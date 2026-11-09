@@ -49,11 +49,12 @@ func Dial(ctx context.Context, path string) (*Link, error) {
 
 // Link is one end of a control connection.
 type Link struct {
-	c *net.UnixConn
+	c   *net.UnixConn
+	oob []byte
 }
 
 func newLink(c *net.UnixConn) *Link {
-	return &Link{c: c}
+	return &Link{c: c, oob: make([]byte, oobSize)}
 }
 
 // Send writes one frame; fds travel with its first byte.
@@ -64,13 +65,16 @@ func (k *Link) Send(typ uint8, payload []byte, fds []int) error {
 	if len(fds) > MaxFDs {
 		return ErrTooManyFDs
 	}
-	if len(fds) > 0 {
+	if len(fds) > 0 && !fdPassing {
 		return ErrUnsupported
 	}
 	var h [headerSize]byte
 	h[0] = typ
 	putLength(h[1:], len(payload))
-	if _, err := k.c.Write(h[:]); err != nil {
+	if err := writeFirst(k.c, h[:1], fds); err != nil {
+		return err
+	}
+	if _, err := k.c.Write(h[1:]); err != nil {
 		return err
 	}
 	_, err := k.c.Write(payload)
@@ -80,18 +84,28 @@ func (k *Link) Send(typ uint8, payload []byte, fds []int) error {
 // Recv blocks for the next frame. It returns io.EOF once the peer has closed.
 func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 	var h [headerSize]byte
-	if _, err := io.ReadFull(k.c, h[:]); err != nil {
-		return 0, nil, nil, err
-	}
-	n, err := length(h[1:])
+	fds, err = readFirst(k.c, h[:1], k.oob)
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	payload = make([]byte, n)
-	if _, err := io.ReadFull(k.c, payload); err != nil {
-		return 0, nil, nil, err
+	defer func() {
+		if err != nil {
+			closeFDs(fds)
+			fds = nil
+		}
+	}()
+	if _, err = io.ReadFull(k.c, h[1:]); err != nil {
+		return 0, nil, fds, err
 	}
-	return h[0], payload, nil, nil
+	n, err := length(h[1:])
+	if err != nil {
+		return 0, nil, fds, err
+	}
+	payload = make([]byte, n)
+	if _, err = io.ReadFull(k.c, payload); err != nil {
+		return 0, nil, fds, err
+	}
+	return h[0], payload, fds, nil
 }
 
 // Close closes the link.
