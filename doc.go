@@ -25,8 +25,9 @@
 // instead. Each direction of a lane serves one goroutine at a time; use more
 // lanes for more concurrency.
 //
-// Blocking calls spin for Config.Spin, then park until the peer rings,
-// ctx is done or the connection closes. Close wakes them with ErrClosed on
-// this end and ErrPeerClosed on the other, as does the peer's death. The
-// segment is unmapped once every outstanding slice has been released.
+// Blocking calls busy-spin for Config.Spin without yielding their thread,
+// then park until the peer rings, ctx is done or the connection closes.
+// Close wakes them with ErrClosed on this end and ErrPeerClosed on the
+// other, as does the peer's death. The segment is unmapped once every
+// outstanding slice has been released.
 package ipc

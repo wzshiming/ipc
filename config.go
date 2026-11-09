@@ -27,8 +27,10 @@ type Config struct {
 	// RingSize is each lane's ring capacity per direction in bytes, a power
 	// of two in [64 KiB, 1 GiB]; 0 means 4 MiB.
 	RingSize int
-	// Spin is how long a blocking call polls before parking; 0 means 50 µs,
-	// a negative value parks at once. It is local to each end.
+	// Spin is how long a blocking call busy re-checks its lane, without
+	// yielding its thread, before parking; 0 means 50 µs, a negative value
+	// parks at once. Each spinning call holds a CPU, so choose Spin small or
+	// negative when CPUs are scarce. It is local to each end.
 	Spin time.Duration
 }
 

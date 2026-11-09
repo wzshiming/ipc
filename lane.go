@@ -3,7 +3,6 @@ package ipc
 import (
 	"context"
 	"io"
-	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +15,10 @@ const (
 	halfClosed int32 = 1 << 20
 	halfDone   int32 = 1 << 21
 )
+
+// spinCheckEvery is how many failed re-checks a spin makes between reads
+// of the clock, ctx and the connection's done channel.
+const spinCheckEvery = 128
 
 // half is one direction of a lane as seen by this end: its ring access gate,
 // its doorbell signal and the doorbell it sends to the peer.
@@ -111,13 +114,20 @@ func (l *Lane) Reserve(ctx context.Context, n int) ([]byte, error) {
 	if err != ErrWouldBlock {
 		return p, err
 	}
-	for deadline := time.Now().Add(l.c.spin); time.Now().Before(deadline); {
-		runtime.Gosched()
-		if p, err = l.TryReserve(n); err != ErrWouldBlock {
-			return p, err
-		}
-		if err := l.c.interrupted(ctx); err != nil {
-			return nil, err
+	if l.c.spin > 0 {
+		deadline := time.Now().Add(l.c.spin)
+		for i := 1; ; i++ {
+			if p, err = l.TryReserve(n); err != ErrWouldBlock {
+				return p, err
+			}
+			if i%spinCheckEvery == 0 {
+				if err := l.c.interrupted(ctx); err != nil {
+					return nil, err
+				}
+				if !time.Now().Before(deadline) {
+					break
+				}
+			}
 		}
 	}
 	for {
@@ -196,13 +206,20 @@ func (l *Lane) Next(ctx context.Context) ([]byte, error) {
 	if err != ErrWouldBlock {
 		return p, err
 	}
-	for deadline := time.Now().Add(l.c.spin); time.Now().Before(deadline); {
-		runtime.Gosched()
-		if p, err = l.TryNext(); err != ErrWouldBlock {
-			return p, err
-		}
-		if err := l.c.interrupted(ctx); err != nil {
-			return nil, err
+	if l.c.spin > 0 {
+		deadline := time.Now().Add(l.c.spin)
+		for i := 1; ; i++ {
+			if p, err = l.TryNext(); err != ErrWouldBlock {
+				return p, err
+			}
+			if i%spinCheckEvery == 0 {
+				if err := l.c.interrupted(ctx); err != nil {
+					return nil, err
+				}
+				if !time.Now().Before(deadline) {
+					break
+				}
+			}
 		}
 	}
 	for {
