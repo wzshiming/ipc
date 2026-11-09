@@ -188,10 +188,15 @@ func (c *Conn) ring(bell *doorbell) error {
 
 // peerErr maps the link errors a vanished peer causes to ErrPeerClosed.
 func peerErr(err error) error {
-	if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+	if isPeerGone(err) {
 		return ErrPeerClosed
 	}
 	return err
+}
+
+// isPeerGone reports whether a link error means the peer closed or crashed.
+func isPeerGone(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
 // Lanes returns the number of lanes.
