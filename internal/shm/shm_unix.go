@@ -52,3 +52,66 @@ func mapFD(fd int, name string, size, n int) (*Segment, error) {
 	}
 	return &Segment{mem: mem, size: size, sys: segSys{fd: fd, name: name}}, nil
 }
+
+// Export returns a Token holding a new CLOEXEC dup of the segment's fd,
+// owned by the caller.
+func (s *Segment) Export() (Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mem == nil {
+		return Token{}, ErrClosed
+	}
+	fd, err := unix.FcntlInt(uintptr(s.sys.fd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return Token{}, err
+	}
+	return Token{Size: s.size, fd: fd, hasFD: true}, nil
+}
+
+// Close closes the fd the token still holds. It is idempotent.
+func (t *Token) Close() error {
+	if !t.hasFD {
+		return nil
+	}
+	t.hasFD = false
+	return unix.Close(t.fd)
+}
+
+func closeFDs(fds []int) {
+	for _, fd := range fds {
+		unix.Close(fd)
+	}
+}
+
+func decodeSys(size int, _ []byte, fds []int) (Token, error) {
+	tok := Token{Size: size}
+	if len(fds) > 0 {
+		tok.fd, tok.hasFD = fds[0], true
+	}
+	return tok, nil
+}
+
+// Attach maps the peer's segment. It takes ownership of tok's fd, closing it
+// on failure and with the returned Segment otherwise.
+func Attach(tok Token) (*Segment, error) {
+	if !tok.hasFD {
+		return nil, errors.New("shm: token holds no fd")
+	}
+	fd := tok.fd
+	if err := checkSize(tok.Size); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	n := mapLen(tok.Size)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	if st.Size != int64(n) {
+		unix.Close(fd)
+		return nil, errors.New("shm: segment size does not match token size")
+	}
+	unix.CloseOnExec(fd)
+	return mapFD(fd, "", tok.Size, n)
+}

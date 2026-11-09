@@ -78,3 +78,48 @@ func mapHandle(h windows.Handle, name string, size int) (*Segment, error) {
 	mem := unsafe.Slice(*(**byte)(unsafe.Pointer(&addr)), n)
 	return &Segment{mem: mem, size: size, sys: segSys{h: h, name: name}}, nil
 }
+
+var procOpenFileMappingW = windows.NewLazySystemDLL("kernel32.dll").NewProc("OpenFileMappingW")
+
+func openMapping(name string) (windows.Handle, error) {
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return 0, err
+	}
+	r, _, e := procOpenFileMappingW.Call(windows.FILE_MAP_READ|windows.FILE_MAP_WRITE, 0, uintptr(unsafe.Pointer(p)))
+	if r == 0 {
+		return 0, e
+	}
+	return windows.Handle(r), nil
+}
+
+// Export returns a Token carrying the segment's mapping name.
+func (s *Segment) Export() (Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mem == nil {
+		return Token{}, ErrClosed
+	}
+	return Token{Size: s.size, name: s.sys.name}, nil
+}
+
+// Close is a no-op on Windows: a token holds only a name.
+func (t *Token) Close() error { return nil }
+
+func closeFDs([]int) {}
+
+func decodeSys(size int, rest []byte, _ []int) (Token, error) {
+	return Token{Size: size, name: string(rest)}, nil
+}
+
+// Attach opens the peer's existing mapping by name and maps it.
+func Attach(tok Token) (*Segment, error) {
+	if err := checkSize(tok.Size); err != nil {
+		return nil, err
+	}
+	h, err := openMapping(tok.name)
+	if err != nil {
+		return nil, err
+	}
+	return mapHandle(h, tok.name, tok.Size)
+}

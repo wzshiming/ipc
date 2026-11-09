@@ -7,6 +7,7 @@
 package shm
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"sync"
@@ -71,4 +72,35 @@ func checkSize(size int) error {
 func mapLen(size int) int {
 	pg := os.Getpagesize()
 	return (size + pg - 1) &^ (pg - 1)
+}
+
+// Token is what a peer needs to Attach a segment: its Size plus an owned fd
+// (POSIX) or the mapping name (Windows).
+type Token struct {
+	Size  int
+	fd    int
+	hasFD bool
+	name  string
+}
+
+// Encode returns the token as bytes plus the fds to send alongside them
+// (SCM_RIGHTS). The token keeps owning its fd.
+func (t Token) Encode() (payload []byte, fds []int) {
+	payload = binary.LittleEndian.AppendUint64(nil, uint64(t.Size))
+	payload = append(payload, t.name...)
+	if t.hasFD {
+		fds = []int{t.fd}
+	}
+	return payload, fds
+}
+
+// DecodeToken rebuilds a Token received from a peer. It takes ownership of
+// fds: they end up in the Token, or are closed when decoding fails.
+func DecodeToken(payload []byte, fds []int) (Token, error) {
+	if len(payload) < 8 {
+		closeFDs(fds)
+		return Token{}, errors.New("shm: short token payload")
+	}
+	size := int(binary.LittleEndian.Uint64(payload))
+	return decodeSys(size, payload[8:], fds)
 }
