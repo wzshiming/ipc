@@ -18,10 +18,6 @@ var errTruncatedRights = errors.New("control: fd attachment truncated")
 
 // writeFirst sends the frame's first byte alone so its rights cannot ride on payload bytes.
 func writeFirst(c *net.UnixConn, b []byte, fds []int) error {
-	if len(fds) == 0 {
-		_, err := c.Write(b)
-		return err
-	}
 	_, _, err := c.WriteMsgUnix(b, unix.UnixRights(fds...), nil)
 	return err
 }

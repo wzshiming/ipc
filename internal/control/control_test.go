@@ -123,6 +123,56 @@ func TestRoundTripManySmallFramesInOrder(t *testing.T) {
 	}
 }
 
+func TestConcurrentSendsDoNotInterleave(t *testing.T) {
+	a, b := pair(t)
+	const senders, perSender = 8, 10000
+	errc := make(chan error, senders)
+	for id := range senders {
+		go func() {
+			buf := make([]byte, 8+64)
+			for seq := range perSender {
+				binary.LittleEndian.PutUint32(buf, uint32(id))
+				binary.LittleEndian.PutUint32(buf[4:], uint32(seq))
+				n := 8 + seq%64
+				for i := 8; i < n; i++ {
+					buf[i] = byte(id)
+				}
+				if err := a.Send(uint8(id), buf[:n], nil); err != nil {
+					errc <- err
+					return
+				}
+			}
+			errc <- nil
+		}()
+	}
+	var next [senders]int
+	for i := range senders * perSender {
+		typ, p, _, err := b.Recv()
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		if len(p) < 8 {
+			t.Fatalf("frame %d: short payload %x", i, p)
+		}
+		id := binary.LittleEndian.Uint32(p)
+		seq := int(binary.LittleEndian.Uint32(p[4:]))
+		if id >= senders || typ != uint8(id) || seq != next[id] || len(p) != 8+seq%64 {
+			t.Fatalf("frame %d: typ=%d id=%d seq=%d len=%d", i, typ, id, seq, len(p))
+		}
+		for _, c := range p[8:] {
+			if c != byte(id) {
+				t.Fatalf("frame %d: sender %d payload corrupted: %x", i, id, p)
+			}
+		}
+		next[id]++
+	}
+	for range senders {
+		if err := <-errc; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestSendRejectsOversizePayload(t *testing.T) {
 	a, _ := pair(t)
 	err := a.Send(1, make([]byte, MaxPayload+1), nil)

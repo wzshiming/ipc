@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 )
 
 // Listener accepts control links on an AF_UNIX socket path.
@@ -51,6 +52,9 @@ func Dial(ctx context.Context, path string) (*Link, error) {
 type Link struct {
 	c   *net.UnixConn
 	oob []byte
+
+	wmu  sync.Mutex
+	wbuf []byte
 }
 
 func newLink(c *net.UnixConn) *Link {
@@ -71,13 +75,18 @@ func (k *Link) Send(typ uint8, payload []byte, fds []int) error {
 	var h [headerSize]byte
 	h[0] = typ
 	putLength(h[1:], len(payload))
-	if err := writeFirst(k.c, h[:1], fds); err != nil {
-		return err
+
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
+	k.wbuf = append(append(k.wbuf[:0], h[:]...), payload...)
+	rest := k.wbuf
+	if len(fds) > 0 {
+		if err := writeFirst(k.c, rest[:1], fds); err != nil {
+			return err
+		}
+		rest = rest[1:]
 	}
-	if _, err := k.c.Write(h[1:]); err != nil {
-		return err
-	}
-	_, err := k.c.Write(payload)
+	_, err := k.c.Write(rest)
 	return err
 }
 
