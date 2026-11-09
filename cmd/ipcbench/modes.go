@@ -187,10 +187,10 @@ func measureLatency(ctx context.Context, l *ipc.Lane, size int, d time.Duration)
 	const warmup = 1000
 	msg := newTemplate(size)
 	samples := make([]time.Duration, 0, 1<<20)
-	deadline := time.Now().Add(d)
+	start := nowNanos()
 	for seq := uint64(1); ; seq++ {
-		t0 := time.Now()
-		if seq > warmup && !t0.Before(deadline) {
+		t0 := nowNanos()
+		if seq > warmup && elapsed(start, t0) >= d {
 			break
 		}
 		binary.LittleEndian.PutUint64(msg, seq)
@@ -209,7 +209,7 @@ func measureLatency(ctx context.Context, l *ipc.Lane, size int, d time.Duration)
 			return nil, err
 		}
 		if seq > warmup {
-			samples = append(samples, time.Since(t0))
+			samples = append(samples, elapsed(t0, nowNanos()))
 		}
 	}
 	if err := l.Send(ctx, nil); err != nil {
