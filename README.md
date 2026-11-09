@@ -43,7 +43,8 @@ func (c *Conn) MaxRecord() int
 // LocalAddr and RemoteAddr return the socket path the connection was made on.
 func (c *Conn) LocalAddr() net.Addr
 func (c *Conn) RemoteAddr() net.Addr
-// Close says goodbye and wakes every blocked call with ErrClosed (ErrPeerClosed on the peer).
+// Close says goodbye and wakes every blocked call with ErrClosed (ErrPeerClosed on the peer,
+// whose receives still drain the records committed before Close).
 func (c *Conn) Close() error
 // Done is closed once the connection is closed by either end or fails.
 func (c *Conn) Done() <-chan struct{}
@@ -308,7 +309,7 @@ CI only smoke-tests `ipcbench` (1-second runs on shared runners, no performance 
 
 - Each direction of a lane serves one goroutine at a time; use more lanes for more concurrency.
 - A record is at most `MaxRecord = RingSize/2 − 8` bytes.
-- Connections are not persistent: a crashed or exiting peer ends the connection with `ErrPeerClosed`, and nothing is replayed.
+- Connections are not persistent: a crashed or exiting peer ends the connection with `ErrPeerClosed` once the records it committed are drained, and nothing is replayed.
 - A lane is used either through the Lane API or through one `NewStream` on each end, never both.
 - `Spin` busy-waits a CPU for up to `Spin` per blocking call; set it small or negative when CPUs are scarce.
 - Small-record rates depend on spacing: with a tight spin, producer and consumer run one record apart and the head index crosses cores per record (≈ 23 M records/s at 64 B above); parking batches records and raises the rate (≈ 59 M records/s).

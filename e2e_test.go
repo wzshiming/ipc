@@ -234,6 +234,22 @@ func TestE2EFourLanesBidirectionalStream(t *testing.T) {
 	t.Logf("%d lanes x 2 directions x %d MiB in %v: %.2f GB/s aggregate", e2eLanes, volume>>20, d, total/d.Seconds()/1e9)
 }
 
+// The child closes as soon as its receives finish, so the parent often reads
+// the rest of the stream after the peer's Bye.
+func TestE2EFourLanesStreamDrainsAfterChildCloses(t *testing.T) {
+	t.Setenv(envMiB, "8")
+	for i := range 5 {
+		c, cmd := startPeer(t, "stream", Config{Lanes: e2eLanes})
+		if err := runStream(c, 0, streamVolume()); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("run %d child: %v", i, err)
+		}
+		c.Close()
+	}
+}
+
 func TestE2EPingPong64B(t *testing.T) {
 	c, cmd := startPeer(t, "echo", Config{})
 	l := c.Lane(0)

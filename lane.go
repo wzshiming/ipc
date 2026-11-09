@@ -182,7 +182,9 @@ func (l *Lane) Abort() {
 	l.tx.release(l.c)
 }
 
-// TryNext returns the next record, or ErrWouldBlock when there is none.
+// TryNext returns the next record, or ErrWouldBlock when there is none. After
+// the peer closed or died it still returns the records the peer committed,
+// then the close reason instead of ErrWouldBlock.
 func (l *Lane) TryNext() ([]byte, error) {
 	if l.rx.held {
 		return nil, errOrder
@@ -191,6 +193,13 @@ func (l *Lane) TryNext() ([]byte, error) {
 		return nil, l.c.err
 	}
 	p, err := l.cons.TryNext()
+	if err == ring.ErrEmpty && isClosed(l.c.done) {
+		// Recheck: all the peer committed before it left is visible by now.
+		if p, err = l.cons.TryNext(); err == ring.ErrEmpty {
+			l.rx.release(l.c)
+			return nil, l.c.err
+		}
+	}
 	if err != nil {
 		l.rx.release(l.c)
 		return nil, l.ringErr(err)
@@ -200,7 +209,7 @@ func (l *Lane) TryNext() ([]byte, error) {
 }
 
 // Next is TryNext that waits for a record until ctx is done or the
-// connection closes.
+// connection closes; after the peer's close it drains without waiting.
 func (l *Lane) Next(ctx context.Context) ([]byte, error) {
 	p, err := l.TryNext()
 	if err != ErrWouldBlock {
@@ -213,8 +222,11 @@ func (l *Lane) Next(ctx context.Context) ([]byte, error) {
 				return p, err
 			}
 			if i%spinCheckEvery == 0 {
-				if err := l.c.interrupted(ctx); err != nil {
-					return nil, err
+				// No done check: TryNext reports the close once drained.
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
 				}
 				if !time.Now().Before(deadline) {
 					break
@@ -238,7 +250,6 @@ func (l *Lane) Next(ctx context.Context) ([]byte, error) {
 				}
 				return nil, ctx.Err()
 			case <-l.c.done:
-				return nil, l.c.err
 			}
 		}
 		if p, err = l.TryNext(); err != ErrWouldBlock {
@@ -258,7 +269,8 @@ func (l *Lane) Release() error {
 		return nil
 	}
 	if wake {
-		return l.c.ring(&l.rx.bell)
+		// A failed doorbell means the peer is gone; Next reports that once drained.
+		l.c.ring(&l.rx.bell)
 	}
 	return nil
 }
@@ -276,8 +288,9 @@ func (l *Lane) Send(ctx context.Context, p []byte) error {
 	return l.Commit()
 }
 
-// Recv copies the next record into p, waiting like Next. A record longer
-// than p fills p, is consumed anyway and yields io.ErrShortBuffer.
+// Recv copies the next record into p, waiting and draining like Next. A
+// record longer than p fills p, is consumed anyway and yields
+// io.ErrShortBuffer.
 func (l *Lane) Recv(ctx context.Context, p []byte) (int, error) {
 	rec, err := l.Next(ctx)
 	if err != nil {

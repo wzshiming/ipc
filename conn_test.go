@@ -259,6 +259,169 @@ func TestPeerCloseWakesBlockedReserveWithErrPeerClosed(t *testing.T) {
 	}
 }
 
+// commitSeq commits n records of size bytes numbered 0..n-1 on l.
+func commitSeq(t *testing.T, l *Lane, n, size int) {
+	t.Helper()
+	for i := range n {
+		p, err := l.TryReserve(size)
+		if err != nil {
+			t.Fatalf("TryReserve record %d: %v", i, err)
+		}
+		putSeq(p, uint64(i))
+		if err := l.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// drainSeq reads n records numbered 0..n-1 from l, alternating TryNext and
+// Next, then expects ErrPeerClosed from both.
+func drainSeq(t *testing.T, l *Lane, n int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range n {
+		var rec []byte
+		var err error
+		if i%2 == 0 {
+			rec, err = l.TryNext()
+		} else {
+			rec, err = l.Next(ctx)
+		}
+		if err != nil {
+			t.Fatalf("record %d after peer close: %v", i, err)
+		}
+		if got := getSeq(rec); got != uint64(i) {
+			t.Fatalf("record seq %d; want %d", got, i)
+		}
+		if err := l.Release(); err != nil {
+			t.Fatalf("Release record %d after peer close: %v", i, err)
+		}
+	}
+	if _, err := l.Next(ctx); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("Next on drained lane = %v; want ErrPeerClosed", err)
+	}
+	if _, err := l.TryNext(); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("TryNext on drained lane = %v; want ErrPeerClosed", err)
+	}
+}
+
+func TestPeerCloseLeavesCommittedRecordsDrainable(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	commitSeq(t, lc.Lane(0), 1000, 1<<10)
+	lc.Close()
+	<-dc.Done()
+	drainSeq(t, dc.Lane(0), 1000)
+	if !errors.Is(dc.Err(), ErrPeerClosed) {
+		t.Fatalf("Err = %v; want ErrPeerClosed", dc.Err())
+	}
+}
+
+func TestParkedNextWokenByPeerCloseReturnsRecordCommittedBeforeIt(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{Spin: -1})
+	type result struct {
+		seq uint64
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		rec, err := dc.Lane(0).Next(context.Background())
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		ch <- result{seq: getSeq(rec)}
+		dc.Lane(0).Release()
+	}()
+	time.Sleep(20 * time.Millisecond)
+	// Commit without ringing, so only the peer's close wakes the parked Next.
+	prod := lc.Lane(0).prod
+	p, err := prod.TryReserve(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putSeq(p, 7)
+	prod.Commit()
+	lc.Close()
+	select {
+	case r := <-ch:
+		if r.err != nil || r.seq != 7 {
+			t.Fatalf("Next = seq %d, %v; want the record committed before close", r.seq, r.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("parked Next was not woken by the peer's close")
+	}
+}
+
+func TestPeerCrashLeavesCommittedRecordsDrainable(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	commitSeq(t, lc.Lane(0), 1000, 1<<10)
+	lc.link.Close() // vanish without Bye
+	<-dc.Done()
+	drainSeq(t, dc.Lane(0), 1000)
+	if !errors.Is(dc.Err(), ErrPeerClosed) {
+		t.Fatalf("Err = %v; want ErrPeerClosed", dc.Err())
+	}
+}
+
+func TestReleaseAfterPeerCloseSucceedsWhenPeerWasParked(t *testing.T) {
+	lc, dc := pair(t, Config{RingSize: 64 << 10, Spin: -1}, Config{RingSize: 64 << 10})
+	tx := lc.Lane(0)
+	n := 0
+	for ; ; n++ {
+		p, err := tx.TryReserve(4000)
+		if err != nil {
+			break
+		}
+		putSeq(p, uint64(n))
+		tx.Commit()
+	}
+	ch := make(chan error, 1)
+	go func() {
+		_, err := tx.Reserve(context.Background(), 4000)
+		ch <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	lc.Close()
+	waitErr(t, ch, time.Second)
+	<-dc.Done()
+	drainSeq(t, dc.Lane(0), n)
+}
+
+func TestPeerCloseFailsReserveTryReserveAndSendAtOnce(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	commitSeq(t, lc.Lane(0), 10, 100)
+	lc.Close()
+	<-dc.Done()
+	l := dc.Lane(0)
+	if _, err := l.TryReserve(8); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("TryReserve = %v; want ErrPeerClosed", err)
+	}
+	if _, err := l.Reserve(context.Background(), 8); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("Reserve = %v; want ErrPeerClosed", err)
+	}
+	if err := l.Send(context.Background(), []byte("x")); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("Send = %v; want ErrPeerClosed", err)
+	}
+}
+
+func TestLocalCloseAfterPeerCloseUnmapsAndStopsDraining(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	commitSeq(t, lc.Lane(0), 10, 100)
+	lc.Close()
+	<-dc.readerDone // the peer-close shutdown has finished
+	if dc.unmapped.Load() {
+		t.Fatal("segment unmapped by peer close; draining needs it until local Close")
+	}
+	dc.Close()
+	if !dc.unmapped.Load() {
+		t.Fatal("segment still mapped after local Close")
+	}
+	if _, err := dc.Lane(0).TryNext(); err == nil {
+		t.Fatal("TryNext after local Close returned a record")
+	}
+}
+
 func TestLocalCloseWakesBlockedNextWithErrClosed(t *testing.T) {
 	_, dc := pair(t, Config{}, Config{Spin: -1})
 	ch := make(chan error, 1)

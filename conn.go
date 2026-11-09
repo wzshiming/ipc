@@ -33,6 +33,7 @@ type Conn struct {
 	sendDir   uint8
 
 	closeOnce  sync.Once
+	rxOnce     sync.Once
 	done       chan struct{}
 	err        error // written once before done is closed
 	readerDone chan struct{}
@@ -105,7 +106,7 @@ func (c *Conn) readLoop() {
 	for {
 		typ, p, fds, err := c.link.Recv()
 		if err != nil {
-			c.shutdown(peerErr(err))
+			c.peerGone(peerErr(err))
 			return
 		}
 		if len(fds) > 0 {
@@ -129,7 +130,7 @@ func (c *Conn) readLoop() {
 			default:
 			}
 		case frameBye:
-			c.shutdown(ErrPeerClosed)
+			c.peerGone(ErrPeerClosed)
 			return
 		default:
 			c.shutdown(errProtocol)
@@ -138,21 +139,33 @@ func (c *Conn) readLoop() {
 	}
 }
 
-// shutdown closes the connection once with err as the reason, waking every
-// blocked call; the segment is released when no lane slice is outstanding.
+// shutdown closes the connection with err as the reason unless it is closed
+// already, waking every blocked call and ending receives; the segment is
+// released when no lane slice is outstanding.
 func (c *Conn) shutdown(err error) {
+	c.peerGone(err)
+	c.rxOnce.Do(func() {
+		for _, l := range c.lanes {
+			l.rx.close(c)
+		}
+	})
+}
+
+// peerGone closes the connection like shutdown but leaves the receive halves
+// open, so records the peer committed can still be drained until Close.
+func (c *Conn) peerGone(err error) {
 	c.closeOnce.Do(func() {
 		c.err = err
+		// Sends fail before Done closes, so callers seeing Done see them fail.
+		for _, l := range c.lanes {
+			l.tx.close(c)
+		}
 		close(c.done)
 		if err == ErrClosed {
 			c.link.SetWriteDeadline(time.Now().Add(time.Second))
 			c.link.Send(frameBye, nil, nil)
 		}
 		c.link.Close()
-		for _, l := range c.lanes {
-			l.tx.close(c)
-			l.rx.close(c)
-		}
 	})
 }
 
@@ -167,7 +180,7 @@ func (c *Conn) halfDone() {
 // ring sends a doorbell for a peer parked on the ring bell names.
 func (c *Conn) ring(bell *doorbell) error {
 	if err := c.link.Send(frameDoorbell, bell[:], nil); err != nil {
-		c.shutdown(peerErr(err))
+		c.peerGone(peerErr(err))
 		return c.err
 	}
 	return nil
@@ -200,19 +213,22 @@ func (c *Conn) LocalAddr() net.Addr { return c.addr }
 func (c *Conn) RemoteAddr() net.Addr { return c.addr }
 
 // Close tells the peer goodbye, closes the link and wakes every blocked call
-// with ErrClosed. Slices still held from Reserve or Next stay readable until
-// they are committed, aborted or released.
+// with ErrClosed; records the peer committed are no longer delivered. Slices
+// still held from Reserve or Next stay readable until they are committed,
+// aborted or released.
 func (c *Conn) Close() error {
 	c.shutdown(ErrClosed)
 	<-c.readerDone
 	return nil
 }
 
-// Done is closed once the connection is closed by either end or fails.
+// Done is closed once the connection is closed by either end or fails. After
+// the peer's close, receives still drain what it committed until Close.
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // Err returns nil while the connection is open, then why it closed:
-// ErrClosed, ErrPeerClosed, ErrCorrupt or a link error.
+// ErrClosed, ErrPeerClosed (also when the peer died), ErrCorrupt or a link
+// error.
 func (c *Conn) Err() error {
 	select {
 	case <-c.done:

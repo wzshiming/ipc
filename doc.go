@@ -28,6 +28,8 @@
 // Blocking calls busy-spin for Config.Spin without yielding their thread,
 // then park until the peer rings, ctx is done or the connection closes.
 // Close wakes them with ErrClosed on this end and ErrPeerClosed on the
-// other, as does the peer's death. The segment is unmapped once every
-// outstanding slice has been released.
+// other, as does the peer's death. After the peer's close or death, sends
+// fail at once but receives return the records it committed before failing
+// with ErrPeerClosed, until this end's Close. The segment is unmapped once
+// this end has closed and every outstanding slice has been released.
 package ipc

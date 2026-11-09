@@ -144,6 +144,50 @@ func TestStreamPeerReadsEOFAfterDrainingDataWrittenBeforeClose(t *testing.T) {
 	}
 }
 
+func TestStreamReadDrainsThenEOFAfterPeerClosesStreamAndConn(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
+	want := make([]byte, 1<<20)
+	rand.NewChaCha8([32]byte{2}).Read(want)
+	if _, err := ls.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	ls.Close()
+	lc.Close()
+	<-dc.Done()
+	got, err := io.ReadAll(ds)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("ReadAll after peer close = %d bytes, %v; want the %d bytes written", len(got), err, len(want))
+	}
+	if dc.unmapped.Load() {
+		t.Fatal("segment unmapped before local Close")
+	}
+	ds.Close()
+	dc.Close()
+	if !dc.unmapped.Load() {
+		t.Fatal("segment still mapped after local Close")
+	}
+}
+
+func TestStreamReadDrainsThenErrPeerClosedAfterPeerCrash(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
+	want := make([]byte, 1<<20)
+	rand.NewChaCha8([32]byte{3}).Read(want)
+	if _, err := ls.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	lc.link.Close() // vanish without the EOF marker or Bye
+	<-dc.Done()
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(ds, got); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("ReadFull after peer crash: %v; want the %d bytes written", err, len(want))
+	}
+	if _, err := ds.Read(got); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("Read after drain = %v; want ErrPeerClosed", err)
+	}
+}
+
 func TestStreamWriteAfterCloseIsErrClosed(t *testing.T) {
 	ls, _ := streamPair(t, Config{})
 	ls.Close()
