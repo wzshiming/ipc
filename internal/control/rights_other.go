@@ -3,8 +3,10 @@
 package control
 
 import (
+	"errors"
 	"io"
 	"net"
+	"syscall"
 )
 
 // Descriptor passing is only wired up for darwin and linux.
@@ -23,3 +25,5 @@ func readFirst(c *net.UnixConn, b, _ []byte) ([]int, error) {
 }
 
 func closeFDs([]int) {}
+
+func isConnRefused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }

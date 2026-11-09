@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -16,13 +17,34 @@ type Listener struct {
 	l *net.UnixListener
 }
 
-// Listen listens on the AF_UNIX socket at path.
+// Listen listens on the AF_UNIX socket at path. A socket file left behind by
+// a dead listener is removed; a live one fails with EADDRINUSE.
 func Listen(path string) (*Listener, error) {
-	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	addr := &net.UnixAddr{Name: path, Net: "unix"}
+	l, err := net.ListenUnix("unix", addr)
+	if err != nil && isStale(path) {
+		if rerr := os.Remove(path); rerr == nil || os.IsNotExist(rerr) {
+			l, err = net.ListenUnix("unix", addr)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &Listener{l: l}, nil
+}
+
+// isStale reports whether path is a socket file nobody is listening on.
+func isStale(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || fi.Mode().Type() != os.ModeSocket {
+		return false
+	}
+	c, err := net.DialTimeout("unix", path, time.Second)
+	if err == nil {
+		c.Close()
+		return false
+	}
+	return isConnRefused(err)
 }
 
 // Accept waits for and returns the next link.

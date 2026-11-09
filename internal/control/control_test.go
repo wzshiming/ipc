@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -283,5 +284,81 @@ func TestListenerCloseUnblocksAcceptAndRemovesFile(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("socket file still present: %v", err)
+	}
+}
+
+// staleSocket leaves a socket file at path with nobody listening on it.
+func staleSocket(t *testing.T, path string) {
+	t.Helper()
+	ul, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Skipf("AF_UNIX unavailable: %v", err)
+	}
+	ul.SetUnlinkOnClose(false)
+	if err := ul.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("stale socket file missing: %v", err)
+	}
+}
+
+func TestDialStalePathFailsFast(t *testing.T) {
+	path := sockPath(t)
+	staleSocket(t, path)
+	start := time.Now()
+	if _, err := Dial(t.Context(), path); err == nil {
+		t.Fatal("dial to stale path succeeded")
+	}
+	if d := time.Since(start); d >= time.Second {
+		t.Fatalf("dial took %v", d)
+	}
+}
+
+func TestListenReplacesStaleSocketFile(t *testing.T) {
+	path := sockPath(t)
+	staleSocket(t, path)
+	l := listen(t, path)
+	go func() {
+		if c, err := Dial(t.Context(), path); err == nil {
+			c.Close()
+		}
+	}()
+	c, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+}
+
+func TestListenOnLivePathIsAddrInUse(t *testing.T) {
+	path := sockPath(t)
+	listen(t, path)
+	l2, err := Listen(path)
+	if err == nil {
+		l2.Close()
+		t.Fatal("second Listen on a live path succeeded")
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("live socket file removed: %v", err)
+	}
+	c, err := Dial(t.Context(), path)
+	if err != nil {
+		t.Fatalf("live listener no longer reachable: %v", err)
+	}
+	c.Close()
+}
+
+func TestListenDoesNotRemoveRegularFile(t *testing.T) {
+	path := sockPath(t)
+	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := Listen(path); err == nil {
+		l.Close()
+		t.Fatal("Listen over a regular file succeeded")
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "keep" {
+		t.Fatalf("regular file clobbered: %q, %v", b, err)
 	}
 }

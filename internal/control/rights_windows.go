@@ -3,8 +3,11 @@
 package control
 
 import (
+	"errors"
 	"io"
 	"net"
+
+	"golang.org/x/sys/windows"
 )
 
 // Windows AF_UNIX has no control messages, so the Msg variants are unusable.
@@ -23,3 +26,5 @@ func readFirst(c *net.UnixConn, b, _ []byte) ([]int, error) {
 }
 
 func closeFDs([]int) {}
+
+func isConnRefused(err error) bool { return errors.Is(err, windows.WSAECONNREFUSED) }

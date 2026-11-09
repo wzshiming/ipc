@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -70,3 +71,5 @@ func closeFDs(fds []int) {
 		unix.Close(fd)
 	}
 }
+
+func isConnRefused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
