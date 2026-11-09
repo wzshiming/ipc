@@ -41,6 +41,32 @@ func TestWindowsNameGoneAfterBothClose(t *testing.T) {
 	}
 }
 
+func TestWindowsDecodeRejectsFDs(t *testing.T) {
+	seg, err := Create(MinSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seg.Close()
+	tok, err := seg.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := tok.Encode()
+	if _, err := DecodeToken(payload, []int{3}); err == nil {
+		t.Fatal("DecodeToken accepted an fd on Windows")
+	}
+}
+
+func TestWindowsDecodeRejectsBadName(t *testing.T) {
+	for _, name := range []string{"", `Global\ipc-0123456789abcdef0123456789abcdef`, `Local\ipc-zz`} {
+		payload := Token{Size: MinSize, name: name}
+		p, _ := payload.Encode()
+		if _, err := DecodeToken(p, nil); err == nil {
+			t.Errorf("DecodeToken accepted name %q", name)
+		}
+	}
+}
+
 func TestWindowsAttachMissingNameFails(t *testing.T) {
 	name, err := randomName()
 	if err != nil {

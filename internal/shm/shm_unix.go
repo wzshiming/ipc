@@ -83,12 +83,12 @@ func closeFDs(fds []int) {
 	}
 }
 
-func decodeSys(size int, _ []byte, fds []int) (Token, error) {
-	tok := Token{Size: size}
-	if len(fds) > 0 {
-		tok.fd, tok.hasFD = fds[0], true
+func decodeSys(size int, rest []byte, fds []int) (Token, error) {
+	if len(fds) != 1 || len(rest) != 0 {
+		closeFDs(fds)
+		return Token{}, errors.New("shm: token needs exactly one fd and no name")
 	}
-	return tok, nil
+	return Token{Size: size, fd: fds[0], hasFD: true}, nil
 }
 
 // Attach maps the peer's segment. It takes ownership of tok's fd, closing it

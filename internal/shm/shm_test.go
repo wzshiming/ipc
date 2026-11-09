@@ -4,6 +4,7 @@ package shm
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -110,6 +111,51 @@ func TestAttachSharesWritesBothWays(t *testing.T) {
 	copy(b.Bytes()[size-4:], "b->a")
 	if got := string(a.Bytes()[size-4:]); got != "b->a" {
 		t.Fatalf("creator read %q, want %q", got, "b->a")
+	}
+}
+
+func TestDecodeRejectsSizeOutOfRange(t *testing.T) {
+	seg, err := Create(MinSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seg.Close()
+	tok, err := seg.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Close()
+	payload, fds := tok.Encode()
+
+	for _, size := range []uint64{0, MinSize - 1, MaxSize + 1, 1 << 63, ^uint64(0)} {
+		p := bytes.Clone(payload)
+		binary.LittleEndian.PutUint64(p, size)
+		if got, err := DecodeToken(p, transferFDs(t, fds)); err == nil {
+			got.Close()
+			t.Errorf("DecodeToken accepted Size %d", size)
+		}
+	}
+}
+
+func TestValidMappingName(t *testing.T) {
+	good := namePrefix + strings.Repeat("0123456789abcdef", 2)
+	if !validMappingName(good) {
+		t.Errorf("rejected %q", good)
+	}
+	for _, bad := range []string{
+		"",
+		namePrefix,
+		`Global\ipc-` + strings.Repeat("ab", 16),
+		`Local\xyz-` + strings.Repeat("ab", 16),
+		namePrefix + strings.Repeat("zz", 16),
+		namePrefix + strings.Repeat("AB", 16),
+		namePrefix + strings.Repeat("ab", 15),
+		namePrefix + strings.Repeat("ab", 17),
+		namePrefix + strings.Repeat("ab", 15) + `\.`,
+	} {
+		if validMappingName(bad) {
+			t.Errorf("accepted %q", bad)
+		}
 	}
 }
 

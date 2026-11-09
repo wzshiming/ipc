@@ -9,8 +9,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const namePrefix = `Local\ipc-`
-
 type segSys struct {
 	h    windows.Handle
 	name string
@@ -108,8 +106,15 @@ func (t *Token) Close() error { return nil }
 
 func closeFDs([]int) {}
 
-func decodeSys(size int, rest []byte, _ []int) (Token, error) {
-	return Token{Size: size, name: string(rest)}, nil
+func decodeSys(size int, rest []byte, fds []int) (Token, error) {
+	if len(fds) != 0 {
+		return Token{}, errors.New("shm: token carries fds on Windows")
+	}
+	name := string(rest)
+	if !validMappingName(name) {
+		return Token{}, errors.New("shm: invalid mapping name")
+	}
+	return Token{Size: size, name: name}, nil
 }
 
 // Attach opens the peer's existing mapping by name and maps it.

@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -18,6 +19,9 @@ const (
 	MinSize = 4096
 	// MaxSize is the largest segment accepted: 1 GiB of data plus two header pages.
 	MaxSize = 1<<30 + 2*4096
+
+	// namePrefix starts every Windows mapping name; 32 lowercase hex chars follow.
+	namePrefix = `Local\ipc-`
 )
 
 // ErrUnsupported is returned on platforms without a shared-memory backend.
@@ -69,6 +73,19 @@ func checkSize(size int) error {
 	return nil
 }
 
+func validMappingName(name string) bool {
+	hexPart, ok := strings.CutPrefix(name, namePrefix)
+	if !ok || len(hexPart) != 32 {
+		return false
+	}
+	for _, c := range []byte(hexPart) {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func mapLen(size int) int {
 	pg := os.Getpagesize()
 	return (size + pg - 1) &^ (pg - 1)
@@ -101,6 +118,10 @@ func DecodeToken(payload []byte, fds []int) (Token, error) {
 		closeFDs(fds)
 		return Token{}, errors.New("shm: short token payload")
 	}
-	size := int(binary.LittleEndian.Uint64(payload))
-	return decodeSys(size, payload[8:], fds)
+	size := binary.LittleEndian.Uint64(payload)
+	if size < MinSize || size > MaxSize {
+		closeFDs(fds)
+		return Token{}, errSize
+	}
+	return decodeSys(int(size), payload[8:], fds)
 }
