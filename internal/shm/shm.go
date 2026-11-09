@@ -9,6 +9,7 @@ package shm
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -25,7 +26,7 @@ const (
 )
 
 // ErrUnsupported is returned on platforms without a shared-memory backend.
-var ErrUnsupported = errors.New("shm: unsupported platform")
+var ErrUnsupported = fmt.Errorf("shm: %w", errors.ErrUnsupported)
 
 // ErrClosed is returned when exporting a closed segment.
 var ErrClosed = errors.New("shm: segment closed")

@@ -3,6 +3,7 @@ package control
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 )
 
 // Wire format: typ u8 | len u32 little-endian | payload.
@@ -19,7 +20,7 @@ var (
 	// ErrClosed is returned by operations on a closed Link or Listener.
 	ErrClosed = errors.New("control: closed")
 	// ErrUnsupported is returned when the platform cannot provide a feature.
-	ErrUnsupported = errors.New("control: unsupported")
+	ErrUnsupported = fmt.Errorf("control: %w", errors.ErrUnsupported)
 	// ErrPayloadTooLarge is returned for a payload above MaxPayload.
 	ErrPayloadTooLarge = errors.New("control: payload exceeds 64 KiB")
 	// ErrTooManyFDs is returned for more than MaxFDs descriptors.

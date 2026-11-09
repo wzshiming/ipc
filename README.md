@@ -302,7 +302,7 @@ CI only smoke-tests `ipcbench` (1-second runs on shared runners, no performance 
 - **Windows** needs Windows 10 1803 or later for AF_UNIX sockets.
 - **Linux and macOS** pass the segment as a file descriptor; fd passing is used only there. The socket file is chmod 0600.
 - **macOS** shared-memory names are limited to 31 characters; the library's random names fit (an internal detail). Socket paths are limited to 104 bytes, so keep them short.
-- **Other GOOS** compile, but creating or attaching a segment returns an unsupported-platform error.
+- **Other GOOS** compile, but creating or attaching a segment fails with an error for which `errors.Is(err, errors.ErrUnsupported)` is true: `Listener.Accept` returns it, and `Dial` returns `ErrRejected`.
 
 ## Limitations
 
