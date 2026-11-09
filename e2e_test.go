@@ -82,6 +82,8 @@ func runChild(role, path string) error {
 	case "hang":
 		_, err := c.Lane(0).Next(context.Background())
 		return err
+	case "copy":
+		return runCopyChild(c)
 	}
 	return fmt.Errorf("unknown role %q", role)
 }
