@@ -209,3 +209,79 @@ func TestDialMissingPathFailsFast(t *testing.T) {
 		t.Fatalf("dial took %v", d)
 	}
 }
+
+func TestRecvReadDeadlineIsTimeout(t *testing.T) {
+	_, b := pair(t)
+	if err := b.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := b.Recv(); !os.IsTimeout(err) {
+		t.Fatalf("got %v, want a timeout error", err)
+	}
+}
+
+func TestSendWriteDeadlineInPastIsTimeout(t *testing.T) {
+	a, _ := pair(t)
+	if err := a.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Send(1, nil, nil); !os.IsTimeout(err) {
+		t.Fatalf("got %v, want a timeout error", err)
+	}
+	if err := a.SetDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseWakesBlockedRecvAndIsIdempotent(t *testing.T) {
+	_, b := pair(t)
+	errc := make(chan error, 1)
+	go func() {
+		_, _, _, err := b.Recv()
+		errc <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrClosed) && err != io.EOF {
+			t.Fatalf("got %v, want ErrClosed or io.EOF", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not wake Recv")
+	}
+	if err := b.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := b.Send(1, nil, nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Send after Close: got %v, want ErrClosed", err)
+	}
+	if _, _, _, err := b.Recv(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Recv after Close: got %v, want ErrClosed", err)
+	}
+}
+
+func TestListenerCloseUnblocksAcceptAndRemovesFile(t *testing.T) {
+	path := sockPath(t)
+	l := listen(t, path)
+	errc := make(chan error, 1)
+	go func() {
+		_, err := l.Accept()
+		errc <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errc; err != ErrClosed {
+		t.Fatalf("Accept: got %v, want ErrClosed", err)
+	}
+	if _, err := l.Accept(); err != ErrClosed {
+		t.Fatalf("Accept after Close: got %v, want ErrClosed", err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("socket file still present: %v", err)
+	}
+}

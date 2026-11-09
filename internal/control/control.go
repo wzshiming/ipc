@@ -4,9 +4,11 @@ package control
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // Listener accepts control links on an AF_UNIX socket path.
@@ -27,7 +29,7 @@ func Listen(path string) (*Listener, error) {
 func (l *Listener) Accept() (*Link, error) {
 	c, err := l.l.AcceptUnix()
 	if err != nil {
-		return nil, err
+		return nil, closedErr(err)
 	}
 	return newLink(c), nil
 }
@@ -55,6 +57,9 @@ type Link struct {
 
 	wmu  sync.Mutex
 	wbuf []byte
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newLink(c *net.UnixConn) *Link {
@@ -82,12 +87,12 @@ func (k *Link) Send(typ uint8, payload []byte, fds []int) error {
 	rest := k.wbuf
 	if len(fds) > 0 {
 		if err := writeFirst(k.c, rest[:1], fds); err != nil {
-			return err
+			return closedErr(err)
 		}
 		rest = rest[1:]
 	}
 	_, err := k.c.Write(rest)
-	return err
+	return closedErr(err)
 }
 
 // Recv blocks for the next frame. It returns io.EOF once the peer has closed.
@@ -95,12 +100,13 @@ func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 	var h [headerSize]byte
 	fds, err = readFirst(k.c, h[:1], k.oob)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, closedErr(err)
 	}
 	defer func() {
 		if err != nil {
 			closeFDs(fds)
 			fds = nil
+			err = closedErr(err)
 		}
 	}()
 	if _, err = io.ReadFull(k.c, h[1:]); err != nil {
@@ -117,5 +123,28 @@ func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 	return h[0], payload, fds, nil
 }
 
-// Close closes the link.
-func (k *Link) Close() error { return k.c.Close() }
+// Close closes the link and wakes a blocked Recv; later calls return nil.
+func (k *Link) Close() error {
+	k.closeOnce.Do(func() { k.closeErr = k.c.Close() })
+	return k.closeErr
+}
+
+// SetDeadline sets the read and write deadlines.
+func (k *Link) SetDeadline(t time.Time) error { return k.c.SetDeadline(t) }
+
+// SetReadDeadline sets the deadline for Recv. A deadline that expires
+// mid-frame leaves the stream misaligned; the link must then be closed.
+func (k *Link) SetReadDeadline(t time.Time) error { return k.c.SetReadDeadline(t) }
+
+// SetWriteDeadline sets the deadline for Send, with the same caveat as
+// SetReadDeadline for a frame partly written.
+func (k *Link) SetWriteDeadline(t time.Time) error { return k.c.SetWriteDeadline(t) }
+
+// closedErr maps use of a closed connection to ErrClosed and passes other
+// errors unwrapped so os.IsTimeout keeps working.
+func closedErr(err error) error {
+	if errors.Is(err, net.ErrClosed) {
+		return ErrClosed
+	}
+	return err
+}
