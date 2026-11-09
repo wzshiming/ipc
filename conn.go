@@ -3,11 +3,9 @@ package ipc
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/wzshiming/ipc/internal/control"
@@ -192,11 +190,6 @@ func peerErr(err error) error {
 		return ErrPeerClosed
 	}
 	return err
-}
-
-// isPeerGone reports whether a link error means the peer closed or crashed.
-func isPeerGone(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
 // Lanes returns the number of lanes.
