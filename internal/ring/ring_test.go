@@ -528,18 +528,23 @@ func ring(bell chan struct{}) {
 }
 
 // TestParkProtocolNoLostWakeups runs a producer and a consumer that park on a
-// full/empty ring and wait on channel doorbells until 1e6 waits have happened.
-// A lost wakeup deadlocks and trips the watchdog. Opening phases force the
-// consumer to block on the empty ring, then the producer on the full one.
+// full/empty ring and wait on channel doorbells until 1e6 waits (2e5 under
+// -race) have happened. A lost wakeup deadlocks and trips the progress
+// watchdog. Opening phases force the consumer to block on the empty ring,
+// then the producer on the full one.
 func TestParkProtocolNoLostWakeups(t *testing.T) {
-	const wantWaits = 1_000_000
+	wantWaits := int64(1_000_000)
+	if raceEnabled {
+		wantWaits = 200_000
+	}
+	const stallLimit = 20 * time.Second
 	const sentinel = 65 // payload sizes are otherwise 0..64
 	p, c := newPair(t, newRegion(t, testCap))
 	prodBell := make(chan struct{}, 1)
 	consBell := make(chan struct{}, 1)
 	consBlocked := make(chan struct{})
 	prodBlocked := make(chan struct{})
-	var waits atomic.Int64
+	var waits, progress atomic.Int64
 	var prodParks, prodRings, consParks, consRings, unparks int
 	done := make(chan struct{}, 2)
 
@@ -580,6 +585,7 @@ func TestParkProtocolNoLostWakeups(t *testing.T) {
 				consRings++
 				ring(consBell)
 			}
+			progress.Add(1)
 			seq++
 			if last {
 				return
@@ -629,6 +635,7 @@ func TestParkProtocolNoLostWakeups(t *testing.T) {
 				prodRings++
 				ring(prodBell)
 			}
+			progress.Add(1)
 			seq++
 			if last {
 				return
@@ -638,15 +645,26 @@ func TestParkProtocolNoLostWakeups(t *testing.T) {
 			}
 		}
 	}()
-	for range 2 {
+	start := time.Now()
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	lastProgress, lastChange := progress.Load(), start
+	for finished := 0; finished < 2; {
 		select {
 		case <-done:
-		case <-time.After(2 * time.Minute):
-			t.Fatalf("deadlock: no progress after %d waits", waits.Load())
+			finished++
+		case now := <-tick.C:
+			if cur := progress.Load(); cur != lastProgress {
+				lastProgress, lastChange = cur, now
+			} else if now.Sub(lastChange) >= stallLimit {
+				t.Fatalf("deadlock: no progress for %v after %d waits", now.Sub(lastChange).Round(time.Second), waits.Load())
+			}
 		}
 	}
-	t.Logf("waits=%d producer parks=%d rings=%d consumer parks=%d rings=%d producer unparks=%d",
-		waits.Load(), prodParks, prodRings, consParks, consRings, unparks)
+	elapsed := time.Since(start)
+	t.Logf("waits=%d in %v (%.0f waits/s) producer parks=%d rings=%d consumer parks=%d rings=%d producer unparks=%d",
+		waits.Load(), elapsed.Round(time.Millisecond), float64(waits.Load())/elapsed.Seconds(),
+		prodParks, prodRings, consParks, consRings, unparks)
 	if consRings > consParks {
 		t.Errorf("consumer woken %d times for %d parks", consRings, consParks)
 	}
