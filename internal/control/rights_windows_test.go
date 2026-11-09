@@ -4,8 +4,24 @@ package control
 
 import (
 	"errors"
+	"net"
+	"os"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
+
+func TestNoAFUnixErrorWrapsErrUnsupported(t *testing.T) {
+	sys := &net.OpError{Op: "listen", Net: "unix", Err: os.NewSyscallError("socket", windows.WSAEAFNOSUPPORT)}
+	err := unsupportedErr(sys)
+	if !errors.Is(err, ErrUnsupported) || !errors.Is(err, windows.WSAEAFNOSUPPORT) {
+		t.Fatalf("got %v, want ErrUnsupported wrapping WSAEAFNOSUPPORT", err)
+	}
+	other := &net.OpError{Op: "listen", Net: "unix", Err: windows.WSAEADDRINUSE}
+	if err := unsupportedErr(other); err != other {
+		t.Fatalf("unrelated error rewritten: %v", err)
+	}
+}
 
 func TestSendWithFDsIsUnsupportedOnWindows(t *testing.T) {
 	a, _ := pair(t)

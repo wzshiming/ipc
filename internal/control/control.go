@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -28,7 +29,13 @@ func Listen(path string) (*Listener, error) {
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, unsupportedErr(err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0o600); err != nil {
+			l.Close()
+			return nil, err
+		}
 	}
 	return &Listener{l: l}, nil
 }
@@ -67,7 +74,7 @@ func Dial(ctx context.Context, path string) (*Link, error) {
 	var d net.Dialer
 	c, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
-		return nil, err
+		return nil, unsupportedErr(err)
 	}
 	return newLink(c.(*net.UnixConn)), nil
 }

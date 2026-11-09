@@ -73,3 +73,5 @@ func closeFDs(fds []int) {
 }
 
 func isConnRefused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
+
+func unsupportedErr(err error) error { return err }

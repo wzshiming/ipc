@@ -27,3 +27,5 @@ func readFirst(c *net.UnixConn, b, _ []byte) ([]int, error) {
 func closeFDs([]int) {}
 
 func isConnRefused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
+
+func unsupportedErr(err error) error { return err }
