@@ -108,7 +108,10 @@ func (p *Producer) Commit() (wakeConsumer bool) {
 	p.head += p.pending
 	p.pending = 0
 	atomic.StoreUint64(p.sharedHead, p.head)
-	return atomic.LoadUint32(p.consumerParked) != 0 && atomic.SwapUint32(p.consumerParked, 0) != 0
+	// An unconditional RMW, never load-then-swap: Park's RMW on the same word
+	// is coherence-ordered with this one, which acquire/release atomics (the
+	// race runtime's) do not give a plain store followed by a load.
+	return atomic.SwapUint32(p.consumerParked, 0) != 0
 }
 
 // Abort discards the outstanding reservation, if any.
@@ -122,7 +125,8 @@ func (p *Producer) Park(n int) (ready bool) {
 	if n < 0 || n > p.maxRecord {
 		return true
 	}
-	atomic.StoreUint32(p.producerParked, 1)
+	// An RMW, not a store, so Release's swap of this word orders with it.
+	atomic.SwapUint32(p.producerParked, 1)
 	need, _ := p.need(n)
 	if ok, err := p.fits(need); ok || err != nil {
 		p.Unpark()

@@ -20,13 +20,17 @@
 //
 // # Memory model
 //
-// Every shared header field is accessed only through sync/atomic, which is
-// sequentially consistent in Go. The producer writes the payload and record
-// header with plain stores, then publishes them by storing head; the consumer
-// loads head before reading them. Symmetrically the consumer stores tail
-// after it is done with a payload, and the producer loads tail before reusing
-// those bytes. The race detector sees these atomic pairs as the
-// happens-before edges ordering payload accesses.
+// Every shared header field is accessed only through sync/atomic. The ring
+// relies on acquire/release ordering only, never on sequential consistency:
+// under -race the runtime implements atomic loads as acquire and stores as
+// release, and across processes on shared memory nothing restores seq_cst,
+// so a store followed by a load of another word may be reordered (see
+// Parking). The producer writes the payload and record header with plain
+// stores, then publishes them by storing head; the consumer loads head before
+// reading them. Symmetrically the consumer stores tail after it is done with a
+// payload, and the producer loads tail before reusing those bytes. The race
+// detector sees these atomic pairs as the happens-before edges ordering
+// payload accesses.
 //
 // Each side keeps a process-local copy of the other side's cursor and reloads
 // it only when the copy says the ring is full (producer) or empty (consumer).
@@ -37,13 +41,18 @@
 //
 // # Parking
 //
-// A side that cannot make progress calls Park, which stores its parked flag
-// and then re-checks the ring. The other side, after publishing its cursor,
-// swaps that flag to 0 and rings a doorbell if it was set. With sequentially
-// consistent atomics either the parker's re-check sees the publish or the
-// publisher sees the flag, so no wakeup is lost; spurious wakeups are
-// possible. A flag is cleared by exactly one swap, so each park yields at most
-// one doorbell, and Unpark clears it so an abandoned wait is not woken.
+// A side that cannot make progress calls Park, which swaps its parked flag to
+// 1 and then re-checks the ring. The other side, after publishing its cursor,
+// unconditionally swaps that flag to 0 and rings a doorbell if it was set.
+// Both sides read-modify-write the same flag word, so their accesses are
+// coherence-ordered: either the publisher's swap reads the parker's 1, or the
+// parker's acquire swap reads the publisher's release swap, synchronizes with
+// it and its re-check sees the publish. No wakeup is lost even under
+// acquire/release atomics, which is what the race runtime provides; a plain
+// store followed by a load would give no such guarantee there. Spurious
+// wakeups are possible. A flag is cleared by exactly one swap, so each park
+// yields at most one doorbell, and Unpark clears it so an abandoned wait is
+// not woken (a stale clear costs at most a spurious doorbell).
 //
 // # Concurrency
 //

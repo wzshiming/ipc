@@ -111,14 +111,18 @@ func (c *Consumer) Release() (wakeProducer bool) {
 	c.tail += c.pending
 	c.pending = 0
 	atomic.StoreUint64(c.sharedTail, c.tail)
-	return atomic.LoadUint32(c.producerParked) != 0 && atomic.SwapUint32(c.producerParked, 0) != 0
+	// An unconditional RMW, never load-then-swap: Park's RMW on the same word
+	// is coherence-ordered with this one, which acquire/release atomics (the
+	// race runtime's) do not give a plain store followed by a load.
+	return atomic.SwapUint32(c.producerParked, 0) != 0
 }
 
 // Park marks the consumer as waiting for a record, then re-checks. It returns
 // true, with the mark cleared, when a record is already published; otherwise
 // the caller waits for a doorbell from the producer.
 func (c *Consumer) Park() (ready bool) {
-	atomic.StoreUint32(c.consumerParked, 1)
+	// An RMW, not a store, so Commit's swap of this word orders with it.
+	atomic.SwapUint32(c.consumerParked, 1)
 	if atomic.LoadUint64(c.sharedHead) != c.tail {
 		c.Unpark()
 		return true
