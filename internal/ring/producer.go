@@ -7,9 +7,11 @@ import (
 
 // Producer is the writing end of a ring. It must be used by one goroutine only.
 type Producer struct {
-	data       []byte
-	sharedHead *uint64 // written by us
-	sharedTail *uint64 // written by the consumer
+	data           []byte
+	sharedHead     *uint64 // written by us
+	sharedTail     *uint64 // written by the consumer
+	consumerParked *uint32
+	producerParked *uint32
 	mask       uint64
 	capacity   uint64
 	maxRecord  int
@@ -27,7 +29,9 @@ func NewProducer(region []byte) (*Producer, error) {
 	p := &Producer{
 		data:       region[HeaderSize : HeaderSize+capacity : HeaderSize+capacity],
 		sharedHead: u64(region, offHead),
-		sharedTail: u64(region, offTail),
+		sharedTail:     u64(region, offTail),
+		consumerParked: u32(region, offConsumerParked),
+		producerParked: u32(region, offProducerParked),
 		mask:       uint64(capacity - 1),
 		capacity:   uint64(capacity),
 		maxRecord:  MaxRecord(capacity),
@@ -104,8 +108,28 @@ func (p *Producer) Commit() (wakeConsumer bool) {
 	p.head += p.pending
 	p.pending = 0
 	atomic.StoreUint64(p.sharedHead, p.head)
-	return false
+	return atomic.LoadUint32(p.consumerParked) != 0 && atomic.SwapUint32(p.consumerParked, 0) != 0
 }
 
 // Abort discards the outstanding reservation, if any.
 func (p *Producer) Abort() { p.pending = 0 }
+
+// Park marks the producer as waiting for room for an n-byte record, then
+// re-checks. It returns true, with the mark cleared, when the record already
+// fits (or never will: n > MaxRecord); otherwise the caller waits for a
+// doorbell from the consumer.
+func (p *Producer) Park(n int) (ready bool) {
+	if n < 0 || n > p.maxRecord {
+		return true
+	}
+	atomic.StoreUint32(p.producerParked, 1)
+	need, _ := p.need(n)
+	if ok, err := p.fits(need); ok || err != nil {
+		p.Unpark()
+		return true
+	}
+	return false
+}
+
+// Unpark clears the waiting mark when the caller gives up waiting.
+func (p *Producer) Unpark() { atomic.StoreUint32(p.producerParked, 0) }

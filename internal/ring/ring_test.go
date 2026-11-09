@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const testCap = 64 << 10
@@ -367,6 +368,243 @@ func TestSecondReservePanics(t *testing.T) {
 		}
 	}()
 	p.TryReserve(8)
+}
+
+// commit writes one n-byte record and returns Commit's wake result.
+func commit(t *testing.T, p *Producer, n int) bool {
+	t.Helper()
+	buf, err := p.TryReserve(n)
+	if err != nil {
+		t.Fatalf("TryReserve(%d): %v", n, err)
+	}
+	fill(buf, 0)
+	return p.Commit()
+}
+
+// release consumes one record and returns Release's wake result.
+func release(t *testing.T, c *Consumer) bool {
+	t.Helper()
+	if _, err := c.TryNext(); err != nil {
+		t.Fatalf("TryNext: %v", err)
+	}
+	return c.Release()
+}
+
+func fillUntilFull(t *testing.T, p *Producer, n int) {
+	t.Helper()
+	for {
+		buf, err := p.TryReserve(n)
+		if errors.Is(err, ErrFull) {
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		fill(buf, 0)
+		p.Commit()
+	}
+}
+
+func TestCommitWakesParkedConsumerOnce(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	if c.Park() {
+		t.Fatal("Park on an empty ring reported ready")
+	}
+	if !commit(t, p, 1) {
+		t.Fatal("Commit after the consumer parked did not ask for a doorbell")
+	}
+	if commit(t, p, 1) {
+		t.Fatal("second Commit rang again for the same park")
+	}
+}
+
+func TestConsumerParkWithDataIsReadyAndClearsFlag(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	commit(t, p, 1)
+	if !c.Park() {
+		t.Fatal("Park with a published record did not report ready")
+	}
+	if commit(t, p, 1) {
+		t.Fatal("Commit rang for a park that reported ready")
+	}
+}
+
+func TestConsumerUnparkIsNotCounted(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	if c.Park() {
+		t.Fatal("Park on an empty ring reported ready")
+	}
+	c.Unpark()
+	if commit(t, p, 1) {
+		t.Fatal("Commit rang for a consumer that had unparked")
+	}
+}
+
+func TestReleaseWakesParkedProducerOnce(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	fillUntilFull(t, p, 1000)
+	if p.Park(1000) {
+		t.Fatal("Park on a full ring reported ready")
+	}
+	if !release(t, c) {
+		t.Fatal("Release after the producer parked did not ask for a doorbell")
+	}
+	if release(t, c) {
+		t.Fatal("second Release rang again for the same park")
+	}
+}
+
+func TestProducerParkWithSpaceIsReadyAndClearsFlag(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	fillUntilFull(t, p, 1000)
+	release(t, c)
+	if !p.Park(1000) {
+		t.Fatal("Park with room for the record did not report ready")
+	}
+	if release(t, c) {
+		t.Fatal("Release rang for a park that reported ready")
+	}
+}
+
+func TestProducerUnparkIsNotCounted(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	fillUntilFull(t, p, 1000)
+	if p.Park(1000) {
+		t.Fatal("Park on a full ring reported ready")
+	}
+	p.Unpark()
+	if release(t, c) {
+		t.Fatal("Release rang for a producer that had unparked")
+	}
+}
+
+func TestProducerParkForOversizedRecordDoesNotBlock(t *testing.T) {
+	p, _ := newPair(t, newRegion(t, testCap))
+	if !p.Park(MaxRecord(testCap) + 1) {
+		t.Fatal("Park for a record TryReserve always rejects would block forever")
+	}
+}
+
+func ring(bell chan struct{}) {
+	select {
+	case bell <- struct{}{}:
+	default:
+	}
+}
+
+// TestParkProtocolNoLostWakeups runs a producer and a consumer that park on a
+// full/empty ring and wait on channel doorbells until 1e6 waits have happened.
+// A lost wakeup deadlocks and trips the watchdog.
+func TestParkProtocolNoLostWakeups(t *testing.T) {
+	const wantWaits = 1_000_000
+	const sentinel = 65 // payload sizes are otherwise 0..64
+	p, c := newPair(t, newRegion(t, testCap))
+	prodBell := make(chan struct{}, 1)
+	consBell := make(chan struct{}, 1)
+	var waits atomic.Int64
+	var prodParks, prodRings, consParks, consRings, unparks int
+	done := make(chan struct{}, 2)
+
+	go func() {
+		defer func() { done <- struct{}{} }()
+		rng := rand.New(rand.NewPCG(5, 6))
+		for seq := uint64(0); ; {
+			n := rng.IntN(sentinel)
+			last := waits.Load() >= wantWaits
+			if last {
+				n = sentinel
+			}
+			buf, err := p.TryReserve(n)
+			if errors.Is(err, ErrFull) {
+				waits.Add(1)
+				prodParks++
+				if p.Park(n) {
+					continue
+				}
+				if rng.IntN(16) == 0 {
+					p.Unpark()
+					unparks++
+					continue
+				}
+				<-prodBell
+				continue
+			}
+			if err != nil {
+				t.Errorf("TryReserve: %v", err)
+				return
+			}
+			fill(buf, seq)
+			if p.Commit() {
+				consRings++
+				ring(consBell)
+			}
+			seq++
+			if last {
+				return
+			}
+			if rng.IntN(8) == 0 {
+				runtime.Gosched()
+			}
+		}
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		rng := rand.New(rand.NewPCG(7, 8))
+		for seq := uint64(0); ; {
+			buf, err := c.TryNext()
+			if errors.Is(err, ErrEmpty) {
+				waits.Add(1)
+				consParks++
+				if c.Park() {
+					continue
+				}
+				if rng.IntN(16) == 0 {
+					c.Unpark()
+					continue
+				}
+				<-consBell
+				continue
+			}
+			if err != nil {
+				t.Errorf("TryNext: %v", err)
+				return
+			}
+			if !check(buf, seq) {
+				t.Errorf("record %d payload mismatch", seq)
+				return
+			}
+			last := len(buf) == sentinel
+			if c.Release() {
+				prodRings++
+				ring(prodBell)
+			}
+			seq++
+			if last {
+				return
+			}
+			if rng.IntN(8) == 0 {
+				runtime.Gosched()
+			}
+		}
+	}()
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Minute):
+			t.Fatalf("deadlock: no progress after %d waits", waits.Load())
+		}
+	}
+	t.Logf("waits=%d producer parks=%d rings=%d consumer parks=%d rings=%d producer unparks=%d",
+		waits.Load(), prodParks, prodRings, consParks, consRings, unparks)
+	if consRings > consParks {
+		t.Errorf("consumer woken %d times for %d parks", consRings, consParks)
+	}
+	if prodRings > prodParks {
+		t.Errorf("producer woken %d times for %d parks", prodRings, prodParks)
+	}
+	if prodParks == 0 || consParks == 0 {
+		t.Error("schedule never parked one side")
+	}
 }
 
 func TestHeaderFieldsOnDistinctCacheLines(t *testing.T) {

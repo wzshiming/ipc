@@ -9,9 +9,11 @@ import (
 // It trusts nothing the producer wrote: every length is checked against
 // MaxRecord, the published bytes and the end of the data area.
 type Consumer struct {
-	data       []byte
-	sharedHead *uint64 // written by the producer
-	sharedTail *uint64 // written by us
+	data           []byte
+	sharedHead     *uint64 // written by the producer
+	sharedTail     *uint64 // written by us
+	consumerParked *uint32
+	producerParked *uint32
 	mask       uint64
 	capacity   uint64
 	maxRecord  uint64
@@ -29,7 +31,9 @@ func NewConsumer(region []byte) (*Consumer, error) {
 	c := &Consumer{
 		data:       region[HeaderSize : HeaderSize+capacity : HeaderSize+capacity],
 		sharedHead: u64(region, offHead),
-		sharedTail: u64(region, offTail),
+		sharedTail:     u64(region, offTail),
+		consumerParked: u32(region, offConsumerParked),
+		producerParked: u32(region, offProducerParked),
 		mask:       uint64(capacity - 1),
 		capacity:   uint64(capacity),
 		maxRecord:  uint64(MaxRecord(capacity)),
@@ -107,5 +111,20 @@ func (c *Consumer) Release() (wakeProducer bool) {
 	c.tail += c.pending
 	c.pending = 0
 	atomic.StoreUint64(c.sharedTail, c.tail)
+	return atomic.LoadUint32(c.producerParked) != 0 && atomic.SwapUint32(c.producerParked, 0) != 0
+}
+
+// Park marks the consumer as waiting for a record, then re-checks. It returns
+// true, with the mark cleared, when a record is already published; otherwise
+// the caller waits for a doorbell from the producer.
+func (c *Consumer) Park() (ready bool) {
+	atomic.StoreUint32(c.consumerParked, 1)
+	if atomic.LoadUint64(c.sharedHead) != c.tail {
+		c.Unpark()
+		return true
+	}
 	return false
 }
+
+// Unpark clears the waiting mark when the caller gives up waiting.
+func (c *Consumer) Unpark() { atomic.StoreUint32(c.consumerParked, 0) }
