@@ -300,7 +300,7 @@ CI only smoke-tests `ipcbench` (1-second runs on shared runners, no performance 
 
 ## Platform notes
 
-- **Windows** needs Windows 10 1803 or later for AF_UNIX sockets.
+- **Windows** needs Windows 10 1803 or later for AF_UNIX sockets. Go's clock there ticks in 0.5–15.6 ms steps, so `ipcbench` times latency samples with `QueryPerformanceCounter`, and the same coarse clock bounds `Config.Spin`: a spin may last up to one timer tick before parking.
 - **Linux and macOS** pass the segment as a file descriptor; fd passing is used only there. The socket file is chmod 0600.
 - **macOS** shared-memory names are limited to 31 characters; the library's random names fit (an internal detail). Socket paths are limited to 104 bytes, so keep them short.
 - **Other GOOS** compile, but creating or attaching a segment fails with an error for which `errors.Is(err, errors.ErrUnsupported)` is true: `Listener.Accept` returns it, and `Dial` returns `ErrRejected`.
