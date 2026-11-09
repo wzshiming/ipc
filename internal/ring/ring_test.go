@@ -478,6 +478,41 @@ func TestProducerUnparkIsNotCounted(t *testing.T) {
 	}
 }
 
+func TestCommitAndReleaseOnUnparkedRingLeaveFlagsClear(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	if commit(t, p, 1) {
+		t.Error("Commit with no parked consumer asked for a doorbell")
+	}
+	if release(t, c) {
+		t.Error("Release with no parked producer asked for a doorbell")
+	}
+	if f := atomic.LoadUint32(c.consumerParked); f != 0 {
+		t.Errorf("consumerParked = %d after Commit, want 0", f)
+	}
+	if f := atomic.LoadUint32(p.producerParked); f != 0 {
+		t.Errorf("producerParked = %d after Release, want 0", f)
+	}
+}
+
+func TestParkAfterPeerPublishedLeavesFlagClear(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	commit(t, p, 1)
+	if !c.Park() {
+		t.Fatal("consumer Park with a published record did not report ready")
+	}
+	if f := atomic.LoadUint32(c.consumerParked); f != 0 {
+		t.Errorf("consumerParked = %d after a ready Park, want 0", f)
+	}
+	fillUntilFull(t, p, 1000)
+	release(t, c)
+	if !p.Park(1) {
+		t.Fatal("producer Park with room for the record did not report ready")
+	}
+	if f := atomic.LoadUint32(p.producerParked); f != 0 {
+		t.Errorf("producerParked = %d after a ready Park, want 0", f)
+	}
+}
+
 func TestProducerParkForOversizedRecordDoesNotBlock(t *testing.T) {
 	p, _ := newPair(t, newRegion(t, testCap))
 	if !p.Park(MaxRecord(testCap) + 1) {
@@ -494,19 +529,23 @@ func ring(bell chan struct{}) {
 
 // TestParkProtocolNoLostWakeups runs a producer and a consumer that park on a
 // full/empty ring and wait on channel doorbells until 1e6 waits have happened.
-// A lost wakeup deadlocks and trips the watchdog.
+// A lost wakeup deadlocks and trips the watchdog. Opening phases force the
+// consumer to block on the empty ring, then the producer on the full one.
 func TestParkProtocolNoLostWakeups(t *testing.T) {
 	const wantWaits = 1_000_000
 	const sentinel = 65 // payload sizes are otherwise 0..64
 	p, c := newPair(t, newRegion(t, testCap))
 	prodBell := make(chan struct{}, 1)
 	consBell := make(chan struct{}, 1)
+	consBlocked := make(chan struct{})
+	prodBlocked := make(chan struct{})
 	var waits atomic.Int64
 	var prodParks, prodRings, consParks, consRings, unparks int
 	done := make(chan struct{}, 2)
 
 	go func() {
 		defer func() { done <- struct{}{} }()
+		<-consBlocked
 		rng := rand.New(rand.NewPCG(5, 6))
 		for seq := uint64(0); ; {
 			n := rng.IntN(sentinel)
@@ -520,6 +559,9 @@ func TestParkProtocolNoLostWakeups(t *testing.T) {
 				prodParks++
 				if p.Park(n) {
 					continue
+				}
+				if prodParks == 1 {
+					close(prodBlocked)
 				}
 				if rng.IntN(16) == 0 {
 					p.Unpark()
@@ -549,6 +591,15 @@ func TestParkProtocolNoLostWakeups(t *testing.T) {
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
+		waits.Add(1)
+		consParks++
+		if c.Park() {
+			t.Error("consumer Park on the untouched ring reported ready")
+			return
+		}
+		close(consBlocked)
+		<-consBell
+		<-prodBlocked
 		rng := rand.New(rand.NewPCG(7, 8))
 		for seq := uint64(0); ; {
 			buf, err := c.TryNext()
