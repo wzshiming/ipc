@@ -36,3 +36,18 @@ jobs:
         run: |
           GOOS=freebsd GOARCH=amd64 go build ./... && GOOS=freebsd GOARCH=amd64 go vet ./...
           GOOS=windows GOARCH=386 go build ./... && GOOS=windows GOARCH=386 go vet ./...
+
+  bench:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Throughput smoke
+        run: go run ./cmd/ipcbench -mode throughput -lanes 2 -size 64KiB -duration 1s
+      - name: Latency smoke
+        run: go run ./cmd/ipcbench -mode latency -duration 1s
