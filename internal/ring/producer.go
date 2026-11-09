@@ -12,12 +12,12 @@ type Producer struct {
 	sharedTail     *uint64 // written by the consumer
 	consumerParked *uint32
 	producerParked *uint32
-	mask       uint64
-	capacity   uint64
-	maxRecord  int
-	head       uint64 // local copy of the shared head
-	cachedTail uint64
-	pending    uint64 // bytes the outstanding reservation advances head by; 0 if none
+	mask           uint64
+	capacity       uint64
+	maxRecord      int
+	head           uint64 // local copy of the shared head
+	cachedTail     uint64
+	pending        uint64 // bytes the outstanding reservation advances head by; 0 if none
 }
 
 // NewProducer attaches a producer to a formatted region.
@@ -27,14 +27,14 @@ func NewProducer(region []byte) (*Producer, error) {
 		return nil, err
 	}
 	p := &Producer{
-		data:       region[HeaderSize : HeaderSize+capacity : HeaderSize+capacity],
-		sharedHead: u64(region, offHead),
+		data:           region[HeaderSize : HeaderSize+capacity : HeaderSize+capacity],
+		sharedHead:     u64(region, offHead),
 		sharedTail:     u64(region, offTail),
 		consumerParked: u32(region, offConsumerParked),
 		producerParked: u32(region, offProducerParked),
-		mask:       uint64(capacity - 1),
-		capacity:   uint64(capacity),
-		maxRecord:  MaxRecord(capacity),
+		mask:           uint64(capacity - 1),
+		capacity:       uint64(capacity),
+		maxRecord:      MaxRecord(capacity),
 	}
 	p.head = atomic.LoadUint64(p.sharedHead)
 	p.cachedTail = atomic.LoadUint64(p.sharedTail)
