@@ -8,7 +8,7 @@
 # a regression.
 #
 # usage: hack/ab-bench.sh [-n count] [-t benchtime] [-b regex] <base>
-#   -n  samples per benchmark per side (default 8)
+#   -n  samples per benchmark per side (default 16)
 #   -t  -benchtime of each sample (default 100ms)
 #   -b  -bench regex (default .)
 
@@ -21,7 +21,9 @@ usage() {
 	exit 2
 }
 
-count=8 benchtime=100ms bench=.
+# At 8 samples benchstat's 95 % interval on the median is the min-max range, so
+# one outlier sets the ±; 16 leaves the three most extreme per side out of it.
+count=16 benchtime=100ms bench=.
 while getopts 'n:t:b:h' opt; do
 	case $opt in
 	n) count=$OPTARG ;;
