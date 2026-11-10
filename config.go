@@ -18,23 +18,14 @@ const (
 	maxRingSize = 1 << 30
 )
 
-// Config sizes a connection. On a Listener it sets the limits and defaults
-// for accepted connections; on Dial it is a request the listener clamps to
-// its limits, and both ends then use the clamped values.
-type Config struct {
-	// Lanes is the number of independent bidirectional lanes; 0 means 1.
-	Lanes int
-	// RingSize is each lane's ring capacity per direction in bytes, a power
-	// of two in [64 KiB, 1 GiB]; 0 means 4 MiB.
+// config sizes a connection; ListenConfig and Dialer document its fields.
+type config struct {
+	Lanes    int
 	RingSize int
-	// Spin is how long a blocking call busy re-checks its lane, without
-	// yielding its thread, before parking; 0 means 50 µs, a negative value
-	// parks at once. Each spinning call holds a CPU, so choose Spin small or
-	// negative when CPUs are scarce. It is local to each end.
-	Spin time.Duration
+	Spin     time.Duration
 }
 
-func (c Config) withDefaults() Config {
+func (c config) withDefaults() config {
 	if c.Lanes == 0 {
 		c.Lanes = defaultLanes
 	}
@@ -61,7 +52,7 @@ func segmentSize(lanes, ringSize uint64) uint64 {
 	return 2 * lanes * uint64(ring.Size(int(ringSize)))
 }
 
-func (c Config) checkListener() error {
+func (c config) checkListener() error {
 	if c.Lanes < 0 || !validLanes(uint64(c.Lanes)) {
 		return fmt.Errorf("ipc: Lanes %d outside [1, %d]", c.Lanes, maxLanes)
 	}

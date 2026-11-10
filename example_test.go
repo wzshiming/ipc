@@ -13,27 +13,27 @@ import (
 
 // connect listens on a fresh socket and returns both ends of one connection.
 // In real use the listener and the dialer are two processes.
-func connect(ctx context.Context, cfg ipc.Config) (server, client *ipc.Conn, cleanup func()) {
+func connect(lc *ipc.ListenConfig, d *ipc.Dialer) (server, client *ipc.Conn, cleanup func()) {
 	dir, err := os.MkdirTemp("", "ipc") // keep the path short: sun_path is ≤ 104 bytes on macOS
 	if err != nil {
 		log.Fatal(err)
 	}
 	path := filepath.Join(dir, "s")
 
-	l, err := ipc.Listen(path, cfg)
+	l, err := lc.Listen(context.Background(), path)
 	if err != nil {
 		log.Fatal(err)
 	}
 	accepted := make(chan *ipc.Conn, 1)
 	go func() {
-		c, err := l.Accept(ctx)
+		c, err := l.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
 		accepted <- c
 	}()
 
-	client, err = ipc.Dial(ctx, path, cfg)
+	client, err = d.Dial(path)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -48,8 +48,10 @@ func connect(ctx context.Context, cfg ipc.Config) (server, client *ipc.Conn, cle
 
 // Records are written and read in place in shared memory.
 func Example() {
-	ctx := context.Background()
-	server, client, cleanup := connect(ctx, ipc.Config{Lanes: 2, RingSize: 64 << 10})
+	server, client, cleanup := connect(
+		&ipc.ListenConfig{Lanes: 2, RingSize: 64 << 10},
+		&ipc.Dialer{Lanes: 2, RingSize: 64 << 10},
+	)
 	defer cleanup()
 	fmt.Println("lanes:", client.Lanes(), "max record:", client.MaxRecord())
 
@@ -79,8 +81,7 @@ func Example() {
 
 // NewStream turns a lane into a net.Conn byte stream.
 func ExampleNewStream() {
-	ctx := context.Background()
-	server, client, cleanup := connect(ctx, ipc.Config{})
+	server, client, cleanup := connect(nil, nil) // nil configs use the defaults
 	defer cleanup()
 
 	w := ipc.NewStream(client.Lane(0))

@@ -31,7 +31,7 @@ func isTimeout(err error) bool {
 }
 
 func TestPastReadDeadlineFailsNextAndReadAtOnce(t *testing.T) {
-	_, dc := pair(t, Config{}, Config{})
+	_, dc := pair(t, ListenConfig{}, Dialer{})
 	l := dc.Lane(0)
 	if err := l.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestPastReadDeadlineFailsNextAndReadAtOnce(t *testing.T) {
 }
 
 func TestSetReadDeadlineInterruptsBlockedNext(t *testing.T) {
-	_, dc := pair(t, Config{}, Config{Spin: -1})
+	_, dc := pair(t, ListenConfig{}, Dialer{Spin: -1})
 	l := dc.Lane(0)
 	ch := make(chan error, 1)
 	go func() {
@@ -69,7 +69,7 @@ func TestSetReadDeadlineInterruptsBlockedNext(t *testing.T) {
 }
 
 func TestZeroReadDeadlineClearsAndNextBlocksUntilData(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{Spin: -1})
+	lc, dc := pair(t, ListenConfig{}, Dialer{Spin: -1})
 	l := dc.Lane(0)
 	l.SetReadDeadline(time.Now().Add(-time.Second))
 	l.SetReadDeadline(time.Time{})
@@ -92,7 +92,7 @@ func TestZeroReadDeadlineClearsAndNextBlocksUntilData(t *testing.T) {
 }
 
 func TestWriteDeadlineTimesOutReserveAndWriteOnFullRing(t *testing.T) {
-	lc, _ := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10})
+	lc, _ := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
 	l := lc.Lane(0)
 	fill(t, l)
 	l.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
@@ -106,7 +106,7 @@ func TestWriteDeadlineTimesOutReserveAndWriteOnFullRing(t *testing.T) {
 }
 
 func TestReadDeadlineTimeoutKeepsLaneUsable(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	l := dc.Lane(0)
 	l.SetDeadline(time.Now().Add(10 * time.Millisecond))
 	if _, err := l.Next(); !isTimeout(err) {
@@ -123,7 +123,7 @@ func TestReadDeadlineTimeoutKeepsLaneUsable(t *testing.T) {
 }
 
 func TestTryCallsIgnoreDeadlines(t *testing.T) {
-	lc, dc := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10})
+	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
 	tx, rx := lc.Lane(0), dc.Lane(0)
 	past := time.Now().Add(-time.Second)
 	tx.SetDeadline(past)
@@ -141,7 +141,7 @@ func TestTryCallsIgnoreDeadlines(t *testing.T) {
 }
 
 func TestStreamDeadlinesGovernTheLane(t *testing.T) {
-	_, dc := pair(t, Config{}, Config{})
+	_, dc := pair(t, ListenConfig{}, Dialer{})
 	s := NewStream(dc.Lane(0))
 	s.SetReadDeadline(time.Now().Add(-time.Second))
 	if _, err := dc.Lane(0).Next(); !isTimeout(err) {

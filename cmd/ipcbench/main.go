@@ -189,10 +189,6 @@ func (o *options) normalize() error {
 	return nil
 }
 
-func (o options) config() ipc.Config {
-	return ipc.Config{Lanes: o.lanes, RingSize: o.ring, Spin: o.spin}
-}
-
 // peerArgs is the command line of the peer that dials path.
 func (o options) peerArgs(path string) []string {
 	return []string{
@@ -253,7 +249,8 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 		defer os.RemoveAll(dir)
 		path = filepath.Join(dir, "b.sock")
 	}
-	ln, err := ipc.Listen(path, o.config())
+	lc := ipc.ListenConfig{Lanes: o.lanes, RingSize: o.ring, Spin: o.spin}
+	ln, err := lc.Listen(context.Background(), path)
 	if err != nil {
 		return nil, err
 	}
@@ -264,18 +261,17 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 	}
 	defer p.stop()
 
-	ctx, cancel := context.WithTimeout(context.Background(), o.duration+time.Minute)
-	defer cancel()
-	acceptCtx, acceptCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer acceptCancel()
+	ln.SetDeadline(time.Now().Add(30 * time.Second))
+	accepted := make(chan struct{})
 	go func() {
 		select {
 		case <-p.done:
-			acceptCancel()
-		case <-acceptCtx.Done():
+			ln.SetDeadline(time.Unix(1, 0))
+		case <-accepted:
 		}
 	}()
-	conn, err := ln.Accept(acceptCtx)
+	conn, err := ln.Accept()
+	close(accepted)
 	if err != nil {
 		select {
 		case <-p.done:
@@ -315,9 +311,8 @@ func checkConn(o options, conn *ipc.Conn) error {
 
 // runPeer dials, then produces or echoes until the parent closes.
 func runPeer(o options) error {
-	ctx, cancel := context.WithTimeout(context.Background(), o.duration+time.Minute)
-	defer cancel()
-	conn, err := ipc.Dial(ctx, o.path, o.config())
+	d := ipc.Dialer{Lanes: o.lanes, RingSize: o.ring, Spin: o.spin, Timeout: time.Minute}
+	conn, err := d.Dial(o.path)
 	if err != nil {
 		return err
 	}

@@ -1,7 +1,6 @@
 package ipc
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -44,13 +43,11 @@ func TestMain(m *testing.M) {
 }
 
 func runChild(role, path string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	cfg := Config{Lanes: 1}
+	d := Dialer{Lanes: 1, Timeout: 10 * time.Second}
 	if role == "stream" {
-		cfg.Lanes = e2eLanes
+		d.Lanes = e2eLanes
 	}
-	c, err := Dial(ctx, path, cfg)
-	cancel()
+	c, err := d.Dial(path)
 	if err != nil {
 		return err
 	}
@@ -192,9 +189,9 @@ func recvStream(l *Lane, volume int64) error {
 }
 
 // startPeer listens, starts the child in role and returns the accepted Conn.
-func startPeer(t *testing.T, role string, cfg Config) (*Conn, *exec.Cmd) {
+func startPeer(t *testing.T, role string, lcfg ListenConfig) (*Conn, *exec.Cmd) {
 	t.Helper()
-	l, path := listen(t, cfg)
+	l, path := listen(t, lcfg)
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
 	cmd.Env = append(os.Environ(), envRole+"="+role, envPath+"="+path)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
@@ -205,9 +202,8 @@ func startPeer(t *testing.T, role string, cfg Config) (*Conn, *exec.Cmd) {
 		cmd.Process.Kill()
 		cmd.Wait()
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	c, err := l.Accept(ctx)
+	l.SetDeadline(time.Now().Add(20 * time.Second))
+	c, err := l.Accept()
 	if err != nil {
 		t.Fatal("Accept:", err)
 	}
@@ -216,7 +212,7 @@ func startPeer(t *testing.T, role string, cfg Config) (*Conn, *exec.Cmd) {
 }
 
 func TestE2EFourLanesBidirectionalStream(t *testing.T) {
-	c, cmd := startPeer(t, "stream", Config{Lanes: e2eLanes})
+	c, cmd := startPeer(t, "stream", ListenConfig{Lanes: e2eLanes})
 	if c.Lanes() != e2eLanes {
 		t.Fatalf("Lanes = %d; want %d", c.Lanes(), e2eLanes)
 	}
@@ -238,7 +234,7 @@ func TestE2EFourLanesBidirectionalStream(t *testing.T) {
 func TestE2EFourLanesStreamDrainsAfterChildCloses(t *testing.T) {
 	t.Setenv(envMiB, "8")
 	for i := range 5 {
-		c, cmd := startPeer(t, "stream", Config{Lanes: e2eLanes})
+		c, cmd := startPeer(t, "stream", ListenConfig{Lanes: e2eLanes})
 		if err := runStream(c, 0, streamVolume()); err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
@@ -250,7 +246,7 @@ func TestE2EFourLanesStreamDrainsAfterChildCloses(t *testing.T) {
 }
 
 func TestE2EPingPong64B(t *testing.T) {
-	c, cmd := startPeer(t, "echo", Config{})
+	c, cmd := startPeer(t, "echo", ListenConfig{})
 	l := c.Lane(0)
 	start := time.Now()
 	for seq := uint64(0); seq < pingPongCount; seq++ {
@@ -282,7 +278,7 @@ func TestE2EPingPong64B(t *testing.T) {
 }
 
 func TestE2EKilledPeerWakesBlockedNextWithErrPeerClosed(t *testing.T) {
-	c, cmd := startPeer(t, "hang", Config{Spin: -1})
+	c, cmd := startPeer(t, "hang", ListenConfig{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
 		_, err := c.Lane(0).Next()

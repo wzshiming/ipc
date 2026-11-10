@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -12,108 +13,131 @@ import (
 	"github.com/wzshiming/ipc/internal/shm"
 )
 
-// Listener accepts connections on a socket path.
+// ListenConfig contains options for listening. Its values are the limits and
+// the defaults for accepted connections: a dialer's request is clamped to
+// them and both ends use the clamped values.
+type ListenConfig struct {
+	// Lanes is the most lanes a connection may have; 0 means 1.
+	Lanes int
+	// RingSize is the largest ring capacity per lane direction in bytes, a
+	// power of two in [64 KiB, 1 GiB]; 0 means 4 MiB.
+	RingSize int
+	// Spin is how long a blocking call on an accepted connection busy
+	// re-checks its lane, without yielding its thread, before parking; 0
+	// means 50 µs and a negative value parks at once. Each spinning call
+	// holds a CPU, so choose Spin small or negative when CPUs are scarce.
+	Spin time.Duration
+}
+
+// Listener accepts connections on an AF_UNIX socket path.
 type Listener struct {
 	cl   *control.Listener
-	cfg  Config
+	cfg  config
 	addr addr
 
-	links     chan accepted
-	done      chan struct{}
+	mu       sync.Mutex
+	deadline time.Time
+
 	closeOnce sync.Once
 	closeErr  error
-	wg        sync.WaitGroup
 }
 
-type accepted struct {
-	link *control.Link
-	err  error
+// Listen listens on the AF_UNIX socket at path with the default
+// ListenConfig. A socket file left behind by a dead listener is replaced.
+func Listen(path string) (*Listener, error) {
+	var lc *ListenConfig
+	return lc.Listen(context.Background(), path)
 }
 
-// Listen listens on the AF_UNIX socket at path. cfg sets the limits and
-// defaults for accepted connections.
-func Listen(path string, cfg Config) (*Listener, error) {
+// Listen listens on the AF_UNIX socket at path. It fails if lc's values are
+// out of range or another listener is live on path; a socket file left
+// behind by a dead listener is replaced. ctx bounds the setup, including the
+// probe of an existing socket file, but not the returned Listener. A nil lc
+// uses the defaults.
+func (lc *ListenConfig) Listen(ctx context.Context, path string) (*Listener, error) {
+	var cfg config
+	if lc != nil {
+		cfg = config(*lc)
+	}
 	cfg = cfg.withDefaults()
 	if err := cfg.checkListener(); err != nil {
 		return nil, err
 	}
-	cl, err := control.Listen(context.Background(), path)
+	cl, err := control.Listen(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	l := &Listener{
-		cl:    cl,
-		cfg:   cfg,
-		addr:  addr(path),
-		links: make(chan accepted),
-		done:  make(chan struct{}),
-	}
-	l.wg.Add(1)
-	go l.acceptLoop()
-	return l, nil
+	return &Listener{cl: cl, cfg: cfg, addr: addr(path)}, nil
 }
 
-// acceptLoop hands raw links to Accept, holding at most one at a time.
-func (l *Listener) acceptLoop() {
-	defer l.wg.Done()
+// Accept waits for a dialer, completes its handshake and returns the
+// connection. Dialers that fail the handshake are dropped and Accept keeps
+// waiting. Past the deadline set by SetDeadline it returns
+// os.ErrDeadlineExceeded, and after Close net.ErrClosed.
+func (l *Listener) Accept() (*Conn, error) {
 	for {
 		link, err := l.cl.Accept()
-		if errors.Is(err, control.ErrClosed) {
-			return
+		if err != nil {
+			return nil, listenerErr(err)
 		}
-		select {
-		case l.links <- accepted{link, err}:
-		case <-l.done:
-			if link != nil {
-				link.Close()
-			}
-			return
+		c, local, err := l.handshake(link)
+		if err == nil {
+			return c, nil
+		}
+		if local {
+			return nil, err
 		}
 	}
 }
 
-// Accept waits for a dialer and completes its handshake. Dialers that fail
-// the handshake are dropped and Accept keeps waiting.
-func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
-	for {
-		select {
-		case a := <-l.links:
-			if a.err != nil {
-				return nil, a.err
-			}
-			c, local, err := l.handshake(ctx, a.link)
-			if err == nil {
-				return c, nil
-			}
-			if local {
-				return nil, err
-			}
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-l.done:
-			return nil, net.ErrClosed
-		}
+// listenerErr maps the control listener's close and timeout errors to the
+// standard ones.
+func listenerErr(err error) error {
+	switch {
+	case errors.Is(err, control.ErrClosed):
+		return net.ErrClosed
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return os.ErrDeadlineExceeded
 	}
+	return err
+}
+
+// SetDeadline sets the deadline for Accept, including a call already
+// blocked, and for the handshakes it performs; a zero t means no deadline.
+func (l *Listener) SetDeadline(t time.Time) error {
+	l.mu.Lock()
+	l.deadline = t
+	l.mu.Unlock()
+	if err := l.cl.SetDeadline(t); err != nil {
+		return listenerErr(err)
+	}
+	return nil
+}
+
+// handshakeDeadline is when a handshake begun now must have finished.
+func (l *Listener) handshakeDeadline() time.Time {
+	t := time.Now().Add(handshakeTimeout)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.deadline.IsZero() && l.deadline.Before(t) {
+		return l.deadline
+	}
+	return t
 }
 
 // handshake answers the dialer's Hello. local reports a failure on this end
 // rather than the dialer's. The link is closed on failure.
-func (l *Listener) handshake(ctx context.Context, link *control.Link) (c *Conn, local bool, err error) {
-	stop := context.AfterFunc(ctx, func() { link.SetDeadline(time.Unix(1, 0)) })
+func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error) {
 	var seg *shm.Segment
 	defer func() {
 		if err != nil {
-			stop()
 			link.Close()
 			if seg != nil {
 				seg.Close()
 			}
 		}
 	}()
-	link.SetDeadline(time.Now().Add(handshakeTimeout))
+	link.SetDeadline(l.handshakeDeadline())
 	typ, p, fds, err := link.Recv()
 	if err != nil {
 		return nil, false, err
@@ -154,9 +178,6 @@ func (l *Listener) handshake(ctx context.Context, link *control.Link) (c *Conn, 
 	if err != nil {
 		return nil, false, err
 	}
-	if !stop() {
-		return nil, false, ctx.Err()
-	}
 	link.SetDeadline(time.Time{})
 	c, err = newConn(link, seg, int(lanes), int(ringSize), l.cfg.Spin, string(l.addr), true)
 	if err != nil {
@@ -165,13 +186,10 @@ func (l *Listener) handshake(ctx context.Context, link *control.Link) (c *Conn, 
 	return c, false, nil
 }
 
-// Close stops listening; connections already accepted stay open.
+// Close stops listening and removes the socket file; a blocked Accept
+// returns net.ErrClosed. Connections already accepted stay open.
 func (l *Listener) Close() error {
-	l.closeOnce.Do(func() {
-		close(l.done)
-		l.closeErr = l.cl.Close()
-		l.wg.Wait()
-	})
+	l.closeOnce.Do(func() { l.closeErr = l.cl.Close() })
 	return l.closeErr
 }
 

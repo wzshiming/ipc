@@ -2,7 +2,6 @@ package ipc
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -20,9 +19,10 @@ import (
 // envCopyMiB sets the cross-process io.Copy volume in MiB (default 1024).
 const envCopyMiB = "IPC_E2E_COPY_MIB"
 
-// streamPair returns the listener-side and dialer-side Streams of lane 0.
-func streamPair(t testing.TB, cfg Config) (ls, ds net.Conn) {
-	lc, dc := pair(t, cfg, cfg)
+// streamPair returns the listener-side and dialer-side Streams of lane 0,
+// with lcfg's settings on both ends.
+func streamPair(t testing.TB, lcfg ListenConfig) (ls, ds net.Conn) {
+	lc, dc := pair(t, lcfg, Dialer{Lanes: lcfg.Lanes, RingSize: lcfg.RingSize, Spin: lcfg.Spin})
 	ls, ds = NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
 	t.Cleanup(func() {
 		ls.Close()
@@ -37,19 +37,18 @@ func makeStreamPipe() (c1, c2 net.Conn, stop func(), err error) {
 		return nil, nil, nil, err
 	}
 	path := filepath.Join(dir, "s")
-	ln, err := Listen(path, Config{})
+	ln, err := Listen(path)
 	if err != nil {
 		os.RemoveAll(dir)
 		return nil, nil, nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ln.SetDeadline(time.Now().Add(10 * time.Second))
 	ch := make(chan *Conn, 1)
 	go func() {
-		c, _ := ln.Accept(ctx)
+		c, _ := ln.Accept()
 		ch <- c
 	}()
-	dc, err := Dial(ctx, path, Config{})
+	dc, err := (&Dialer{Timeout: 10 * time.Second}).Dial(path)
 	lc := <-ch
 	if err != nil || lc == nil {
 		if dc != nil {
@@ -82,7 +81,7 @@ func TestStreamConformsToNetConn(t *testing.T) {
 }
 
 func TestStreamReadKeepsUnreadRecordAcrossReads(t *testing.T) {
-	ls, ds := streamPair(t, Config{})
+	ls, ds := streamPair(t, ListenConfig{})
 	if _, err := ls.Write([]byte("abcdef")); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +100,7 @@ func TestStreamReadKeepsUnreadRecordAcrossReads(t *testing.T) {
 }
 
 func TestStreamEmptyWriteSendsNothing(t *testing.T) {
-	ls, ds := streamPair(t, Config{})
+	ls, ds := streamPair(t, ListenConfig{})
 	if n, err := ls.Write(nil); n != 0 || err != nil {
 		t.Fatalf("Write(nil) = %d, %v; want 0, nil", n, err)
 	}
@@ -113,7 +112,7 @@ func TestStreamEmptyWriteSendsNothing(t *testing.T) {
 }
 
 func TestStreamWriteSplitsIntoMaxRecords(t *testing.T) {
-	ls, ds := streamPair(t, Config{RingSize: 64 << 10})
+	ls, ds := streamPair(t, ListenConfig{RingSize: 64 << 10})
 	want := make([]byte, 5*(64<<10)+123)
 	rand.NewChaCha8([32]byte{1}).Read(want)
 	go func() {
@@ -127,7 +126,7 @@ func TestStreamWriteSplitsIntoMaxRecords(t *testing.T) {
 }
 
 func TestStreamPeerReadsEOFAfterDrainingDataWrittenBeforeClose(t *testing.T) {
-	ls, ds := streamPair(t, Config{})
+	ls, ds := streamPair(t, ListenConfig{})
 	ls.Write([]byte("bye"))
 	if err := ls.Close(); err != nil {
 		t.Fatal("Close:", err)
@@ -145,7 +144,7 @@ func TestStreamPeerReadsEOFAfterDrainingDataWrittenBeforeClose(t *testing.T) {
 }
 
 func TestStreamReadDrainsThenEOFAfterPeerClosesStreamAndConn(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
 	want := make([]byte, 1<<20)
 	rand.NewChaCha8([32]byte{2}).Read(want)
@@ -170,7 +169,7 @@ func TestStreamReadDrainsThenEOFAfterPeerClosesStreamAndConn(t *testing.T) {
 }
 
 func TestStreamReadDrainsThenErrPeerClosedAfterPeerCrash(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
 	want := make([]byte, 1<<20)
 	rand.NewChaCha8([32]byte{3}).Read(want)
@@ -189,7 +188,7 @@ func TestStreamReadDrainsThenErrPeerClosedAfterPeerCrash(t *testing.T) {
 }
 
 func TestStreamWriteAfterCloseIsNetErrClosed(t *testing.T) {
-	ls, _ := streamPair(t, Config{})
+	ls, _ := streamPair(t, ListenConfig{})
 	ls.Close()
 	if _, err := ls.Write([]byte("x")); err != net.ErrClosed {
 		t.Fatalf("Write after Close = %v; want net.ErrClosed", err)
@@ -200,7 +199,7 @@ func TestStreamWriteAfterCloseIsNetErrClosed(t *testing.T) {
 }
 
 func TestStreamCloseWakesBlockedRead(t *testing.T) {
-	_, ds := streamPair(t, Config{Spin: -1})
+	_, ds := streamPair(t, ListenConfig{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
 		_, err := ds.Read(make([]byte, 8))
@@ -214,7 +213,7 @@ func TestStreamCloseWakesBlockedRead(t *testing.T) {
 }
 
 func TestStreamReadDrainsThenEOFAfterPeerClosesConnWithoutMarker(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
 	if _, err := ls.Write([]byte("bye")); err != nil {
 		t.Fatal(err)
@@ -228,7 +227,7 @@ func TestStreamReadDrainsThenEOFAfterPeerClosesConnWithoutMarker(t *testing.T) {
 }
 
 func TestStreamCloseLeavesConnOpen(t *testing.T) {
-	lc, dc := pair(t, Config{Lanes: 2}, Config{Lanes: 2})
+	lc, dc := pair(t, ListenConfig{Lanes: 2}, Dialer{Lanes: 2})
 	if err := NewStream(lc.Lane(0)).Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +243,7 @@ func TestStreamCloseLeavesConnOpen(t *testing.T) {
 }
 
 func TestStreamDeadlineErrorIsNetTimeout(t *testing.T) {
-	_, ds := streamPair(t, Config{})
+	_, ds := streamPair(t, ListenConfig{})
 	ds.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
 	_, err := ds.Read(make([]byte, 8))
 	var ne net.Error
@@ -254,7 +253,7 @@ func TestStreamDeadlineErrorIsNetTimeout(t *testing.T) {
 }
 
 func TestStreamAddrsAreConnAddrs(t *testing.T) {
-	lc, _ := pair(t, Config{}, Config{})
+	lc, _ := pair(t, ListenConfig{}, Dialer{})
 	s := NewStream(lc.Lane(0))
 	defer s.Close()
 	if s.LocalAddr() != lc.LocalAddr() || s.RemoteAddr() != lc.RemoteAddr() {
@@ -268,7 +267,7 @@ type fillReader struct{}
 func (fillReader) Read(p []byte) (int, error) { return len(p), nil }
 
 func TestStreamIOCopyThroughput(t *testing.T) {
-	ls, ds := streamPair(t, Config{})
+	ls, ds := streamPair(t, ListenConfig{})
 	volume := int64(4 << 30)
 	if raceEnabled() {
 		volume = 256 << 20
@@ -312,7 +311,7 @@ func copyVolume() int64 {
 }
 
 func TestE2EStreamIOCopyEchoesRandomData(t *testing.T) {
-	c, cmd := startPeer(t, "copy", Config{})
+	c, cmd := startPeer(t, "copy", ListenConfig{})
 	s := NewStream(c.Lane(0))
 	volume := copyVolume()
 	start := time.Now()

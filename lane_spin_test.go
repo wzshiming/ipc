@@ -51,7 +51,7 @@ func TestPinnedPingPongDoesNotPayThreadHandoffPerRoundTrip(t *testing.T) {
 	if raceEnabled() || testing.Short() || runtime.GOMAXPROCS(0) < 2 {
 		t.Skip("needs two idle CPUs and no race detector")
 	}
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	pinnedPingPong(t, lc, dc, 1000)
 	samples := pinnedPingPong(t, lc, dc, 5000)
 	slices.Sort(samples)
@@ -61,7 +61,7 @@ func TestPinnedPingPongDoesNotPayThreadHandoffPerRoundTrip(t *testing.T) {
 }
 
 func BenchmarkPinnedPingPong64B(b *testing.B) {
-	lc, dc := pair(b, Config{}, Config{})
+	lc, dc := pair(b, ListenConfig{}, Dialer{})
 	b.ResetTimer()
 	pinnedPingPong(b, lc, dc, b.N)
 }

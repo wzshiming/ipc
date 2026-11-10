@@ -23,7 +23,7 @@ func raceEnabled() bool {
 }
 
 func TestWriteReadBothDirectionsOnEveryLane(t *testing.T) {
-	lc, dc := pair(t, Config{Lanes: 3}, Config{Lanes: 3})
+	lc, dc := pair(t, ListenConfig{Lanes: 3}, Dialer{Lanes: 3})
 	buf := make([]byte, 64)
 	for i := range 3 {
 		for _, ends := range [][2]*Conn{{lc, dc}, {dc, lc}} {
@@ -44,7 +44,7 @@ func TestWriteReadBothDirectionsOnEveryLane(t *testing.T) {
 }
 
 func TestReadShortBufferConsumesRecord(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	lc.Lane(0).Write([]byte("abcdef"))
 	lc.Lane(0).Write([]byte("next"))
 	buf := make([]byte, 3)
@@ -60,7 +60,7 @@ func TestReadShortBufferConsumesRecord(t *testing.T) {
 }
 
 func TestWriteEmptySendsZeroLengthRecord(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	if n, err := lc.Lane(0).Write(nil); n != 0 || err != nil {
 		t.Fatalf("Write(nil) = %d, %v; want 0, nil", n, err)
 	}
@@ -71,7 +71,7 @@ func TestWriteEmptySendsZeroLengthRecord(t *testing.T) {
 }
 
 func TestWriteAboveMaxRecordIsErrTooLarge(t *testing.T) {
-	lc, _ := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10})
+	lc, _ := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
 	n, err := lc.Lane(0).Write(make([]byte, lc.MaxRecord()+1))
 	if n != 0 || !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("Write = %d, %v; want 0, ErrTooLarge", n, err)
@@ -85,14 +85,14 @@ func TestWriteAboveMaxRecordIsErrTooLarge(t *testing.T) {
 }
 
 func TestTryNextOnEmptyLaneIsErrWouldBlock(t *testing.T) {
-	_, dc := pair(t, Config{}, Config{})
+	_, dc := pair(t, ListenConfig{}, Dialer{})
 	if _, err := dc.Lane(0).TryNext(); !errors.Is(err, ErrWouldBlock) {
 		t.Fatalf("TryNext = %v; want ErrWouldBlock", err)
 	}
 }
 
 func TestTryReserveOnFullLaneIsErrWouldBlock(t *testing.T) {
-	lc, _ := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10})
+	lc, _ := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
 	tx := lc.Lane(0)
 	for range 64 {
 		if _, err := tx.TryReserve(4000); err != nil {
@@ -107,7 +107,7 @@ func TestTryReserveOnFullLaneIsErrWouldBlock(t *testing.T) {
 }
 
 func TestOutOfOrderLaneCallsReturnErrorsNotPanics(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	tx, rx := lc.Lane(0), dc.Lane(0)
 	if err := tx.Commit(); err == nil {
 		t.Fatal("Commit without Reserve succeeded")
@@ -132,7 +132,7 @@ func TestOutOfOrderLaneCallsReturnErrorsNotPanics(t *testing.T) {
 }
 
 func TestBlockedNextIsWokenByDoorbell(t *testing.T) {
-	lc, dc := pair(t, Config{Spin: -1}, Config{Spin: -1})
+	lc, dc := pair(t, ListenConfig{Spin: -1}, Dialer{Spin: -1})
 	ch := make(chan []byte, 1)
 	go func() {
 		buf := make([]byte, 8)
@@ -152,7 +152,7 @@ func TestBlockedNextIsWokenByDoorbell(t *testing.T) {
 }
 
 func TestBlockedReserveIsWokenByRelease(t *testing.T) {
-	lc, dc := pair(t, Config{RingSize: 64 << 10, Spin: -1}, Config{RingSize: 64 << 10, Spin: -1})
+	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10, Spin: -1}, Dialer{RingSize: 64 << 10, Spin: -1})
 	tx, rx := lc.Lane(0), dc.Lane(0)
 	for {
 		if _, err := tx.TryReserve(4000); err != nil {
@@ -178,7 +178,7 @@ func TestBlockedReserveIsWokenByRelease(t *testing.T) {
 }
 
 func TestSteadyStateHotPathAllocatesNothing(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	tx, rx := lc.Lane(0), dc.Lane(0)
 	allocs := testing.AllocsPerRun(1000, func() {
 		p, err := tx.TryReserve(64)
@@ -198,7 +198,7 @@ func TestSteadyStateHotPathAllocatesNothing(t *testing.T) {
 }
 
 func TestBlockingCallsWithDataOrRoomAllocateNothing(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	tx, rx := lc.Lane(0), dc.Lane(0)
 	allocs := testing.AllocsPerRun(1000, func() {
 		p, err := tx.Reserve(64)
@@ -255,7 +255,7 @@ func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
 }
 
 func TestSingleLane64KiBThroughput(t *testing.T) {
-	lc, dc := pair(t, Config{}, Config{})
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	records := 16384
 	if raceEnabled() {
 		records = 1024
@@ -269,7 +269,7 @@ func TestSingleLane64KiBThroughput(t *testing.T) {
 }
 
 func BenchmarkLane64KiB(b *testing.B) {
-	lc, dc := pair(b, Config{}, Config{})
+	lc, dc := pair(b, ListenConfig{}, Dialer{})
 	b.SetBytes(64 << 10)
 	b.ResetTimer()
 	transfer64KiB(b, lc, dc, b.N)
