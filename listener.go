@@ -94,7 +94,7 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-l.done:
-			return nil, ErrClosed
+			return nil, net.ErrClosed
 		}
 	}
 }

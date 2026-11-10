@@ -96,7 +96,7 @@ func (l *Lane) TryReserve(n int) ([]byte, error) {
 		return nil, errOrder
 	}
 	if !l.tx.acquire(l.c) {
-		return nil, l.c.err
+		return nil, l.c.sendErr()
 	}
 	p, err := l.prod.TryReserve(n)
 	if err != nil {
@@ -132,7 +132,7 @@ func (l *Lane) Reserve(ctx context.Context, n int) ([]byte, error) {
 	}
 	for {
 		if !l.tx.acquire(l.c) {
-			return nil, l.c.err
+			return nil, l.c.sendErr()
 		}
 		ready := l.prod.Park(n)
 		l.tx.release(l.c)
@@ -146,7 +146,7 @@ func (l *Lane) Reserve(ctx context.Context, n int) ([]byte, error) {
 				}
 				return nil, ctx.Err()
 			case <-l.c.done:
-				return nil, l.c.err
+				return nil, l.c.sendErr()
 			}
 		}
 		if p, err = l.TryReserve(n); err != ErrWouldBlock {
@@ -164,7 +164,7 @@ func (l *Lane) Commit() error {
 	l.tx.held = false
 	wake := l.prod.Commit()
 	if l.tx.release(l.c) {
-		return l.c.err
+		return l.c.sendErr()
 	}
 	if wake {
 		return l.c.ring(&l.tx.bell)
@@ -190,14 +190,14 @@ func (l *Lane) TryNext() ([]byte, error) {
 		return nil, errOrder
 	}
 	if !l.rx.acquire(l.c) {
-		return nil, l.c.err
+		return nil, l.c.recvErr()
 	}
 	p, err := l.cons.TryNext()
 	if err == ring.ErrEmpty && isClosed(l.c.done) {
 		// Recheck: all the peer committed before it left is visible by now.
 		if p, err = l.cons.TryNext(); err == ring.ErrEmpty {
 			l.rx.release(l.c)
-			return nil, l.c.err
+			return nil, l.c.recvErr()
 		}
 	}
 	if err != nil {
@@ -236,7 +236,7 @@ func (l *Lane) Next(ctx context.Context) ([]byte, error) {
 	}
 	for {
 		if !l.rx.acquire(l.c) {
-			return nil, l.c.err
+			return nil, l.c.recvErr()
 		}
 		ready := l.cons.Park()
 		l.rx.release(l.c)
@@ -312,7 +312,7 @@ func (c *Conn) interrupted(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-c.done:
-		return c.err
+		return c.sendErr()
 	default:
 		return nil
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -61,7 +62,7 @@ func runChild(role, path string) error {
 		l := c.Lane(0)
 		for {
 			rec, err := l.Next(context.Background())
-			if errors.Is(err, ErrPeerClosed) {
+			if err == io.EOF {
 				return nil
 			}
 			if err != nil {

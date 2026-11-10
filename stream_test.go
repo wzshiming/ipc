@@ -188,11 +188,14 @@ func TestStreamReadDrainsThenErrPeerClosedAfterPeerCrash(t *testing.T) {
 	}
 }
 
-func TestStreamWriteAfterCloseIsErrClosed(t *testing.T) {
+func TestStreamWriteAfterCloseIsNetErrClosed(t *testing.T) {
 	ls, _ := streamPair(t, Config{})
 	ls.Close()
-	if _, err := ls.Write([]byte("x")); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Write after Close = %v; want ErrClosed", err)
+	if _, err := ls.Write([]byte("x")); err != net.ErrClosed {
+		t.Fatalf("Write after Close = %v; want net.ErrClosed", err)
+	}
+	if _, err := ls.Read(make([]byte, 1)); err != net.ErrClosed {
+		t.Fatalf("Read after Close = %v; want net.ErrClosed", err)
 	}
 }
 
@@ -205,8 +208,22 @@ func TestStreamCloseWakesBlockedRead(t *testing.T) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 	ds.Close()
-	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrClosed) {
-		t.Fatalf("blocked Read after Close = %v; want ErrClosed", err)
+	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+		t.Fatalf("blocked Read after Close = %v; want net.ErrClosed", err)
+	}
+}
+
+func TestStreamReadDrainsThenEOFAfterPeerClosesConnWithoutMarker(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
+	if _, err := ls.Write([]byte("bye")); err != nil {
+		t.Fatal(err)
+	}
+	lc.Close()
+	<-dc.Done()
+	got, err := io.ReadAll(ds)
+	if err != nil || string(got) != "bye" {
+		t.Fatalf("ReadAll after peer Conn.Close = %q, %v; want bye, nil", got, err)
 	}
 }
 

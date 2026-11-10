@@ -220,7 +220,7 @@ func getSeq(p []byte) (seq uint64) {
 	return seq
 }
 
-func TestPeerCloseWakesBlockedNextWithErrPeerClosed(t *testing.T) {
+func TestPeerCloseWakesBlockedNextWithEOF(t *testing.T) {
 	lc, dc := pair(t, Config{}, Config{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
@@ -229,12 +229,12 @@ func TestPeerCloseWakesBlockedNextWithErrPeerClosed(t *testing.T) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 	lc.Close()
-	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrPeerClosed) {
-		t.Fatalf("Next = %v; want ErrPeerClosed", err)
+	if err := waitErr(t, ch, time.Second); err != io.EOF {
+		t.Fatalf("Next = %v; want io.EOF", err)
 	}
 	<-dc.Done()
-	if !errors.Is(dc.Err(), ErrPeerClosed) || !errors.Is(lc.Err(), ErrClosed) {
-		t.Fatalf("Err = %v (dialer), %v (listener); want ErrPeerClosed, ErrClosed", dc.Err(), lc.Err())
+	if !errors.Is(dc.Err(), ErrPeerClosed) || !errors.Is(lc.Err(), net.ErrClosed) {
+		t.Fatalf("Err = %v (dialer), %v (listener); want ErrPeerClosed, net.ErrClosed", dc.Err(), lc.Err())
 	}
 }
 
@@ -275,8 +275,8 @@ func commitSeq(t *testing.T, l *Lane, n, size int) {
 }
 
 // drainSeq reads n records numbered 0..n-1 from l, alternating TryNext and
-// Next, then expects ErrPeerClosed from both.
-func drainSeq(t *testing.T, l *Lane, n int) {
+// Next, then expects end from both.
+func drainSeq(t *testing.T, l *Lane, n int, end error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -298,20 +298,20 @@ func drainSeq(t *testing.T, l *Lane, n int) {
 			t.Fatalf("Release record %d after peer close: %v", i, err)
 		}
 	}
-	if _, err := l.Next(ctx); !errors.Is(err, ErrPeerClosed) {
-		t.Fatalf("Next on drained lane = %v; want ErrPeerClosed", err)
+	if _, err := l.Next(ctx); err != end {
+		t.Fatalf("Next on drained lane = %v; want %v", err, end)
 	}
-	if _, err := l.TryNext(); !errors.Is(err, ErrPeerClosed) {
-		t.Fatalf("TryNext on drained lane = %v; want ErrPeerClosed", err)
+	if _, err := l.TryNext(); err != end {
+		t.Fatalf("TryNext on drained lane = %v; want %v", err, end)
 	}
 }
 
-func TestPeerCloseLeavesCommittedRecordsDrainable(t *testing.T) {
+func TestPeerCloseLeavesCommittedRecordsDrainableThenEOF(t *testing.T) {
 	lc, dc := pair(t, Config{}, Config{})
 	commitSeq(t, lc.Lane(0), 1000, 1<<10)
 	lc.Close()
 	<-dc.Done()
-	drainSeq(t, dc.Lane(0), 1000)
+	drainSeq(t, dc.Lane(0), 1000, io.EOF)
 	if !errors.Is(dc.Err(), ErrPeerClosed) {
 		t.Fatalf("Err = %v; want ErrPeerClosed", dc.Err())
 	}
@@ -353,12 +353,12 @@ func TestParkedNextWokenByPeerCloseReturnsRecordCommittedBeforeIt(t *testing.T) 
 	}
 }
 
-func TestPeerCrashLeavesCommittedRecordsDrainable(t *testing.T) {
+func TestPeerCrashLeavesCommittedRecordsDrainableThenErrPeerClosed(t *testing.T) {
 	lc, dc := pair(t, Config{}, Config{})
 	commitSeq(t, lc.Lane(0), 1000, 1<<10)
 	lc.link.Close() // vanish without Bye
 	<-dc.Done()
-	drainSeq(t, dc.Lane(0), 1000)
+	drainSeq(t, dc.Lane(0), 1000, ErrPeerClosed)
 	if !errors.Is(dc.Err(), ErrPeerClosed) {
 		t.Fatalf("Err = %v; want ErrPeerClosed", dc.Err())
 	}
@@ -385,7 +385,7 @@ func TestReleaseAfterPeerCloseSucceedsWhenPeerWasParked(t *testing.T) {
 	lc.Close()
 	waitErr(t, ch, time.Second)
 	<-dc.Done()
-	drainSeq(t, dc.Lane(0), n)
+	drainSeq(t, dc.Lane(0), n, io.EOF)
 }
 
 func TestPeerCloseFailsReserveTryReserveAndSendAtOnce(t *testing.T) {
@@ -417,12 +417,18 @@ func TestLocalCloseAfterPeerCloseUnmapsAndStopsDraining(t *testing.T) {
 	if !dc.unmapped.Load() {
 		t.Fatal("segment still mapped after local Close")
 	}
-	if _, err := dc.Lane(0).TryNext(); err == nil {
-		t.Fatal("TryNext after local Close returned a record")
+	if _, err := dc.Lane(0).TryNext(); err != net.ErrClosed {
+		t.Fatalf("TryNext after local Close = %v; want net.ErrClosed", err)
+	}
+	if _, err := dc.Lane(0).TryReserve(8); err != net.ErrClosed {
+		t.Fatalf("TryReserve after local Close = %v; want net.ErrClosed", err)
+	}
+	if err := dc.Err(); err != net.ErrClosed {
+		t.Fatalf("Err after local Close = %v; want net.ErrClosed", err)
 	}
 }
 
-func TestLocalCloseWakesBlockedNextWithErrClosed(t *testing.T) {
+func TestLocalCloseWakesBlockedNextWithNetErrClosed(t *testing.T) {
 	_, dc := pair(t, Config{}, Config{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
@@ -431,11 +437,46 @@ func TestLocalCloseWakesBlockedNextWithErrClosed(t *testing.T) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 	dc.Close()
-	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Next = %v; want ErrClosed", err)
+	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+		t.Fatalf("Next = %v; want net.ErrClosed", err)
 	}
-	if _, err := dc.Lane(0).TryNext(); !errors.Is(err, ErrClosed) {
-		t.Fatalf("TryNext after Close = %v; want ErrClosed", err)
+	if _, err := dc.Lane(0).TryNext(); err != net.ErrClosed {
+		t.Fatalf("TryNext after Close = %v; want net.ErrClosed", err)
+	}
+	if err := dc.Err(); err != net.ErrClosed {
+		t.Fatalf("Err after Close = %v; want net.ErrClosed", err)
+	}
+}
+
+func TestLocalCloseWakesBlockedReserveWithNetErrClosed(t *testing.T) {
+	_, dc := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10, Spin: -1})
+	tx := dc.Lane(0)
+	for {
+		if _, err := tx.TryReserve(4000); err != nil {
+			break
+		}
+		tx.Commit()
+	}
+	ch := make(chan error, 1)
+	go func() {
+		_, err := tx.Reserve(context.Background(), 4000)
+		ch <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	dc.Close()
+	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+		t.Fatalf("Reserve = %v; want net.ErrClosed", err)
+	}
+}
+
+func TestCommitAfterLocalCloseIsNetErrClosed(t *testing.T) {
+	_, dc := pair(t, Config{}, Config{})
+	if _, err := dc.Lane(0).TryReserve(8); err != nil {
+		t.Fatal(err)
+	}
+	dc.Close()
+	if err := dc.Lane(0).Commit(); err != net.ErrClosed {
+		t.Fatalf("Commit after Close = %v; want net.ErrClosed", err)
 	}
 }
 
@@ -596,8 +637,8 @@ func TestAcceptReturnsErrClosedAfterListenerClose(t *testing.T) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 	l.Close()
-	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Accept = %v; want ErrClosed", err)
+	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+		t.Fatalf("Accept = %v; want net.ErrClosed", err)
 	}
 }
 

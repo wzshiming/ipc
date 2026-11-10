@@ -3,8 +3,6 @@ package ipc
 import "errors"
 
 var (
-	// ErrClosed reports that this end closed the connection or listener.
-	ErrClosed = errors.New("ipc: closed")
 	// ErrPeerClosed reports that the peer closed the connection or died.
 	ErrPeerClosed = errors.New("ipc: peer closed")
 	// ErrWouldBlock is returned by TryReserve on a full lane and by TryNext on an empty one.

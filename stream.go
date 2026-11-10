@@ -81,7 +81,7 @@ func (s *stream) Write(p []byte) (int, error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	if s.closed.Load() {
-		return 0, ErrClosed
+		return 0, net.ErrClosed
 	}
 	limit := s.l.c.MaxRecord()
 	n := 0
@@ -106,7 +106,7 @@ func (s *stream) Write(p []byte) (int, error) {
 // Close wakes blocked calls, sends the EOF marker and releases a held record.
 func (s *stream) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
-		return ErrClosed
+		return net.ErrClosed
 	}
 	s.rd.close()
 	s.wd.close()
@@ -170,7 +170,7 @@ func (d *deadline) set(t time.Time) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
-		return ErrClosed
+		return net.ErrClosed
 	}
 	d.stopTimer()
 	expired := isClosed(d.cancel)
@@ -208,14 +208,14 @@ func (d *deadline) close() {
 	}
 }
 
-// err returns ErrClosed or os.ErrDeadlineExceeded once a call must not
+// err returns net.ErrClosed or os.ErrDeadlineExceeded once a call must not
 // proceed, else nil.
 func (d *deadline) err() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
 	case d.closed:
-		return ErrClosed
+		return net.ErrClosed
 	case isClosed(d.cancel):
 		return os.ErrDeadlineExceeded
 	}

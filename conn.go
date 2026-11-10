@@ -3,6 +3,7 @@ package ipc
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,8 @@ type Conn struct {
 	rxOnce     sync.Once
 	done       chan struct{}
 	err        error // written once before done is closed
+	closed     atomic.Bool // Close was called on this end
+	bye        atomic.Bool // the peer said goodbye
 	readerDone chan struct{}
 
 	live     atomic.Int32 // lane halves that may still touch the segment
@@ -128,6 +131,7 @@ func (c *Conn) readLoop() {
 			default:
 			}
 		case frameBye:
+			c.bye.Store(true)
 			c.peerGone(ErrPeerClosed)
 			return
 		default:
@@ -159,7 +163,7 @@ func (c *Conn) peerGone(err error) {
 			l.tx.close(c)
 		}
 		close(c.done)
-		if err == ErrClosed {
+		if err == net.ErrClosed {
 			c.link.SetWriteDeadline(time.Now().Add(time.Second))
 			c.link.Send(frameBye, nil, nil)
 		}
@@ -179,9 +183,29 @@ func (c *Conn) halfDone() {
 func (c *Conn) ring(bell *doorbell) error {
 	if err := c.link.Send(frameDoorbell, bell[:], nil); err != nil {
 		c.peerGone(peerErr(err))
-		return c.err
+		return c.sendErr()
 	}
 	return nil
+}
+
+// sendErr is what sends return once the connection is closed.
+func (c *Conn) sendErr() error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	return c.err
+}
+
+// recvErr is what receives return once the connection is closed and the
+// records the peer committed are drained.
+func (c *Conn) recvErr() error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	if c.err == ErrPeerClosed && c.bye.Load() {
+		return io.EOF
+	}
+	return c.err
 }
 
 // peerErr maps the link errors a vanished peer causes to ErrPeerClosed.
@@ -211,11 +235,12 @@ func (c *Conn) LocalAddr() net.Addr { return c.addr }
 func (c *Conn) RemoteAddr() net.Addr { return c.addr }
 
 // Close tells the peer goodbye, closes the link and wakes every blocked call
-// with ErrClosed; records the peer committed are no longer delivered. Slices
-// still held from Reserve or Next stay readable until they are committed,
-// aborted or released.
+// with net.ErrClosed; records the peer committed are no longer delivered.
+// Slices still held from Reserve or Next stay readable until they are
+// committed, aborted or released.
 func (c *Conn) Close() error {
-	c.shutdown(ErrClosed)
+	c.closed.Store(true)
+	c.shutdown(net.ErrClosed)
 	<-c.readerDone
 	return nil
 }
@@ -225,12 +250,12 @@ func (c *Conn) Close() error {
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // Err returns nil while the connection is open, then why it closed:
-// ErrClosed, ErrPeerClosed (also when the peer died), ErrCorrupt or a link
-// error.
+// net.ErrClosed after Close, ErrPeerClosed after the peer closed or died,
+// else ErrCorrupt or the link error.
 func (c *Conn) Err() error {
 	select {
 	case <-c.done:
-		return c.err
+		return c.sendErr()
 	default:
 		return nil
 	}
