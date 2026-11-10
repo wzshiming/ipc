@@ -95,6 +95,12 @@ type Link struct {
 	c   *net.UnixConn
 	oob []byte
 
+	// Next reads from r, c's steady reader unless a test wraps it, into
+	// rbuf, whose unread bytes are rbuf[rpos:rend].
+	r          io.Reader
+	rbuf       []byte
+	rpos, rend int
+
 	wmu  sync.Mutex
 	wbuf []byte
 
@@ -102,8 +108,14 @@ type Link struct {
 	closeErr  error
 }
 
+// readBufSize is the initial size of a Link's receive buffer; it grows to
+// hold the largest frame received.
+const readBufSize = 4 << 10
+
 func newLink(c *net.UnixConn) *Link {
-	return &Link{c: c, oob: make([]byte, oobSize)}
+	k := &Link{c: c, oob: make([]byte, oobSize)}
+	k.r = steadyReader(c, k.oob)
+	return k
 }
 
 // Send writes one frame; fds travel with its first byte.
@@ -163,7 +175,61 @@ func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 	return h[0], payload, fds, nil
 }
 
-// Close closes the link and wakes a blocked Recv; later calls return nil.
+// Next returns the next frame once the handshake's Recv calls are over; Recv
+// must not follow it. One read takes every frame queued on the socket, as
+// far as the buffer holds, and the following calls return them without
+// reading; the payload is valid until the next call and no frame allocates.
+// Descriptors the peer attaches are closed on arrival, by the kernel where a
+// plain read discards them and by the link where the kernel installs them
+// regardless (darwin). Next returns io.EOF once the peer has closed between
+// frames and io.ErrUnexpectedEOF when it closed inside one.
+func (k *Link) Next() (uint8, []byte, error) {
+	for {
+		need := headerSize
+		if buf := k.rbuf[k.rpos:k.rend]; len(buf) >= headerSize {
+			n, err := length(buf[1:])
+			if err != nil {
+				return 0, nil, err
+			}
+			if need += n; len(buf) >= need {
+				k.rpos += need
+				return buf[0], buf[headerSize:need:need], nil
+			}
+		}
+		if err := k.fill(need); err != nil {
+			return 0, nil, err
+		}
+	}
+}
+
+// fill reads once into the buffer, first moving or growing it so that a
+// frame of n bytes fits from its first unread byte.
+func (k *Link) fill(n int) error {
+	if k.rpos == k.rend {
+		k.rpos, k.rend = 0, 0
+	}
+	if len(k.rbuf)-k.rpos < n {
+		buf := k.rbuf
+		if len(buf) < n {
+			buf = make([]byte, max(n, readBufSize))
+		}
+		k.rend = copy(buf, k.rbuf[k.rpos:k.rend])
+		k.rpos = 0
+		k.rbuf = buf
+	}
+	m, err := k.r.Read(k.rbuf[k.rend:])
+	k.rend += m
+	if err != nil && m == 0 {
+		if err == io.EOF && k.rend > k.rpos {
+			err = io.ErrUnexpectedEOF
+		}
+		return closedErr(err)
+	}
+	return nil
+}
+
+// Close closes the link and wakes a blocked Recv or Next; later calls
+// return nil.
 func (k *Link) Close() error {
 	k.closeOnce.Do(func() { k.closeErr = k.c.Close() })
 	return k.closeErr
@@ -172,8 +238,9 @@ func (k *Link) Close() error {
 // SetDeadline sets the read and write deadlines.
 func (k *Link) SetDeadline(t time.Time) error { return k.c.SetDeadline(t) }
 
-// SetReadDeadline sets the deadline for Recv. A deadline that expires
-// mid-frame leaves the stream misaligned; the link must then be closed.
+// SetReadDeadline sets the deadline for Recv and Next. A deadline that
+// expires mid-frame leaves the stream misaligned; the link must then be
+// closed.
 func (k *Link) SetReadDeadline(t time.Time) error { return k.c.SetReadDeadline(t) }
 
 // SetWriteDeadline sets the deadline for Send, with the same caveat as

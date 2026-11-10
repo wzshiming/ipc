@@ -123,14 +123,9 @@ func corruptErr(dir uint8, err error) error {
 func (c *Conn) readLoop() {
 	defer close(c.readerDone)
 	for {
-		typ, p, fds, err := c.link.Recv()
+		typ, p, err := c.link.Next()
 		if err != nil {
 			c.peerGone(peerErr(err))
-			return
-		}
-		if len(fds) > 0 {
-			discardFDs(fds)
-			c.shutdown(errProtocol)
 			return
 		}
 		switch typ {
