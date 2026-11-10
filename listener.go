@@ -3,6 +3,7 @@ package ipc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -13,27 +14,26 @@ import (
 	"github.com/wzshiming/ipc/internal/shm"
 )
 
-// ListenConfig contains options for listening. Its values are the limits and
-// the defaults for accepted connections: a dialer's request is clamped to
-// them and both ends use the clamped values.
+// ListenConfig contains options for listening.
 type ListenConfig struct {
-	// Lanes is the most lanes a connection may have; 0 means 1.
-	Lanes int
-	// RingSize is the largest ring capacity per lane direction in bytes, a
-	// power of two in [64 KiB, 1 GiB]; 0 means 4 MiB.
+	// RingSize caps the ring capacity per direction a connection gets: a
+	// dialer's request above it is clamped to it. It is a power of two in
+	// [64 KiB, 512 MiB]; 0 means no cap.
 	RingSize int
 	// Spin is how long a blocking call on an accepted connection busy
-	// re-checks its lane, without yielding its thread, before parking; 0
+	// re-checks its ring, without yielding its thread, before parking; 0
 	// means 50 µs and a negative value parks at once. Each spinning call
 	// holds a CPU, so choose Spin small or negative when CPUs are scarce.
 	Spin time.Duration
 }
 
-// Listener accepts connections on an AF_UNIX socket path.
+// Listener accepts connections on an AF_UNIX socket path, any number of
+// them. It is a net.Listener whose Accept returns a *Conn.
 type Listener struct {
-	cl   *control.Listener
-	cfg  config
-	addr addr
+	cl       *control.Listener
+	ringSize int // the largest ring size granted
+	spin     time.Duration
+	addr     addr
 
 	mu       sync.Mutex
 	deadline time.Time
@@ -42,6 +42,8 @@ type Listener struct {
 	closeErr  error
 }
 
+var _ net.Listener = (*Listener)(nil)
+
 // Listen listens on the AF_UNIX socket at path with the default
 // ListenConfig. A socket file left behind by a dead listener is replaced.
 func Listen(path string) (*Listener, error) {
@@ -49,32 +51,34 @@ func Listen(path string) (*Listener, error) {
 	return lc.Listen(context.Background(), path)
 }
 
-// Listen listens on the AF_UNIX socket at path. It fails if lc's values are
+// Listen listens on the AF_UNIX socket at path. It fails if lc's RingSize is
 // out of range or another listener is live on path; a socket file left
 // behind by a dead listener is replaced. ctx bounds the setup, including the
 // probe of an existing socket file, but not the returned Listener. A nil lc
 // uses the defaults.
 func (lc *ListenConfig) Listen(ctx context.Context, path string) (*Listener, error) {
-	var cfg config
+	var cfg ListenConfig
 	if lc != nil {
-		cfg = config(*lc)
+		cfg = *lc
 	}
-	cfg = cfg.withDefaults()
-	if err := cfg.checkListener(); err != nil {
-		return nil, err
+	if cfg.RingSize == 0 {
+		cfg.RingSize = maxRingSize
+	}
+	if !validRingSize(uint64(cfg.RingSize)) {
+		return nil, fmt.Errorf("ipc: RingSize %d is not a power of two in [64 KiB, 512 MiB]", cfg.RingSize)
 	}
 	cl, err := control.Listen(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	return &Listener{cl: cl, cfg: cfg, addr: addr(path)}, nil
+	return &Listener{cl: cl, ringSize: cfg.RingSize, spin: spinDuration(cfg.Spin), addr: addr(path)}, nil
 }
 
 // Accept waits for a dialer, completes its handshake and returns the
-// connection. Dialers that fail the handshake are dropped and Accept keeps
-// waiting. Past the deadline set by SetDeadline it returns
+// connection, a *Conn. Dialers that fail the handshake are dropped and
+// Accept keeps waiting. Past the deadline set by SetDeadline it returns
 // os.ErrDeadlineExceeded, and after Close net.ErrClosed.
-func (l *Listener) Accept() (*Conn, error) {
+func (l *Listener) Accept() (net.Conn, error) {
 	for {
 		link, err := l.cl.Accept()
 		if err != nil {
@@ -155,15 +159,14 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 		link.Send(frameReject, []byte(reason), nil)
 		return nil, false, ErrRejected
 	}
-	lanes := min(h.lanes, uint64(l.cfg.Lanes))
-	ringSize := min(h.ringSize, uint64(l.cfg.RingSize))
-	seg, err = shm.Create(int(segmentSize(lanes, ringSize)))
+	ringSize := min(h.ringSize, uint64(l.ringSize))
+	seg, err = shm.Create(int(segmentSize(ringSize)))
 	if err != nil {
 		link.Send(frameReject, []byte("cannot create segment"), nil)
 		return nil, true, err
 	}
 	mem, rs := seg.Bytes(), ring.Size(int(ringSize))
-	for k := range 2 * int(lanes) {
+	for k := range 2 {
 		if err := ring.Format(mem[k*rs:(k+1)*rs], int(ringSize)); err != nil {
 			return nil, true, err
 		}
@@ -173,13 +176,13 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 		return nil, true, err
 	}
 	payload, tokFDs := tok.Encode()
-	err = link.Send(frameWelcome, welcome{lanes: lanes, ringSize: ringSize, token: payload}.encode(), tokFDs)
+	err = link.Send(frameWelcome, welcome{ringSize: ringSize, token: payload}.encode(), tokFDs)
 	tok.Close()
 	if err != nil {
 		return nil, false, err
 	}
 	link.SetDeadline(time.Time{})
-	c, err = newConn(link, seg, int(lanes), int(ringSize), l.cfg.Spin, string(l.addr), true)
+	c, err = newConn(link, seg, int(ringSize), l.spin, string(l.addr), true)
 	if err != nil {
 		return nil, true, err
 	}

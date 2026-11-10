@@ -7,11 +7,11 @@ import (
 	"github.com/wzshiming/ipc/internal/shm"
 )
 
-// Control protocol, version 1. The dialer sends Hello; the listener answers
+// Control protocol, version 2. The dialer sends Hello; the listener answers
 // Welcome (with the segment token) or Reject (with a reason) and closes.
 // Afterwards only Doorbell and Bye frames flow, in both directions.
 const (
-	protoVersion = 1
+	protoVersion = 2
 
 	frameHello    uint8 = 1
 	frameWelcome  uint8 = 2
@@ -22,36 +22,41 @@ const (
 	handshakeTimeout = 5 * time.Second
 )
 
-// Ring direction carried by a Doorbell: ring 2i+dir of lane i.
+// Ring direction: the ring's index in the segment and what a Doorbell carries.
 const (
 	dirListenerToDialer uint8 = 0
 	dirDialerToListener uint8 = 1
 )
 
-// hello is version u32 | lanes u64 | ringSize u64, little-endian.
+// hello is version u32 | ringSize u64, little-endian. Every version starts
+// with the version word; the rest belongs to that version.
 type hello struct {
 	version  uint32
-	lanes    uint64
 	ringSize uint64
 }
 
-const helloSize = 20
+const helloSize = 12
 
 func (h hello) encode() []byte {
 	b := binary.LittleEndian.AppendUint32(make([]byte, 0, helloSize), h.version)
-	b = binary.LittleEndian.AppendUint64(b, h.lanes)
 	return binary.LittleEndian.AppendUint64(b, h.ringSize)
 }
 
+// decodeHello reads a hello of our version; of another version it reads only
+// the version word, so that reject can name it.
 func decodeHello(p []byte) (hello, error) {
+	if len(p) < 4 {
+		return hello{}, errProtocol
+	}
+	h := hello{version: binary.LittleEndian.Uint32(p)}
+	if h.version != protoVersion {
+		return h, nil
+	}
 	if len(p) != helloSize {
 		return hello{}, errProtocol
 	}
-	return hello{
-		version:  binary.LittleEndian.Uint32(p),
-		lanes:    binary.LittleEndian.Uint64(p[4:]),
-		ringSize: binary.LittleEndian.Uint64(p[12:]),
-	}, nil
+	h.ringSize = binary.LittleEndian.Uint64(p[4:])
+	return h, nil
 }
 
 // reject returns why the listener refuses h, or "" to accept it.
@@ -59,57 +64,45 @@ func (h hello) reject() string {
 	switch {
 	case h.version != protoVersion:
 		return "unsupported protocol version"
-	case !validLanes(h.lanes):
-		return "lanes outside [1, 1024]"
 	case !validRingSize(h.ringSize):
-		return "ring size not a power of two in [64 KiB, 1 GiB]"
+		return "ring size not a power of two in [64 KiB, 512 MiB]"
 	}
 	return ""
 }
 
-// welcome is lanes u64 | ringSize u64 | shm token payload.
+// welcome is ringSize u64 | shm token payload.
 type welcome struct {
-	lanes    uint64
 	ringSize uint64
 	token    []byte
 }
 
 func (w welcome) encode() []byte {
-	b := binary.LittleEndian.AppendUint64(make([]byte, 0, 16+len(w.token)), w.lanes)
-	b = binary.LittleEndian.AppendUint64(b, w.ringSize)
+	b := binary.LittleEndian.AppendUint64(make([]byte, 0, 8+len(w.token)), w.ringSize)
 	return append(b, w.token...)
 }
 
 func decodeWelcome(p []byte) (welcome, error) {
-	if len(p) < 16 {
+	if len(p) < 8 {
 		return welcome{}, errProtocol
 	}
 	w := welcome{
-		lanes:    binary.LittleEndian.Uint64(p),
-		ringSize: binary.LittleEndian.Uint64(p[8:]),
-		token:    p[16:],
+		ringSize: binary.LittleEndian.Uint64(p),
+		token:    p[8:],
 	}
-	if !validLanes(w.lanes) || !validRingSize(w.ringSize) {
+	if !validRingSize(w.ringSize) {
 		return welcome{}, errProtocol
 	}
 	return w, nil
 }
 
-// doorbell is lane u16 | dir u8.
-type doorbell [3]byte
+// doorbell is dir u8: the ring whose parked peer it wakes.
+type doorbell [1]byte
 
-func newDoorbell(lane int, dir uint8) doorbell {
-	var d doorbell
-	binary.LittleEndian.PutUint16(d[:], uint16(lane))
-	d[2] = dir
-	return d
-}
-
-func decodeDoorbell(p []byte) (lane int, dir uint8, err error) {
-	if len(p) != len(doorbell{}) || p[2] > dirDialerToListener {
-		return 0, 0, errProtocol
+func decodeDoorbell(p []byte) (dir uint8, err error) {
+	if len(p) != len(doorbell{}) || p[0] > dirDialerToListener {
+		return 0, errProtocol
 	}
-	return int(binary.LittleEndian.Uint16(p)), p[2], nil
+	return p[0], nil
 }
 
 // discardFDs closes descriptors received where none belong: DecodeToken owns

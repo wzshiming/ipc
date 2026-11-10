@@ -19,19 +19,7 @@ import (
 // envCopyMiB sets the cross-process io.Copy volume in MiB (default 1024).
 const envCopyMiB = "IPC_E2E_COPY_MIB"
 
-// streamPair returns the listener-side and dialer-side Streams of lane 0,
-// with lcfg's settings on both ends.
-func streamPair(t testing.TB, lcfg ListenConfig) (ls, ds net.Conn) {
-	lc, dc := pair(t, lcfg, Dialer{Lanes: lcfg.Lanes, RingSize: lcfg.RingSize, Spin: lcfg.Spin})
-	ls, ds = NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
-	t.Cleanup(func() {
-		ls.Close()
-		ds.Close()
-	})
-	return ls, ds
-}
-
-func makeStreamPipe() (c1, c2 net.Conn, stop func(), err error) {
+func makePipe() (c1, c2 net.Conn, stop func(), err error) {
 	dir, err := os.MkdirTemp("", "ipc")
 	if err != nil {
 		return nil, nil, nil, err
@@ -43,7 +31,7 @@ func makeStreamPipe() (c1, c2 net.Conn, stop func(), err error) {
 		return nil, nil, nil, err
 	}
 	ln.SetDeadline(time.Now().Add(10 * time.Second))
-	ch := make(chan *Conn, 1)
+	ch := make(chan net.Conn, 1)
 	go func() {
 		c, _ := ln.Accept()
 		ch <- c
@@ -64,31 +52,28 @@ func makeStreamPipe() (c1, c2 net.Conn, stop func(), err error) {
 		}
 		return nil, nil, nil, err
 	}
-	c1, c2 = NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
 	stop = func() {
-		c1.Close()
-		c2.Close()
 		lc.Close()
 		dc.Close()
 		ln.Close()
 		os.RemoveAll(dir)
 	}
-	return c1, c2, stop, nil
+	return lc, dc, stop, nil
 }
 
-func TestStreamConformsToNetConn(t *testing.T) {
-	nettest.TestConn(t, makeStreamPipe)
+func TestConnConformsToNetConn(t *testing.T) {
+	nettest.TestConn(t, makePipe)
 }
 
-func TestStreamReadKeepsUnreadRecordAcrossReads(t *testing.T) {
-	ls, ds := streamPair(t, ListenConfig{})
-	if _, err := ls.Write([]byte("abcdef")); err != nil {
+func TestReadKeepsUnreadRecordAcrossReads(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if _, err := lc.Write([]byte("abcdef")); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 2)
 	var got []byte
 	for range 3 {
-		n, err := ds.Read(buf)
+		n, err := dc.Read(buf)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -99,165 +84,159 @@ func TestStreamReadKeepsUnreadRecordAcrossReads(t *testing.T) {
 	}
 }
 
-func TestStreamEmptyWriteSendsNothing(t *testing.T) {
-	ls, ds := streamPair(t, ListenConfig{})
-	if n, err := ls.Write(nil); n != 0 || err != nil {
+func TestEmptyWriteSendsNothing(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if n, err := lc.Write(nil); n != 0 || err != nil {
 		t.Fatalf("Write(nil) = %d, %v; want 0, nil", n, err)
 	}
-	ls.Write([]byte("x"))
-	buf := make([]byte, 4)
-	if n, err := ds.Read(buf); err != nil || string(buf[:n]) != "x" {
-		t.Fatalf("Read after empty Write = %q, %v; want x", buf[:n], err)
+	if _, err := dc.TryNext(); err != ErrWouldBlock {
+		t.Fatalf("TryNext after Write(nil) = %v; want ErrWouldBlock", err)
 	}
 }
 
-func TestStreamWriteSplitsIntoMaxRecords(t *testing.T) {
-	ls, ds := streamPair(t, ListenConfig{RingSize: 64 << 10})
+func TestReadSkipsZeroLengthRecords(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	for range 2 {
+		if _, err := lc.Reserve(0); err != nil {
+			t.Fatal(err)
+		}
+		if err := lc.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := lc.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if n, err := dc.Read(buf); err != nil || string(buf[:n]) != "x" {
+		t.Fatalf("Read over zero-length records = %q, %v; want x", buf[:n], err)
+	}
+}
+
+func TestWriteSplitsIntoMaxRecords(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
 	want := make([]byte, 5*(64<<10)+123)
 	rand.NewChaCha8([32]byte{1}).Read(want)
 	go func() {
-		ls.Write(want)
-		ls.Close()
+		lc.Write(want)
+		lc.Close()
 	}()
-	got, err := io.ReadAll(ds)
+	var got []byte
+	records := 0
+	for {
+		rec, err := dc.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rec) > dc.MaxRecord() {
+			t.Fatalf("record of %d bytes exceeds MaxRecord %d", len(rec), dc.MaxRecord())
+		}
+		records++
+		got = append(got, rec...)
+		dc.Release()
+	}
+	if !bytes.Equal(got, want) || records <= 1 {
+		t.Fatalf("%d records carrying %d bytes; want the %d bytes written in several records", records, len(got), len(want))
+	}
+}
+
+func TestReadReassemblesSplitWriteInOrder(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
+	want := make([]byte, 5*(64<<10)+123)
+	rand.NewChaCha8([32]byte{4}).Read(want)
+	go func() {
+		lc.Write(want)
+		lc.Close()
+	}()
+	got, err := io.ReadAll(dc)
 	if err != nil || !bytes.Equal(got, want) {
 		t.Fatalf("ReadAll = %d bytes, %v; want the %d bytes written", len(got), err, len(want))
 	}
 }
 
-func TestStreamPeerReadsEOFAfterDrainingDataWrittenBeforeClose(t *testing.T) {
-	ls, ds := streamPair(t, ListenConfig{})
-	ls.Write([]byte("bye"))
-	if err := ls.Close(); err != nil {
-		t.Fatal("Close:", err)
-	}
-	buf := make([]byte, 8)
-	n, err := ds.Read(buf)
-	if err != nil || string(buf[:n]) != "bye" {
-		t.Fatalf("Read = %q, %v; want bye", buf[:n], err)
-	}
-	for range 2 {
-		if n, err := ds.Read(buf); n != 0 || err != io.EOF {
-			t.Fatalf("Read after drain = %d, %v; want 0, io.EOF", n, err)
-		}
-	}
-}
-
-func TestStreamReadDrainsThenEOFAfterPeerClosesStreamAndConn(t *testing.T) {
+func TestReadDrainsThenEOFAfterPeerClose(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
 	want := make([]byte, 1<<20)
 	rand.NewChaCha8([32]byte{2}).Read(want)
-	if _, err := ls.Write(want); err != nil {
+	if _, err := lc.Write(want); err != nil {
 		t.Fatal(err)
 	}
-	ls.Close()
 	lc.Close()
 	<-dc.Done()
-	got, err := io.ReadAll(ds)
+	got, err := io.ReadAll(dc)
 	if err != nil || !bytes.Equal(got, want) {
 		t.Fatalf("ReadAll after peer close = %d bytes, %v; want the %d bytes written", len(got), err, len(want))
+	}
+	if n, err := dc.Read(make([]byte, 8)); n != 0 || err != io.EOF {
+		t.Fatalf("Read after drain = %d, %v; want 0, io.EOF", n, err)
 	}
 	if dc.unmapped.Load() {
 		t.Fatal("segment unmapped before local Close")
 	}
-	ds.Close()
 	dc.Close()
 	if !dc.unmapped.Load() {
 		t.Fatal("segment still mapped after local Close")
 	}
 }
 
-func TestStreamReadDrainsThenErrPeerClosedAfterPeerCrash(t *testing.T) {
+func TestReadDrainsThenErrPeerClosedAfterPeerCrash(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
 	want := make([]byte, 1<<20)
 	rand.NewChaCha8([32]byte{3}).Read(want)
-	if _, err := ls.Write(want); err != nil {
+	if _, err := lc.Write(want); err != nil {
 		t.Fatal(err)
 	}
-	lc.link.Close() // vanish without the EOF marker or Bye
+	lc.link.Close() // vanish without Bye
 	<-dc.Done()
 	got := make([]byte, len(want))
-	if _, err := io.ReadFull(ds, got); err != nil || !bytes.Equal(got, want) {
+	if _, err := io.ReadFull(dc, got); err != nil || !bytes.Equal(got, want) {
 		t.Fatalf("ReadFull after peer crash: %v; want the %d bytes written", err, len(want))
 	}
-	if _, err := ds.Read(got); !errors.Is(err, ErrPeerClosed) {
+	if _, err := dc.Read(got); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("Read after drain = %v; want ErrPeerClosed", err)
 	}
 }
 
-func TestStreamWriteAfterCloseIsNetErrClosed(t *testing.T) {
-	ls, _ := streamPair(t, ListenConfig{})
-	ls.Close()
-	if _, err := ls.Write([]byte("x")); err != net.ErrClosed {
+func TestReadAndWriteAfterCloseAreNetErrClosed(t *testing.T) {
+	lc, _ := pair(t, ListenConfig{}, Dialer{})
+	lc.Close()
+	if _, err := lc.Write([]byte("x")); err != net.ErrClosed {
 		t.Fatalf("Write after Close = %v; want net.ErrClosed", err)
 	}
-	if _, err := ls.Read(make([]byte, 1)); err != net.ErrClosed {
+	if _, err := lc.Read(make([]byte, 1)); err != net.ErrClosed {
 		t.Fatalf("Read after Close = %v; want net.ErrClosed", err)
 	}
 }
 
-func TestStreamCloseWakesBlockedRead(t *testing.T) {
-	_, ds := streamPair(t, ListenConfig{Spin: -1})
-	ch := make(chan error, 1)
-	go func() {
-		_, err := ds.Read(make([]byte, 8))
-		ch <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	ds.Close()
-	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
-		t.Fatalf("blocked Read after Close = %v; want net.ErrClosed", err)
-	}
-}
-
-func TestStreamReadDrainsThenEOFAfterPeerClosesConnWithoutMarker(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	ls, ds := NewStream(lc.Lane(0)), NewStream(dc.Lane(0))
-	if _, err := ls.Write([]byte("bye")); err != nil {
-		t.Fatal(err)
-	}
-	lc.Close()
-	<-dc.Done()
-	got, err := io.ReadAll(ds)
-	if err != nil || string(got) != "bye" {
-		t.Fatalf("ReadAll after peer Conn.Close = %q, %v; want bye, nil", got, err)
-	}
-}
-
-func TestStreamCloseLeavesConnOpen(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{Lanes: 2}, Dialer{Lanes: 2})
-	if err := NewStream(lc.Lane(0)).Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := lc.Err(); err != nil {
-		t.Fatalf("Conn.Err after Stream.Close = %v; want nil", err)
-	}
-	if _, err := lc.Lane(1).Write([]byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := dc.Lane(1).Read(make([]byte, 1)); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestStreamDeadlineErrorIsNetTimeout(t *testing.T) {
-	_, ds := streamPair(t, ListenConfig{})
-	ds.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-	_, err := ds.Read(make([]byte, 8))
+func TestReadDeadlineErrorIsNetTimeout(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	dc.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	_, err := dc.Read(make([]byte, 8))
 	var ne net.Error
 	if !errors.As(err, &ne) || !ne.Timeout() {
 		t.Fatalf("Read past deadline = %v; want a net.Error with Timeout()", err)
 	}
 }
 
-func TestStreamAddrsAreConnAddrs(t *testing.T) {
-	lc, _ := pair(t, ListenConfig{}, Dialer{})
-	s := NewStream(lc.Lane(0))
-	defer s.Close()
-	if s.LocalAddr() != lc.LocalAddr() || s.RemoteAddr() != lc.RemoteAddr() {
-		t.Fatalf("addrs = %v, %v; want %v, %v", s.LocalAddr(), s.RemoteAddr(), lc.LocalAddr(), lc.RemoteAddr())
+func TestReadAfterExpiredDeadlineKeepsHeldRecord(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if _, err := lc.Write([]byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 3)
+	if n, err := dc.Read(buf); err != nil || string(buf[:n]) != "abc" {
+		t.Fatalf("first Read = %q, %v; want abc", buf[:n], err)
+	}
+	dc.SetReadDeadline(time.Now().Add(-time.Second))
+	if n, err := dc.Read(buf); n != 0 || !isTimeout(err) {
+		t.Fatalf("Read past deadline = %d, %v; want 0, os.ErrDeadlineExceeded", n, err)
+	}
+	dc.SetReadDeadline(time.Time{})
+	if n, err := dc.Read(buf); err != nil || string(buf[:n]) != "def" {
+		t.Fatalf("Read after clearing the deadline = %q, %v; want def", buf[:n], err)
 	}
 }
 
@@ -266,8 +245,8 @@ type fillReader struct{}
 
 func (fillReader) Read(p []byte) (int, error) { return len(p), nil }
 
-func TestStreamIOCopyThroughput(t *testing.T) {
-	ls, ds := streamPair(t, ListenConfig{})
+func TestIOCopyThroughput(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	volume := int64(4 << 30)
 	if raceEnabled() {
 		volume = 256 << 20
@@ -275,11 +254,11 @@ func TestStreamIOCopyThroughput(t *testing.T) {
 	errc := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		_, err := io.Copy(ls, io.LimitReader(fillReader{}, volume))
-		ls.Close()
+		_, err := io.Copy(lc, io.LimitReader(fillReader{}, volume))
+		lc.Close()
 		errc <- err
 	}()
-	n, err := io.Copy(io.Discard, ds)
+	n, err := io.Copy(io.Discard, dc)
 	d := time.Since(start)
 	if err != nil || n != volume {
 		t.Fatalf("io.Copy = %d, %v; want %d", n, err, volume)
@@ -294,11 +273,10 @@ func TestStreamIOCopyThroughput(t *testing.T) {
 	}
 }
 
-// runCopyChild echoes the stream on lane 0 until EOF.
+// runCopyChild echoes copyVolume bytes, then closes so that the parent
+// reads io.EOF.
 func runCopyChild(c *Conn) error {
-	s := NewStream(c.Lane(0))
-	_, err := io.Copy(s, s)
-	s.Close()
+	_, err := io.Copy(c, io.LimitReader(c, copyVolume()))
 	return err
 }
 
@@ -310,22 +288,22 @@ func copyVolume() int64 {
 	return mib << 20
 }
 
-func TestE2EStreamIOCopyEchoesRandomData(t *testing.T) {
-	c, cmd := startPeer(t, "copy", ListenConfig{})
-	s := NewStream(c.Lane(0))
+func TestE2EIOCopyEchoesRandomDataThenEOF(t *testing.T) {
+	conns, cmd := startPeer(t, "copy", ListenConfig{}, 1)
+	c := conns[0]
 	volume := copyVolume()
 	start := time.Now()
 	sent := make(chan []byte, 1)
 	go func() {
 		h := sha256.New()
 		src := io.TeeReader(io.LimitReader(rand.NewChaCha8([32]byte{7}), volume), h)
-		if _, err := io.Copy(s, src); err != nil {
+		if _, err := io.Copy(c, src); err != nil {
 			t.Error("Write:", err)
 		}
 		sent <- h.Sum(nil)
 	}()
 	h := sha256.New()
-	n, err := io.Copy(h, io.LimitReader(s, volume))
+	n, err := io.Copy(h, io.LimitReader(c, volume))
 	if err != nil || n != volume {
 		t.Fatalf("echo read %d bytes, %v; want %d", n, err, volume)
 	}
@@ -333,8 +311,8 @@ func TestE2EStreamIOCopyEchoesRandomData(t *testing.T) {
 		t.Fatal("echoed data differs from data sent")
 	}
 	d := time.Since(start)
-	if err := s.Close(); err != nil {
-		t.Fatal("Close:", err)
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("Read after the child's Close = %v; want io.EOF", err)
 	}
 	if err := cmd.Wait(); err != nil {
 		t.Fatal("child:", err)

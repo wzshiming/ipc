@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-// deadline is the deadline of one direction of a lane: once it passes,
-// expired is set and the channel done returns is closed. A later deadline
-// replaces a closed channel with an open one.
+// deadline is the deadline of one direction of a connection: once it
+// passes, expired is set and the channel done returns is closed. A later
+// deadline replaces a closed channel with an open one.
 type deadline struct {
 	expired atomic.Bool
 	mu      sync.Mutex

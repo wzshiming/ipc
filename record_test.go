@@ -3,7 +3,6 @@ package ipc
 import (
 	"bytes"
 	"errors"
-	"io"
 	"runtime/debug"
 	"testing"
 	"time"
@@ -22,93 +21,58 @@ func raceEnabled() bool {
 	return false
 }
 
-func TestWriteReadBothDirectionsOnEveryLane(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{Lanes: 3}, Dialer{Lanes: 3})
+func TestWriteReadBothDirections(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	buf := make([]byte, 64)
-	for i := range 3 {
-		for _, ends := range [][2]*Conn{{lc, dc}, {dc, lc}} {
-			from, to := ends[0].Lane(i), ends[1].Lane(i)
-			if from.Index() != i || from.Conn() != ends[0] {
-				t.Fatalf("Lane(%d).Index, Conn = %d, %p", i, from.Index(), from.Conn())
-			}
-			msg := []byte{byte(i), 'm'}
-			if n, err := from.Write(msg); n != len(msg) || err != nil {
-				t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(msg))
-			}
-			n, err := to.Read(buf)
-			if err != nil || !bytes.Equal(buf[:n], msg) {
-				t.Fatalf("lane %d Read = %q, %v; want %q", i, buf[:n], err, msg)
-			}
+	for _, ends := range [][2]*Conn{{lc, dc}, {dc, lc}} {
+		from, to := ends[0], ends[1]
+		msg := []byte("message")
+		if n, err := from.Write(msg); n != len(msg) || err != nil {
+			t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(msg))
+		}
+		n, err := to.Read(buf)
+		if err != nil || !bytes.Equal(buf[:n], msg) {
+			t.Fatalf("Read = %q, %v; want %q", buf[:n], err, msg)
 		}
 	}
 }
 
-func TestReadShortBufferConsumesRecord(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	lc.Lane(0).Write([]byte("abcdef"))
-	lc.Lane(0).Write([]byte("next"))
-	buf := make([]byte, 3)
-	n, err := dc.Lane(0).Read(buf)
-	if !errors.Is(err, io.ErrShortBuffer) || n != 3 || string(buf[:n]) != "abc" {
-		t.Fatalf("Read = %d %q, %v; want 3 abc, io.ErrShortBuffer", n, buf[:n], err)
-	}
-	buf = make([]byte, 8)
-	n, err = dc.Lane(0).Read(buf)
-	if err != nil || string(buf[:n]) != "next" {
-		t.Fatalf("Read after short = %q, %v; want next", buf[:n], err)
-	}
-}
-
-func TestWriteEmptySendsZeroLengthRecord(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	if n, err := lc.Lane(0).Write(nil); n != 0 || err != nil {
-		t.Fatalf("Write(nil) = %d, %v; want 0, nil", n, err)
-	}
-	rec, err := dc.Lane(0).TryNext()
-	if err != nil || len(rec) != 0 {
-		t.Fatalf("TryNext = %q, %v; want an empty record", rec, err)
-	}
-}
-
-func TestWriteAboveMaxRecordIsErrTooLarge(t *testing.T) {
+func TestReserveAboveMaxRecordIsErrTooLarge(t *testing.T) {
 	lc, _ := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
-	n, err := lc.Lane(0).Write(make([]byte, lc.MaxRecord()+1))
-	if n != 0 || !errors.Is(err, ErrTooLarge) {
-		t.Fatalf("Write = %d, %v; want 0, ErrTooLarge", n, err)
-	}
-	if _, err := lc.Lane(0).Reserve(lc.MaxRecord() + 1); !errors.Is(err, ErrTooLarge) {
+	if _, err := lc.Reserve(lc.MaxRecord() + 1); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("Reserve = %v; want ErrTooLarge", err)
 	}
-	if _, err := lc.Lane(0).Write(make([]byte, lc.MaxRecord())); err != nil {
-		t.Fatalf("Write(MaxRecord) = %v", err)
+	if _, err := lc.TryReserve(lc.MaxRecord() + 1); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("TryReserve = %v; want ErrTooLarge", err)
+	}
+	if _, err := lc.TryReserve(lc.MaxRecord()); err != nil {
+		t.Fatalf("TryReserve(MaxRecord) = %v", err)
 	}
 }
 
-func TestTryNextOnEmptyLaneIsErrWouldBlock(t *testing.T) {
+func TestTryNextOnEmptyRingIsErrWouldBlock(t *testing.T) {
 	_, dc := pair(t, ListenConfig{}, Dialer{})
-	if _, err := dc.Lane(0).TryNext(); !errors.Is(err, ErrWouldBlock) {
+	if _, err := dc.TryNext(); !errors.Is(err, ErrWouldBlock) {
 		t.Fatalf("TryNext = %v; want ErrWouldBlock", err)
 	}
 }
 
-func TestTryReserveOnFullLaneIsErrWouldBlock(t *testing.T) {
+func TestTryReserveOnFullRingIsErrWouldBlock(t *testing.T) {
 	lc, _ := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
-	tx := lc.Lane(0)
 	for range 64 {
-		if _, err := tx.TryReserve(4000); err != nil {
+		if _, err := lc.TryReserve(4000); err != nil {
 			if !errors.Is(err, ErrWouldBlock) {
 				t.Fatalf("TryReserve = %v; want ErrWouldBlock", err)
 			}
 			return
 		}
-		tx.Commit()
+		lc.Commit()
 	}
 	t.Fatal("64 KiB ring never filled")
 }
 
-func TestOutOfOrderLaneCallsReturnErrorsNotPanics(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	tx, rx := lc.Lane(0), dc.Lane(0)
+func TestOutOfOrderRecordCallsReturnErrorsNotPanics(t *testing.T) {
+	tx, rx := pair(t, ListenConfig{}, Dialer{})
 	if err := tx.Commit(); err == nil {
 		t.Fatal("Commit without Reserve succeeded")
 	}
@@ -131,16 +95,30 @@ func TestOutOfOrderLaneCallsReturnErrorsNotPanics(t *testing.T) {
 	}
 }
 
+func TestZeroLengthRecordIsVisibleToNext(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if _, err := lc.Reserve(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := lc.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := dc.Next()
+	if err != nil || len(rec) != 0 {
+		t.Fatalf("Next = %q, %v; want an empty record", rec, err)
+	}
+}
+
 func TestBlockedNextIsWokenByDoorbell(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{Spin: -1}, Dialer{Spin: -1})
 	ch := make(chan []byte, 1)
 	go func() {
 		buf := make([]byte, 8)
-		n, _ := dc.Lane(0).Read(buf)
+		n, _ := dc.Read(buf)
 		ch <- buf[:n]
 	}()
 	time.Sleep(20 * time.Millisecond)
-	lc.Lane(0).Write([]byte("ding"))
+	lc.Write([]byte("ding"))
 	select {
 	case got := <-ch:
 		if string(got) != "ding" {
@@ -152,8 +130,7 @@ func TestBlockedNextIsWokenByDoorbell(t *testing.T) {
 }
 
 func TestBlockedReserveIsWokenByRelease(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10, Spin: -1}, Dialer{RingSize: 64 << 10, Spin: -1})
-	tx, rx := lc.Lane(0), dc.Lane(0)
+	tx, rx := pair(t, ListenConfig{RingSize: 64 << 10, Spin: -1}, Dialer{RingSize: 64 << 10, Spin: -1})
 	for {
 		if _, err := tx.TryReserve(4000); err != nil {
 			break
@@ -178,8 +155,7 @@ func TestBlockedReserveIsWokenByRelease(t *testing.T) {
 }
 
 func TestSteadyStateHotPathAllocatesNothing(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	tx, rx := lc.Lane(0), dc.Lane(0)
+	tx, rx := pair(t, ListenConfig{}, Dialer{})
 	allocs := testing.AllocsPerRun(1000, func() {
 		p, err := tx.TryReserve(64)
 		if err != nil {
@@ -198,8 +174,7 @@ func TestSteadyStateHotPathAllocatesNothing(t *testing.T) {
 }
 
 func TestBlockingCallsWithDataOrRoomAllocateNothing(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	tx, rx := lc.Lane(0), dc.Lane(0)
+	tx, rx := pair(t, ListenConfig{}, Dialer{})
 	allocs := testing.AllocsPerRun(1000, func() {
 		p, err := tx.Reserve(64)
 		if err != nil {
@@ -235,7 +210,7 @@ func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
 	start := time.Now()
 	go func() {
 		for range records {
-			if _, err := lc.Lane(0).Write(msg); err != nil {
+			if _, err := lc.Write(msg); err != nil {
 				done <- err
 				return
 			}
@@ -244,7 +219,7 @@ func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
 	}()
 	buf := make([]byte, 64<<10)
 	for range records {
-		if _, err := dc.Lane(0).Read(buf); err != nil {
+		if _, err := dc.Read(buf); err != nil {
 			tb.Fatal(err)
 		}
 	}
@@ -254,7 +229,7 @@ func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
 	return time.Since(start)
 }
 
-func TestSingleLane64KiBThroughput(t *testing.T) {
+func TestWriteRead64KiBThroughput(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	records := 16384
 	if raceEnabled() {
@@ -262,13 +237,13 @@ func TestSingleLane64KiBThroughput(t *testing.T) {
 	}
 	d := transfer64KiB(t, lc, dc, records)
 	rate := float64(records) * (64 << 10) / d.Seconds()
-	t.Logf("single lane, 64 KiB records: %.2f GB/s (race=%v)", rate/1e9, raceEnabled())
+	t.Logf("one connection, 64 KiB records: %.2f GB/s (race=%v)", rate/1e9, raceEnabled())
 	if !raceEnabled() && rate < 1e9 {
 		t.Fatalf("throughput %.2f GB/s below 1 GB/s", rate/1e9)
 	}
 }
 
-func BenchmarkLane64KiB(b *testing.B) {
+func BenchmarkWriteRead64KiB(b *testing.B) {
 	lc, dc := pair(b, ListenConfig{}, Dialer{})
 	b.SetBytes(64 << 10)
 	b.ResetTimer()

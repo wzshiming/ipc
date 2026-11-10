@@ -3,6 +3,7 @@ package ipc
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -43,7 +44,7 @@ func pair(t testing.TB, lcfg ListenConfig, d Dialer) (lc, dc *Conn) {
 	l.SetDeadline(time.Now().Add(10 * time.Second))
 	d.Timeout = 10 * time.Second
 	type result struct {
-		c   *Conn
+		c   net.Conn
 		err error
 	}
 	ch := make(chan result, 1)
@@ -60,17 +61,18 @@ func pair(t testing.TB, lcfg ListenConfig, d Dialer) (lc, dc *Conn) {
 		dc.Close()
 		t.Fatal("Accept:", r.err)
 	}
+	lc = r.c.(*Conn)
 	t.Cleanup(func() {
-		r.c.Close()
+		lc.Close()
 		dc.Close()
 	})
-	return r.c, dc
+	return lc, dc
 }
 
 // acceptOne accepts one connection on l in the background; the test's
 // cleanup closes l and the connection.
 func acceptOne(t *testing.T, l *Listener) {
-	ch := make(chan *Conn, 1)
+	ch := make(chan net.Conn, 1)
 	go func() {
 		c, _ := l.Accept()
 		ch <- c
@@ -83,11 +85,23 @@ func acceptOne(t *testing.T, l *Listener) {
 	})
 }
 
-func TestDialerRequestIsClampedToListenerLimits(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{Lanes: 2, RingSize: 128 << 10}, Dialer{Lanes: 4, RingSize: 1 << 20})
+func TestDialerRequestIsGrantedWithoutListenerCap(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{RingSize: 8 << 20})
 	for _, c := range []*Conn{lc, dc} {
-		if c.Lanes() != 2 || c.RingSize() != 128<<10 {
-			t.Fatalf("Lanes, RingSize = %d, %d; want 2, %d", c.Lanes(), c.RingSize(), 128<<10)
+		if c.RingSize() != 8<<20 {
+			t.Fatalf("RingSize = %d; want the requested %d", c.RingSize(), 8<<20)
+		}
+		if c.MaxRecord() != ring.MaxRecord(8<<20) {
+			t.Fatalf("MaxRecord = %d; want %d", c.MaxRecord(), ring.MaxRecord(8<<20))
+		}
+	}
+}
+
+func TestDialerRequestIsClampedToListenerCap(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{RingSize: 128 << 10}, Dialer{RingSize: 1 << 20})
+	for _, c := range []*Conn{lc, dc} {
+		if c.RingSize() != 128<<10 {
+			t.Fatalf("RingSize = %d; want the cap %d", c.RingSize(), 128<<10)
 		}
 		if c.MaxRecord() != ring.MaxRecord(128<<10) {
 			t.Fatalf("MaxRecord = %d; want %d", c.MaxRecord(), ring.MaxRecord(128<<10))
@@ -95,11 +109,11 @@ func TestDialerRequestIsClampedToListenerLimits(t *testing.T) {
 	}
 }
 
-func TestZeroDialerUsesDefaults(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{Lanes: 8}, Dialer{})
+func TestZeroDialerRequestsFourMiB(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	for _, c := range []*Conn{lc, dc} {
-		if c.Lanes() != 1 || c.RingSize() != 4<<20 {
-			t.Fatalf("Lanes, RingSize = %d, %d; want 1, %d", c.Lanes(), c.RingSize(), 4<<20)
+		if c.RingSize() != 4<<20 {
+			t.Fatalf("RingSize = %d; want %d", c.RingSize(), 4<<20)
 		}
 	}
 }
@@ -117,8 +131,8 @@ func TestPackageListenAndDialUseDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if c.Lanes() != 1 || c.RingSize() != 4<<20 {
-		t.Fatalf("Lanes, RingSize = %d, %d; want 1, %d", c.Lanes(), c.RingSize(), 4<<20)
+	if c.RingSize() != 4<<20 {
+		t.Fatalf("RingSize = %d; want %d", c.RingSize(), 4<<20)
 	}
 }
 
@@ -137,8 +151,8 @@ func TestNilListenConfigAndDialerUseDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if c.Lanes() != 1 || c.RingSize() != 4<<20 {
-		t.Fatalf("Lanes, RingSize = %d, %d; want 1, %d", c.Lanes(), c.RingSize(), 4<<20)
+	if c.RingSize() != 4<<20 {
+		t.Fatalf("RingSize = %d; want %d", c.RingSize(), 4<<20)
 	}
 }
 
@@ -185,13 +199,12 @@ func TestDialContextWithExpiringCtxAbortsDialToListenerThatNeverAccepts(t *testi
 	}
 }
 
-func TestListenRejectsInvalidConfig(t *testing.T) {
+func TestListenRejectsOutOfRangeCap(t *testing.T) {
 	for _, lcfg := range []ListenConfig{
-		{Lanes: -1},
-		{Lanes: 1025},
+		{RingSize: -1},
 		{RingSize: 100000},
 		{RingSize: 32 << 10},
-		{Lanes: 1024, RingSize: 1 << 30},
+		{RingSize: 1 << 30}, // two such rings exceed the segment limit
 	} {
 		l, err := lcfg.Listen(context.Background(), sockPath(t))
 		if err == nil {
@@ -235,20 +248,20 @@ func TestInterruptedParkedNextKeepsData(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
-		_, err := dc.Lane(0).Next()
+		_, err := dc.Next()
 		ch <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
-	dc.Lane(0).SetReadDeadline(time.Now())
+	dc.SetReadDeadline(time.Now())
 	if err := waitErr(t, ch, 100*time.Millisecond); err != os.ErrDeadlineExceeded {
 		t.Fatalf("Next after deadline = %v; want os.ErrDeadlineExceeded", err)
 	}
-	dc.Lane(0).SetReadDeadline(time.Time{})
-	if _, err := lc.Lane(0).Write([]byte("after")); err != nil {
+	dc.SetReadDeadline(time.Time{})
+	if _, err := lc.Write([]byte("after")); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 16)
-	n, err := dc.Lane(0).Read(buf)
+	n, err := dc.Read(buf)
 	if err != nil || string(buf[:n]) != "after" {
 		t.Fatalf("Read = %q, %v; want after", buf[:n], err)
 	}
@@ -256,7 +269,7 @@ func TestInterruptedParkedNextKeepsData(t *testing.T) {
 
 func TestInterruptedParkedReserveKeepsData(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
-	tx, rx := dc.Lane(0), lc.Lane(0)
+	tx, rx := dc, lc
 	var sent uint64
 	for {
 		p, err := tx.TryReserve(1000)
@@ -321,7 +334,7 @@ func TestPeerCloseWakesBlockedNextWithEOF(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
-		_, err := dc.Lane(0).Next()
+		_, err := dc.Next()
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -337,16 +350,15 @@ func TestPeerCloseWakesBlockedNextWithEOF(t *testing.T) {
 
 func TestPeerCloseWakesBlockedReserveWithErrPeerClosed(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
-	tx := dc.Lane(0)
 	for {
-		if _, err := tx.TryReserve(4000); err != nil {
+		if _, err := dc.TryReserve(4000); err != nil {
 			break
 		}
-		tx.Commit()
+		dc.Commit()
 	}
 	ch := make(chan error, 1)
 	go func() {
-		_, err := tx.Reserve(4000)
+		_, err := dc.Reserve(4000)
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -356,33 +368,33 @@ func TestPeerCloseWakesBlockedReserveWithErrPeerClosed(t *testing.T) {
 	}
 }
 
-// commitSeq commits n records of size bytes numbered 0..n-1 on l.
-func commitSeq(t *testing.T, l *Lane, n, size int) {
+// commitSeq commits n records of size bytes numbered 0..n-1 on c.
+func commitSeq(t *testing.T, c *Conn, n, size int) {
 	t.Helper()
 	for i := range n {
-		p, err := l.TryReserve(size)
+		p, err := c.TryReserve(size)
 		if err != nil {
 			t.Fatalf("TryReserve record %d: %v", i, err)
 		}
 		putSeq(p, uint64(i))
-		if err := l.Commit(); err != nil {
+		if err := c.Commit(); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
-// drainSeq reads n records numbered 0..n-1 from l, alternating TryNext and
+// drainSeq reads n records numbered 0..n-1 from c, alternating TryNext and
 // Next, then expects end from Next, TryNext and Read.
-func drainSeq(t *testing.T, l *Lane, n int, end error) {
+func drainSeq(t *testing.T, c *Conn, n int, end error) {
 	t.Helper()
-	l.SetReadDeadline(time.Now().Add(5 * time.Second))
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	for i := range n {
 		var rec []byte
 		var err error
 		if i%2 == 0 {
-			rec, err = l.TryNext()
+			rec, err = c.TryNext()
 		} else {
-			rec, err = l.Next()
+			rec, err = c.Next()
 		}
 		if err != nil {
 			t.Fatalf("record %d after peer close: %v", i, err)
@@ -390,27 +402,27 @@ func drainSeq(t *testing.T, l *Lane, n int, end error) {
 		if got := getSeq(rec); got != uint64(i) {
 			t.Fatalf("record seq %d; want %d", got, i)
 		}
-		if err := l.Release(); err != nil {
+		if err := c.Release(); err != nil {
 			t.Fatalf("Release record %d after peer close: %v", i, err)
 		}
 	}
-	if _, err := l.Next(); err != end {
-		t.Fatalf("Next on drained lane = %v; want %v", err, end)
+	if _, err := c.Next(); err != end {
+		t.Fatalf("Next on drained ring = %v; want %v", err, end)
 	}
-	if _, err := l.TryNext(); err != end {
-		t.Fatalf("TryNext on drained lane = %v; want %v", err, end)
+	if _, err := c.TryNext(); err != end {
+		t.Fatalf("TryNext on drained ring = %v; want %v", err, end)
 	}
-	if _, err := l.Read(make([]byte, 8)); err != end {
-		t.Fatalf("Read on drained lane = %v; want %v", err, end)
+	if _, err := c.Read(make([]byte, 8)); err != end {
+		t.Fatalf("Read on drained ring = %v; want %v", err, end)
 	}
 }
 
 func TestPeerCloseLeavesCommittedRecordsDrainableThenEOF(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	commitSeq(t, lc.Lane(0), 1000, 1<<10)
+	commitSeq(t, lc, 1000, 1<<10)
 	lc.Close()
 	<-dc.Done()
-	drainSeq(t, dc.Lane(0), 1000, io.EOF)
+	drainSeq(t, dc, 1000, io.EOF)
 	if !errors.Is(dc.Err(), ErrPeerClosed) {
 		t.Fatalf("Err = %v; want ErrPeerClosed", dc.Err())
 	}
@@ -424,23 +436,22 @@ func TestParkedNextWokenByPeerCloseReturnsRecordCommittedBeforeIt(t *testing.T) 
 	}
 	ch := make(chan result, 1)
 	go func() {
-		rec, err := dc.Lane(0).Next()
+		rec, err := dc.Next()
 		if err != nil {
 			ch <- result{err: err}
 			return
 		}
 		ch <- result{seq: getSeq(rec)}
-		dc.Lane(0).Release()
+		dc.Release()
 	}()
 	time.Sleep(20 * time.Millisecond)
 	// Commit without ringing, so only the peer's close wakes the parked Next.
-	prod := lc.Lane(0).prod
-	p, err := prod.TryReserve(8)
+	p, err := lc.prod.TryReserve(8)
 	if err != nil {
 		t.Fatal(err)
 	}
 	putSeq(p, 7)
-	prod.Commit()
+	lc.prod.Commit()
 	lc.Close()
 	select {
 	case r := <-ch:
@@ -454,10 +465,10 @@ func TestParkedNextWokenByPeerCloseReturnsRecordCommittedBeforeIt(t *testing.T) 
 
 func TestPeerCrashLeavesCommittedRecordsDrainableThenErrPeerClosed(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	commitSeq(t, lc.Lane(0), 1000, 1<<10)
+	commitSeq(t, lc, 1000, 1<<10)
 	lc.link.Close() // vanish without Bye
 	<-dc.Done()
-	drainSeq(t, dc.Lane(0), 1000, ErrPeerClosed)
+	drainSeq(t, dc, 1000, ErrPeerClosed)
 	if !errors.Is(dc.Err(), ErrPeerClosed) {
 		t.Fatalf("Err = %v; want ErrPeerClosed", dc.Err())
 	}
@@ -465,48 +476,46 @@ func TestPeerCrashLeavesCommittedRecordsDrainableThenErrPeerClosed(t *testing.T)
 
 func TestReleaseAfterPeerCloseSucceedsWhenPeerWasParked(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10, Spin: -1}, Dialer{RingSize: 64 << 10})
-	tx := lc.Lane(0)
 	n := 0
 	for ; ; n++ {
-		p, err := tx.TryReserve(4000)
+		p, err := lc.TryReserve(4000)
 		if err != nil {
 			break
 		}
 		putSeq(p, uint64(n))
-		tx.Commit()
+		lc.Commit()
 	}
 	ch := make(chan error, 1)
 	go func() {
-		_, err := tx.Reserve(4000)
+		_, err := lc.Reserve(4000)
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
 	lc.Close()
 	waitErr(t, ch, time.Second)
 	<-dc.Done()
-	drainSeq(t, dc.Lane(0), n, io.EOF)
+	drainSeq(t, dc, n, io.EOF)
 }
 
 func TestPeerCloseFailsReserveTryReserveAndWriteAtOnce(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	commitSeq(t, lc.Lane(0), 10, 100)
+	commitSeq(t, lc, 10, 100)
 	lc.Close()
 	<-dc.Done()
-	l := dc.Lane(0)
-	if _, err := l.TryReserve(8); !errors.Is(err, ErrPeerClosed) {
+	if _, err := dc.TryReserve(8); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("TryReserve = %v; want ErrPeerClosed", err)
 	}
-	if _, err := l.Reserve(8); !errors.Is(err, ErrPeerClosed) {
+	if _, err := dc.Reserve(8); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("Reserve = %v; want ErrPeerClosed", err)
 	}
-	if _, err := l.Write([]byte("x")); !errors.Is(err, ErrPeerClosed) {
+	if _, err := dc.Write([]byte("x")); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("Write = %v; want ErrPeerClosed", err)
 	}
 }
 
 func TestLocalCloseAfterPeerCloseUnmapsAndStopsDraining(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	commitSeq(t, lc.Lane(0), 10, 100)
+	commitSeq(t, lc, 10, 100)
 	lc.Close()
 	<-dc.readerDone // the peer-close shutdown has finished
 	if dc.unmapped.Load() {
@@ -516,10 +525,10 @@ func TestLocalCloseAfterPeerCloseUnmapsAndStopsDraining(t *testing.T) {
 	if !dc.unmapped.Load() {
 		t.Fatal("segment still mapped after local Close")
 	}
-	if _, err := dc.Lane(0).TryNext(); err != net.ErrClosed {
+	if _, err := dc.TryNext(); err != net.ErrClosed {
 		t.Fatalf("TryNext after local Close = %v; want net.ErrClosed", err)
 	}
-	if _, err := dc.Lane(0).TryReserve(8); err != net.ErrClosed {
+	if _, err := dc.TryReserve(8); err != net.ErrClosed {
 		t.Fatalf("TryReserve after local Close = %v; want net.ErrClosed", err)
 	}
 	if err := dc.Err(); err != net.ErrClosed {
@@ -531,7 +540,7 @@ func TestLocalCloseWakesBlockedNextWithNetErrClosed(t *testing.T) {
 	_, dc := pair(t, ListenConfig{}, Dialer{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
-		_, err := dc.Lane(0).Next()
+		_, err := dc.Next()
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -539,7 +548,7 @@ func TestLocalCloseWakesBlockedNextWithNetErrClosed(t *testing.T) {
 	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
 		t.Fatalf("Next = %v; want net.ErrClosed", err)
 	}
-	if _, err := dc.Lane(0).TryNext(); err != net.ErrClosed {
+	if _, err := dc.TryNext(); err != net.ErrClosed {
 		t.Fatalf("TryNext after Close = %v; want net.ErrClosed", err)
 	}
 	if err := dc.Err(); err != net.ErrClosed {
@@ -549,16 +558,15 @@ func TestLocalCloseWakesBlockedNextWithNetErrClosed(t *testing.T) {
 
 func TestLocalCloseWakesBlockedReserveWithNetErrClosed(t *testing.T) {
 	_, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
-	tx := dc.Lane(0)
 	for {
-		if _, err := tx.TryReserve(4000); err != nil {
+		if _, err := dc.TryReserve(4000); err != nil {
 			break
 		}
-		tx.Commit()
+		dc.Commit()
 	}
 	ch := make(chan error, 1)
 	go func() {
-		_, err := tx.Reserve(4000)
+		_, err := dc.Reserve(4000)
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -570,15 +578,14 @@ func TestLocalCloseWakesBlockedReserveWithNetErrClosed(t *testing.T) {
 
 func TestLocalCloseWakesBlockedReadAndWriteWithNetErrClosed(t *testing.T) {
 	_, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
-	l := dc.Lane(0)
-	fill(t, l)
+	fill(t, dc)
 	ch := make(chan error, 2)
 	go func() {
-		_, err := l.Write(make([]byte, 4000))
+		_, err := dc.Write(make([]byte, 4000))
 		ch <- err
 	}()
 	go func() {
-		_, err := l.Read(make([]byte, 8))
+		_, err := dc.Read(make([]byte, 8))
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -592,21 +599,21 @@ func TestLocalCloseWakesBlockedReadAndWriteWithNetErrClosed(t *testing.T) {
 
 func TestCommitAfterLocalCloseIsNetErrClosed(t *testing.T) {
 	_, dc := pair(t, ListenConfig{}, Dialer{})
-	if _, err := dc.Lane(0).TryReserve(8); err != nil {
+	if _, err := dc.TryReserve(8); err != nil {
 		t.Fatal(err)
 	}
 	dc.Close()
-	if err := dc.Lane(0).Commit(); err != net.ErrClosed {
+	if err := dc.Commit(); err != net.ErrClosed {
 		t.Fatalf("Commit after Close = %v; want net.ErrClosed", err)
 	}
 }
 
 func TestCloseDefersUnmapUntilInflightNextReleased(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	if _, err := lc.Lane(0).Write([]byte("hello")); err != nil {
+	if _, err := lc.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	rec, err := dc.Lane(0).Next()
+	rec, err := dc.Next()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -617,7 +624,7 @@ func TestCloseDefersUnmapUntilInflightNextReleased(t *testing.T) {
 	if string(rec) != "hello" {
 		t.Fatalf("in-flight slice reads %q after Close", rec)
 	}
-	dc.Lane(0).Release()
+	dc.Release()
 	if !dc.unmapped.Load() {
 		t.Fatal("segment still mapped after the last slice was released")
 	}
@@ -625,7 +632,7 @@ func TestCloseDefersUnmapUntilInflightNextReleased(t *testing.T) {
 
 func TestCloseDefersUnmapUntilInflightReserveAborted(t *testing.T) {
 	_, dc := pair(t, ListenConfig{}, Dialer{})
-	p, err := dc.Lane(0).Reserve(100)
+	p, err := dc.Reserve(100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,7 +641,7 @@ func TestCloseDefersUnmapUntilInflightReserveAborted(t *testing.T) {
 		t.Fatal("segment unmapped while a Reserve slice is outstanding")
 	}
 	clear(p)
-	dc.Lane(0).Abort()
+	dc.Abort()
 	if !dc.unmapped.Load() {
 		t.Fatal("segment still mapped after the reservation was aborted")
 	}
@@ -648,7 +655,22 @@ func TestCloseUnmapsAtOnceWithoutInflightSlices(t *testing.T) {
 	}
 }
 
-func rawHello(t *testing.T, path string, h hello) (typ uint8, payload []byte) {
+func TestCloseReleasesRecordReadHoldsPartlyConsumed(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if _, err := lc.Write([]byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dc.Read(make([]byte, 3)); err != nil {
+		t.Fatal(err)
+	}
+	dc.Close()
+	if !dc.unmapped.Load() {
+		t.Fatal("segment still mapped after Close while Read held a partly consumed record")
+	}
+}
+
+// rawHello sends payload as a Hello frame and returns the listener's answer.
+func rawHello(t *testing.T, path string, payload []byte) (typ uint8, answer []byte) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -658,10 +680,10 @@ func rawHello(t *testing.T, path string, h hello) (typ uint8, payload []byte) {
 	}
 	defer link.Close()
 	link.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := link.Send(frameHello, h.encode(), nil); err != nil {
+	if err := link.Send(frameHello, payload, nil); err != nil {
 		t.Fatal(err)
 	}
-	typ, payload, fds, err := link.Recv()
+	typ, answer, fds, err := link.Recv()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,24 +691,36 @@ func rawHello(t *testing.T, path string, h hello) (typ uint8, payload []byte) {
 	if _, _, _, err := link.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("Recv after Reject = %v; want io.EOF (listener closes the link)", err)
 	}
-	return typ, payload
+	return typ, answer
 }
 
 func TestListenerRejectsInvalidHello(t *testing.T) {
 	l, path := listen(t, ListenConfig{})
 	acceptOne(t, l)
 	for name, h := range map[string]hello{
-		"version":       {version: protoVersion + 1, lanes: 1, ringSize: 64 << 10},
-		"lanes 0":       {version: protoVersion, lanes: 0, ringSize: 64 << 10},
-		"lanes 1025":    {version: protoVersion, lanes: 1025, ringSize: 64 << 10},
-		"ring not pow2": {version: protoVersion, lanes: 1, ringSize: 100000},
-		"ring too big":  {version: protoVersion, lanes: 1, ringSize: 2 << 30},
+		"version":        {version: protoVersion + 1, ringSize: 64 << 10},
+		"ring too small": {version: protoVersion, ringSize: 32 << 10},
+		"ring not pow2":  {version: protoVersion, ringSize: 100000},
+		"ring too big":   {version: protoVersion, ringSize: 1 << 30},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if typ, reason := rawHello(t, path, h); typ != frameReject {
+			if typ, reason := rawHello(t, path, h.encode()); typ != frameReject {
 				t.Fatalf("frame type %d (%q); want Reject %d", typ, reason, frameReject)
 			}
 		})
+	}
+}
+
+func TestListenerRefusesVersionOneHelloAsUnsupportedVersion(t *testing.T) {
+	l, path := listen(t, ListenConfig{})
+	acceptOne(t, l)
+	// Version 1's hello was 20 bytes: version u32 followed by two u64 fields.
+	v1 := binary.LittleEndian.AppendUint32(nil, 1)
+	v1 = binary.LittleEndian.AppendUint64(v1, 1)
+	v1 = binary.LittleEndian.AppendUint64(v1, 4<<20)
+	typ, reason := rawHello(t, path, v1)
+	if typ != frameReject || string(reason) != "unsupported protocol version" {
+		t.Fatalf("frame type %d (%q); want Reject %d (%q)", typ, reason, frameReject, "unsupported protocol version")
 	}
 }
 
@@ -710,7 +744,7 @@ func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 	}
 	defer cl.Close()
 	const rs = 64 << 10
-	seg, err := shm.Create(int(segmentSize(1, rs)))
+	seg, err := shm.Create(int(segmentSize(rs)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -735,7 +769,7 @@ func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 			return
 		}
 		payload, fds := tok.Encode()
-		link.Send(frameWelcome, welcome{lanes: 1, ringSize: rs, token: payload}.encode(), fds)
+		link.Send(frameWelcome, welcome{ringSize: rs, token: payload}.encode(), fds)
 		tok.Close()
 		link.Recv()
 	}()
@@ -748,7 +782,7 @@ func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 	}
 }
 
-func TestAcceptReturnsNetErrClosedAfterListenerClose(t *testing.T) {
+func TestAcceptAfterListenerCloseReturnsNilConnAndNetErrClosed(t *testing.T) {
 	l, _ := listen(t, ListenConfig{})
 	ch := make(chan error, 1)
 	go func() {
@@ -760,8 +794,10 @@ func TestAcceptReturnsNetErrClosedAfterListenerClose(t *testing.T) {
 	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
 		t.Fatalf("Accept = %v; want net.ErrClosed", err)
 	}
-	if _, err := l.Accept(); err != net.ErrClosed {
-		t.Fatalf("Accept after Close = %v; want net.ErrClosed", err)
+	var c net.Conn
+	c, err := l.Accept()
+	if c != nil || err != net.ErrClosed {
+		t.Fatalf("Accept after Close = %v, %v; want a nil net.Conn, net.ErrClosed", c, err)
 	}
 }
 
@@ -780,43 +816,89 @@ func TestListenerDeadlineTimesOutAccept(t *testing.T) {
 	c.Close()
 }
 
+// serve accepts n connections on l in the background and returns them in
+// dial order: handshakes are serial, so Dial returns before the next starts.
+func serve(t *testing.T, l *Listener, path string, n int) (served, dialed []*Conn) {
+	t.Helper()
+	l.SetDeadline(time.Now().Add(10 * time.Second))
+	ch := make(chan net.Conn, n)
+	go func() {
+		for range n {
+			c, err := l.Accept()
+			if err != nil {
+				t.Error("Accept:", err)
+			}
+			ch <- c
+		}
+	}()
+	for range n {
+		c, err := (&Dialer{Timeout: 10 * time.Second}).Dial(path)
+		if err != nil {
+			t.Fatal("Dial:", err)
+		}
+		t.Cleanup(func() { c.Close() })
+		dialed = append(dialed, c)
+	}
+	for range n {
+		c := <-ch
+		if c == nil {
+			t.Fatal("Accept failed")
+		}
+		t.Cleanup(func() { c.Close() })
+		served = append(served, c.(*Conn))
+	}
+	return served, dialed
+}
+
+func TestListenerServesConcurrentConnectionsIndependently(t *testing.T) {
+	l, path := listen(t, ListenConfig{})
+	served, dialed := serve(t, l, path, 4)
+	buf := make([]byte, 8)
+	for i := range 4 {
+		if _, err := dialed[i].Write([]byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 4 {
+		if n, err := served[i].Read(buf); err != nil || n != 1 || buf[0] != byte(i) {
+			t.Fatalf("connection %d read %q, %v; want its own byte %d", i, buf[:n], err, i)
+		}
+	}
+	dialed[0].Close()
+	if _, err := served[0].Read(buf); err != io.EOF {
+		t.Fatalf("Read on the closed connection = %v; want io.EOF", err)
+	}
+	for i := 1; i < 4; i++ {
+		if _, err := served[i].Write([]byte("still")); err != nil {
+			t.Fatalf("connection %d Write after another closed: %v", i, err)
+		}
+		if n, err := dialed[i].Read(buf); err != nil || string(buf[:n]) != "still" {
+			t.Fatalf("connection %d Read after another closed = %q, %v", i, buf[:n], err)
+		}
+	}
+}
+
 func TestCloseLeaksNoGoroutines(t *testing.T) {
 	before := runtime.NumGoroutine()
 	func() {
-		path := sockPath(t)
-		l, err := (&ListenConfig{Lanes: 2}).Listen(context.Background(), path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer l.Close()
-		ch := make(chan *Conn, 1)
-		go func() {
-			c, _ := l.Accept()
-			ch <- c
-		}()
-		dc, err := (&Dialer{Lanes: 2, Spin: -1}).Dial(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		lc := <-ch
-		if lc == nil {
-			t.Fatal("Accept failed")
-		}
+		l, path := listen(t, ListenConfig{})
+		served, dialed := serve(t, l, path, 2)
 		blocked := make(chan error, 1)
 		go func() {
-			_, err := dc.Lane(1).Next()
+			_, err := dialed[1].Next()
 			blocked <- err
 		}()
-		if _, err := lc.Lane(0).Write([]byte("x")); err != nil {
+		if _, err := served[0].Write([]byte("x")); err != nil {
 			t.Fatal(err)
 		}
-		buf := make([]byte, 1)
-		if _, err := dc.Lane(0).Read(buf); err != nil {
+		if _, err := dialed[0].Read(make([]byte, 1)); err != nil {
 			t.Fatal(err)
 		}
-		lc.Close()
-		dc.Close()
+		for _, c := range append(served, dialed...) {
+			c.Close()
+		}
 		<-blocked
+		l.Close()
 	}()
 	deadline := time.Now().Add(2 * time.Second)
 	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
@@ -829,14 +911,14 @@ func TestCloseLeaksNoGoroutines(t *testing.T) {
 }
 
 func TestHelloRoundTrip(t *testing.T) {
-	h := hello{version: protoVersion, lanes: 3, ringSize: 1 << 20}
+	h := hello{version: protoVersion, ringSize: 1 << 20}
 	got, err := decodeHello(h.encode())
 	if err != nil || got != h {
 		t.Fatalf("decodeHello = %+v, %v; want %+v", got, err, h)
 	}
-	w := welcome{lanes: 2, ringSize: 64 << 10, token: []byte("tok")}
+	w := welcome{ringSize: 64 << 10, token: []byte("tok")}
 	gw, err := decodeWelcome(w.encode())
-	if err != nil || gw.lanes != w.lanes || gw.ringSize != w.ringSize || !bytes.Equal(gw.token, w.token) {
+	if err != nil || gw.ringSize != w.ringSize || !bytes.Equal(gw.token, w.token) {
 		t.Fatalf("decodeWelcome = %+v, %v; want %+v", gw, err, w)
 	}
 }

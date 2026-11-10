@@ -10,17 +10,14 @@ import (
 	"github.com/wzshiming/ipc/internal/shm"
 )
 
-// Dialer contains options for connecting to a Listener. Lanes and RingSize
-// are a request: the listener clamps them to its ListenConfig and both ends
-// use the clamped values.
+// Dialer contains options for connecting to a Listener.
 type Dialer struct {
-	// Lanes is the number of lanes requested; 0 means 1.
-	Lanes int
-	// RingSize is the ring capacity per lane direction requested in bytes, a
-	// power of two in [64 KiB, 1 GiB]; 0 means 4 MiB.
+	// RingSize is the ring capacity per direction requested in bytes, a
+	// power of two in [64 KiB, 512 MiB]; 0 means 4 MiB. The listener grants
+	// it, clamped to its ListenConfig.RingSize, and both ends use the result.
 	RingSize int
 	// Spin is how long a blocking call on the connection busy re-checks its
-	// lane, without yielding its thread, before parking; 0 means 50 µs and
+	// ring, without yielding its thread, before parking; 0 means 50 µs and
 	// a negative value parks at once. Each spinning call holds a CPU, so
 	// choose Spin small or negative when CPUs are scarce.
 	Spin time.Duration
@@ -47,22 +44,20 @@ func (d *Dialer) Dial(path string) (*Conn, error) {
 // returned connection. It returns ErrRejected when the listener refuses the
 // request. A nil d uses the defaults.
 func (d *Dialer) DialContext(ctx context.Context, path string) (*Conn, error) {
-	var (
-		cfg     config
-		timeout time.Duration
-	)
+	var cfg Dialer
 	if d != nil {
-		cfg = config{Lanes: d.Lanes, RingSize: d.RingSize, Spin: d.Spin}
-		timeout = d.Timeout
+		cfg = *d
 	}
-	cfg = cfg.withDefaults()
+	if cfg.RingSize == 0 {
+		cfg.RingSize = defaultRingSize
+	}
 	dialCtx := ctx
-	if timeout > 0 {
+	if cfg.Timeout > 0 {
 		var cancel context.CancelFunc
-		dialCtx, cancel = context.WithTimeout(ctx, timeout)
+		dialCtx, cancel = context.WithTimeout(ctx, cfg.Timeout)
 		defer cancel()
 	}
-	c, err := dial(dialCtx, path, cfg)
+	c, err := dial(dialCtx, path, cfg.RingSize, spinDuration(cfg.Spin))
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -75,12 +70,12 @@ func (d *Dialer) DialContext(ctx context.Context, path string) (*Conn, error) {
 	return c, nil
 }
 
-func dial(ctx context.Context, path string, cfg config) (*Conn, error) {
+func dial(ctx context.Context, path string, ringSize int, spin time.Duration) (*Conn, error) {
 	link, err := control.Dial(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	c, err := dialHandshake(ctx, link, path, cfg)
+	c, err := dialHandshake(ctx, link, path, ringSize, spin)
 	if err != nil {
 		link.Close()
 		return nil, err
@@ -88,11 +83,11 @@ func dial(ctx context.Context, path string, cfg config) (*Conn, error) {
 	return c, nil
 }
 
-func dialHandshake(ctx context.Context, link *control.Link, path string, cfg config) (*Conn, error) {
+func dialHandshake(ctx context.Context, link *control.Link, path string, ringSize int, spin time.Duration) (*Conn, error) {
 	stop := context.AfterFunc(ctx, func() { link.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
 	link.SetDeadline(time.Now().Add(handshakeTimeout))
-	h := hello{version: protoVersion, lanes: uint64(cfg.Lanes), ringSize: uint64(cfg.RingSize)}
+	h := hello{version: protoVersion, ringSize: uint64(ringSize)}
 	if err := link.Send(frameHello, h.encode(), nil); err != nil {
 		return nil, err
 	}
@@ -118,7 +113,7 @@ func dialHandshake(ctx context.Context, link *control.Link, path string, cfg con
 	if err != nil {
 		return nil, err
 	}
-	if uint64(tok.Size) != segmentSize(w.lanes, w.ringSize) {
+	if uint64(tok.Size) != segmentSize(w.ringSize) {
 		tok.Close()
 		return nil, errProtocol
 	}
@@ -131,7 +126,7 @@ func dialHandshake(ctx context.Context, link *control.Link, path string, cfg con
 		return nil, ctx.Err()
 	}
 	link.SetDeadline(time.Time{})
-	c, err := newConn(link, seg, int(w.lanes), int(w.ringSize), cfg.Spin, path, false)
+	c, err := newConn(link, seg, int(w.ringSize), spin, path, false)
 	if err != nil {
 		seg.Close()
 		return nil, err

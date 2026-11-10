@@ -20,12 +20,12 @@ import (
 const (
 	envRole = "IPC_E2E_ROLE"
 	envPath = "IPC_E2E_PATH"
-	// envMiB sets the stream volume per lane per direction in MiB (default 256).
+	// envMiB sets the stream volume per connection per direction in MiB (default 256).
 	envMiB = "IPC_E2E_MIB"
 )
 
 const (
-	e2eLanes      = 4
+	e2eConns      = 4
 	pingPongCount = 1_000_000
 	recHdr        = 12 // seq u64 | crc32 u32
 	maxBody       = 64 << 10
@@ -43,9 +43,18 @@ func TestMain(m *testing.M) {
 }
 
 func runChild(role, path string) error {
-	d := Dialer{Lanes: 1, Timeout: 10 * time.Second}
+	d := Dialer{Timeout: 10 * time.Second}
 	if role == "stream" {
-		d.Lanes = e2eLanes
+		conns := make([]*Conn, e2eConns)
+		for i := range conns {
+			c, err := d.Dial(path)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			conns[i] = c
+		}
+		return runStreams(conns, 1, streamVolume())
 	}
 	c, err := d.Dial(path)
 	if err != nil {
@@ -53,32 +62,29 @@ func runChild(role, path string) error {
 	}
 	defer c.Close()
 	switch role {
-	case "stream":
-		return runStream(c, 1, streamVolume())
 	case "echo":
-		l := c.Lane(0)
 		for {
-			rec, err := l.Next()
+			rec, err := c.Next()
 			if err == io.EOF {
 				return nil
 			}
 			if err != nil {
 				return err
 			}
-			p, err := l.Reserve(len(rec))
+			p, err := c.Reserve(len(rec))
 			if err != nil {
 				return err
 			}
 			copy(p, rec)
-			if err := l.Commit(); err != nil {
+			if err := c.Commit(); err != nil {
 				return err
 			}
-			if err := l.Release(); err != nil {
+			if err := c.Release(); err != nil {
 				return err
 			}
 		}
 	case "hang":
-		_, err := c.Lane(0).Next()
+		_, err := c.Next()
 		return err
 	case "copy":
 		return runCopyChild(c)
@@ -105,25 +111,25 @@ var pattern = func() []byte {
 	return p
 }()
 
-// runStream sends volume bytes of variable-length records on every lane in
-// direction dir (0: listener→dialer, 1: dialer→listener) and checks every
-// record arriving from the other direction by sequence number and CRC.
-func runStream(c *Conn, dir uint64, volume int64) error {
+// runStreams sends volume bytes of variable-length records on every
+// connection in direction dir (0: listener→dialer, 1: dialer→listener) and
+// checks every record arriving from the other direction by sequence number
+// and CRC.
+func runStreams(conns []*Conn, dir uint64, volume int64) error {
 	var wg sync.WaitGroup
-	errs := make(chan error, 2*c.Lanes())
-	for i := range c.Lanes() {
-		l := c.Lane(i)
+	errs := make(chan error, 2*len(conns))
+	for i, c := range conns {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			if err := sendStream(l, dir, volume); err != nil {
-				errs <- fmt.Errorf("lane %d send: %w", l.Index(), err)
+			if err := sendStream(c, uint64(i), dir, volume); err != nil {
+				errs <- fmt.Errorf("connection %d send: %w", i, err)
 			}
 		}()
 		go func() {
 			defer wg.Done()
-			if err := recvStream(l, volume); err != nil {
-				errs <- fmt.Errorf("lane %d recv: %w", l.Index(), err)
+			if err := recvStream(c, volume); err != nil {
+				errs <- fmt.Errorf("connection %d recv: %w", i, err)
 			}
 		}()
 	}
@@ -132,13 +138,13 @@ func runStream(c *Conn, dir uint64, volume int64) error {
 	return <-errs
 }
 
-func sendStream(l *Lane, dir uint64, volume int64) error {
-	r := rand.New(rand.NewPCG(uint64(l.Index()), dir))
+func sendStream(c *Conn, seed, dir uint64, volume int64) error {
+	r := rand.New(rand.NewPCG(seed, dir))
 	var seq uint64
 	for sent := int64(0); sent < volume; seq++ {
 		body := r.IntN(maxBody + 1)
 		off := int(seq*4099) % (len(pattern) - maxBody)
-		p, err := l.Reserve(recHdr + body)
+		p, err := c.Reserve(recHdr + body)
 		if err != nil {
 			return err
 		}
@@ -146,27 +152,27 @@ func sendStream(l *Lane, dir uint64, volume int64) error {
 		binary.LittleEndian.PutUint64(p, seq)
 		binary.LittleEndian.PutUint32(p[8:], crc32.ChecksumIEEE(b))
 		copy(p[recHdr:], b)
-		if err := l.Commit(); err != nil {
+		if err := c.Commit(); err != nil {
 			return err
 		}
 		sent += int64(recHdr + body)
 	}
 	// A header-less record marks the end of the stream.
-	if _, err := l.Reserve(0); err != nil {
+	if _, err := c.Reserve(0); err != nil {
 		return err
 	}
-	return l.Commit()
+	return c.Commit()
 }
 
-func recvStream(l *Lane, volume int64) error {
+func recvStream(c *Conn, volume int64) error {
 	var got int64
 	for seq := uint64(0); ; seq++ {
-		rec, err := l.Next()
+		rec, err := c.Next()
 		if err != nil {
 			return err
 		}
 		if len(rec) == 0 {
-			l.Release()
+			c.Release()
 			if got < volume {
 				return fmt.Errorf("stream ended after %d bytes; want %d", got, volume)
 			}
@@ -182,14 +188,15 @@ func recvStream(l *Lane, volume int64) error {
 			return fmt.Errorf("record %d: crc mismatch", seq)
 		}
 		got += int64(len(rec))
-		if err := l.Release(); err != nil {
+		if err := c.Release(); err != nil {
 			return err
 		}
 	}
 }
 
-// startPeer listens, starts the child in role and returns the accepted Conn.
-func startPeer(t *testing.T, role string, lcfg ListenConfig) (*Conn, *exec.Cmd) {
+// startPeer listens, starts the child in role and returns the n connections
+// it dials, in dial order.
+func startPeer(t *testing.T, role string, lcfg ListenConfig, n int) ([]*Conn, *exec.Cmd) {
 	t.Helper()
 	l, path := listen(t, lcfg)
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
@@ -203,69 +210,72 @@ func startPeer(t *testing.T, role string, lcfg ListenConfig) (*Conn, *exec.Cmd) 
 		cmd.Wait()
 	})
 	l.SetDeadline(time.Now().Add(20 * time.Second))
-	c, err := l.Accept()
-	if err != nil {
-		t.Fatal("Accept:", err)
+	conns := make([]*Conn, n)
+	for i := range conns {
+		c, err := l.Accept()
+		if err != nil {
+			t.Fatal("Accept:", err)
+		}
+		t.Cleanup(func() { c.Close() })
+		conns[i] = c.(*Conn)
 	}
-	t.Cleanup(func() { c.Close() })
-	return c, cmd
+	return conns, cmd
 }
 
-func TestE2EFourLanesBidirectionalStream(t *testing.T) {
-	c, cmd := startPeer(t, "stream", ListenConfig{Lanes: e2eLanes})
-	if c.Lanes() != e2eLanes {
-		t.Fatalf("Lanes = %d; want %d", c.Lanes(), e2eLanes)
-	}
+func TestE2EFourConnectionsBidirectionalStream(t *testing.T) {
+	conns, cmd := startPeer(t, "stream", ListenConfig{}, e2eConns)
 	volume := streamVolume()
 	start := time.Now()
-	if err := runStream(c, 0, volume); err != nil {
+	if err := runStreams(conns, 0, volume); err != nil {
 		t.Fatal(err)
 	}
 	if err := cmd.Wait(); err != nil {
 		t.Fatal("child:", err)
 	}
 	d := time.Since(start)
-	total := float64(2 * e2eLanes * volume)
-	t.Logf("%d lanes x 2 directions x %d MiB in %v: %.2f GB/s aggregate", e2eLanes, volume>>20, d, total/d.Seconds()/1e9)
+	total := float64(2 * e2eConns * volume)
+	t.Logf("%d connections x 2 directions x %d MiB in %v: %.2f GB/s aggregate", e2eConns, volume>>20, d, total/d.Seconds()/1e9)
 }
 
 // The child closes as soon as its receives finish, so the parent often reads
 // the rest of the stream after the peer's Bye.
-func TestE2EFourLanesStreamDrainsAfterChildCloses(t *testing.T) {
+func TestE2EFourConnectionsStreamDrainsAfterChildCloses(t *testing.T) {
 	t.Setenv(envMiB, "8")
 	for i := range 5 {
-		c, cmd := startPeer(t, "stream", ListenConfig{Lanes: e2eLanes})
-		if err := runStream(c, 0, streamVolume()); err != nil {
+		conns, cmd := startPeer(t, "stream", ListenConfig{}, e2eConns)
+		if err := runStreams(conns, 0, streamVolume()); err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
 		if err := cmd.Wait(); err != nil {
 			t.Fatalf("run %d child: %v", i, err)
 		}
-		c.Close()
+		for _, c := range conns {
+			c.Close()
+		}
 	}
 }
 
 func TestE2EPingPong64B(t *testing.T) {
-	c, cmd := startPeer(t, "echo", ListenConfig{})
-	l := c.Lane(0)
+	conns, cmd := startPeer(t, "echo", ListenConfig{}, 1)
+	c := conns[0]
 	start := time.Now()
 	for seq := uint64(0); seq < pingPongCount; seq++ {
-		p, err := l.Reserve(64)
+		p, err := c.Reserve(64)
 		if err != nil {
 			t.Fatal(err)
 		}
 		binary.LittleEndian.PutUint64(p, seq)
-		if err := l.Commit(); err != nil {
+		if err := c.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		rec, err := l.Next()
+		rec, err := c.Next()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(rec) != 64 || binary.LittleEndian.Uint64(rec) != seq {
 			t.Fatalf("echo %d: got %d bytes seq %d", seq, len(rec), binary.LittleEndian.Uint64(rec))
 		}
-		if err := l.Release(); err != nil {
+		if err := c.Release(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -278,10 +288,10 @@ func TestE2EPingPong64B(t *testing.T) {
 }
 
 func TestE2EKilledPeerWakesBlockedNextWithErrPeerClosed(t *testing.T) {
-	c, cmd := startPeer(t, "hang", ListenConfig{Spin: -1})
+	conns, cmd := startPeer(t, "hang", ListenConfig{Spin: -1}, 1)
 	ch := make(chan error, 1)
 	go func() {
-		_, err := c.Lane(0).Next()
+		_, err := conns[0].Next()
 		ch <- err
 	}()
 	time.Sleep(50 * time.Millisecond)

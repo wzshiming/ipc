@@ -20,11 +20,23 @@ type addr string
 func (addr) Network() string  { return "ipc" }
 func (a addr) String() string { return string(a) }
 
-// Conn is one shared-memory connection made of Lanes() independent lanes.
+// Conn is one shared-memory connection: a pair of rings, one per direction,
+// in one segment. It is a net.Conn whose Read and Write carry a byte stream
+// over records, and it offers the records themselves through TryReserve,
+// Reserve, Commit, Abort, TryNext, Next and Release. Their slices alias
+// shared memory: a Reserve slice is valid until Commit or Abort, a Next
+// slice until Release.
+//
+// Read and Write may be called from any goroutine. The record methods of one
+// direction serve one goroutine at a time: one may send while another
+// receives. On one direction use either the record methods or Read/Write;
+// interleaving them while Read holds a partly consumed record is not
+// supported. Sends honour the write deadline and receives the read deadline.
 type Conn struct {
 	link      *control.Link
 	seg       *shm.Segment
-	lanes     []*Lane
+	prod      *ring.Producer
+	cons      *ring.Consumer
 	ringSize  int
 	maxRecord int
 	spin      time.Duration
@@ -38,18 +50,24 @@ type Conn struct {
 	closed     atomic.Bool // Close was called on this end
 	bye        atomic.Bool // the peer said goodbye
 	readerDone chan struct{}
+	live       atomic.Int32 // halves that may still touch the segment
+	unmapped   atomic.Bool  // test hook: the segment has been released
 
-	live     atomic.Int32 // lane halves that may still touch the segment
-	unmapped atomic.Bool  // test hook: the segment has been released
+	wmu sync.Mutex // serializes Write
+	tx  half
+	rx  half
+	rmu sync.Mutex // serializes Read
+	rec []byte     // unread rest of the record Read holds
 }
 
-// newConn wires lanes onto the rings of seg and starts the control reader.
-// On error the caller still owns link and seg.
-func newConn(link *control.Link, seg *shm.Segment, lanes, ringSize int, spin time.Duration, path string, listener bool) (*Conn, error) {
+var _ net.Conn = (*Conn)(nil)
+
+// newConn wires the two rings of seg and starts the control reader. On error
+// the caller still owns link and seg.
+func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Duration, path string, listener bool) (*Conn, error) {
 	c := &Conn{
 		link:       link,
 		seg:        seg,
-		lanes:      make([]*Lane, lanes),
 		ringSize:   ringSize,
 		maxRecord:  ring.MaxRecord(ringSize),
 		spin:       spin,
@@ -62,46 +80,38 @@ func newConn(link *control.Link, seg *shm.Segment, lanes, ringSize int, spin tim
 		c.sendDir = dirListenerToDialer
 	}
 	recvDir := 1 - c.sendDir
-	mem := seg.Bytes()
-	rs := ring.Size(ringSize)
-	region := func(k int) []byte { return mem[k*rs : (k+1)*rs : (k+1)*rs] }
-	for k := range 2 * lanes {
-		if capacity, err := ring.Verify(region(k)); err != nil || capacity != ringSize {
-			return nil, corruptErr(k, err)
+	mem, rs := seg.Bytes(), ring.Size(ringSize)
+	region := func(dir uint8) []byte {
+		k := int(dir)
+		return mem[k*rs : (k+1)*rs : (k+1)*rs]
+	}
+	for dir := range uint8(2) {
+		if capacity, err := ring.Verify(region(dir)); err != nil || capacity != ringSize {
+			return nil, corruptErr(dir, err)
 		}
 	}
-	for i := range lanes {
-		tx, rx := 2*i+int(c.sendDir), 2*i+int(recvDir)
-		prod, err := ring.NewProducer(region(tx))
-		if err != nil {
-			return nil, corruptErr(tx, err)
-		}
-		cons, err := ring.NewConsumer(region(rx))
-		if err != nil {
-			return nil, corruptErr(rx, err)
-		}
-		c.lanes[i] = &Lane{
-			c:    c,
-			idx:  i,
-			prod: prod,
-			cons: cons,
-			tx:   half{sig: make(chan struct{}, 1), bell: newDoorbell(i, c.sendDir)},
-			rx:   half{sig: make(chan struct{}, 1), bell: newDoorbell(i, recvDir)},
-		}
+	var err error
+	if c.prod, err = ring.NewProducer(region(c.sendDir)); err != nil {
+		return nil, corruptErr(c.sendDir, err)
 	}
-	c.live.Store(int32(2 * lanes))
+	if c.cons, err = ring.NewConsumer(region(recvDir)); err != nil {
+		return nil, corruptErr(recvDir, err)
+	}
+	c.tx.sig, c.tx.bell = make(chan struct{}, 1), doorbell{c.sendDir}
+	c.rx.sig, c.rx.bell = make(chan struct{}, 1), doorbell{recvDir}
+	c.live.Store(2)
 	go c.readLoop()
 	return c, nil
 }
 
-func corruptErr(k int, err error) error {
+func corruptErr(dir uint8, err error) error {
 	if err == nil {
 		err = errors.New("capacity differs from the negotiated ring size")
 	}
-	return fmt.Errorf("%w: ring %d: %w", ErrCorrupt, k, err)
+	return fmt.Errorf("%w: ring %d: %w", ErrCorrupt, dir, err)
 }
 
-// readLoop dispatches doorbells to lane signals until the link fails.
+// readLoop dispatches doorbells to the halves until the link fails.
 func (c *Conn) readLoop() {
 	defer close(c.readerDone)
 	for {
@@ -117,14 +127,14 @@ func (c *Conn) readLoop() {
 		}
 		switch typ {
 		case frameDoorbell:
-			i, dir, err := decodeDoorbell(p)
-			if err != nil || i >= len(c.lanes) {
+			dir, err := decodeDoorbell(p)
+			if err != nil {
 				c.shutdown(errProtocol)
 				return
 			}
-			h := &c.lanes[i].rx
+			h := &c.rx
 			if dir == c.sendDir {
-				h = &c.lanes[i].tx
+				h = &c.tx
 			}
 			select {
 			case h.sig <- struct{}{}:
@@ -143,25 +153,19 @@ func (c *Conn) readLoop() {
 
 // shutdown closes the connection with err as the reason unless it is closed
 // already, waking every blocked call and ending receives; the segment is
-// released when no lane slice is outstanding.
+// released when no slice is outstanding.
 func (c *Conn) shutdown(err error) {
 	c.peerGone(err)
-	c.rxOnce.Do(func() {
-		for _, l := range c.lanes {
-			l.rx.close(c)
-		}
-	})
+	c.rxOnce.Do(func() { c.rx.close(c) })
 }
 
-// peerGone closes the connection like shutdown but leaves the receive halves
+// peerGone closes the connection like shutdown but leaves the receive half
 // open, so records the peer committed can still be drained until Close.
 func (c *Conn) peerGone(err error) {
 	c.closeOnce.Do(func() {
 		c.err = err
 		// Sends fail before Done closes, so callers seeing Done see them fail.
-		for _, l := range c.lanes {
-			l.tx.close(c)
-		}
+		c.tx.close(c)
 		close(c.done)
 		if err == net.ErrClosed {
 			c.link.SetWriteDeadline(time.Now().Add(time.Second))
@@ -171,7 +175,7 @@ func (c *Conn) peerGone(err error) {
 	})
 }
 
-// halfDone is called once per lane half after close, when it holds no slice.
+// halfDone is called once per half after close, when it holds no slice.
 func (c *Conn) halfDone() {
 	if c.live.Add(-1) == 0 {
 		c.seg.Close()
@@ -216,16 +220,10 @@ func peerErr(err error) error {
 	return err
 }
 
-// Lanes returns the number of lanes.
-func (c *Conn) Lanes() int { return len(c.lanes) }
-
-// Lane returns lane i, 0 <= i < Lanes().
-func (c *Conn) Lane(i int) *Lane { return c.lanes[i] }
-
-// RingSize returns each lane's ring capacity per direction.
+// RingSize returns the ring capacity per direction.
 func (c *Conn) RingSize() int { return c.ringSize }
 
-// MaxRecord returns the largest record a lane accepts.
+// MaxRecord returns the largest record the connection accepts.
 func (c *Conn) MaxRecord() int { return c.maxRecord }
 
 // LocalAddr returns the socket path the connection was made on.
@@ -234,14 +232,46 @@ func (c *Conn) LocalAddr() net.Addr { return c.addr }
 // RemoteAddr returns the socket path the connection was made on.
 func (c *Conn) RemoteAddr() net.Addr { return c.addr }
 
+// SetDeadline sets both the read and the write deadline, as
+// SetReadDeadline and SetWriteDeadline do.
+func (c *Conn) SetDeadline(t time.Time) error {
+	c.rx.dl.set(t)
+	c.tx.dl.set(t)
+	return nil
+}
+
+// SetReadDeadline sets the deadline for Read and Next, including calls
+// already blocked. Past the deadline they fail with os.ErrDeadlineExceeded,
+// which is a net.Error whose Timeout method reports true; a zero t means no
+// deadline. TryNext ignores it.
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.rx.dl.set(t)
+	return nil
+}
+
+// SetWriteDeadline sets the deadline for Write and Reserve, including calls
+// already blocked. Past the deadline they fail with os.ErrDeadlineExceeded;
+// a zero t means no deadline. TryReserve ignores it.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.tx.dl.set(t)
+	return nil
+}
+
 // Close tells the peer goodbye, closes the link and wakes every blocked call
 // with net.ErrClosed; records the peer committed are no longer delivered.
 // Slices still held from Reserve or Next stay readable until they are
-// committed, aborted or released.
+// committed, aborted or released, while a record Read holds partly consumed
+// is released; the segment is unmapped once no slice is left.
 func (c *Conn) Close() error {
 	c.closed.Store(true)
 	c.shutdown(net.ErrClosed)
 	<-c.readerDone
+	c.rmu.Lock()
+	if len(c.rec) > 0 {
+		c.rec = nil
+		c.Release()
+	}
+	c.rmu.Unlock()
 	return nil
 }
 

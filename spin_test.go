@@ -16,9 +16,9 @@ func pinnedPingPong(tb testing.TB, lc, dc *Conn, rounds int) []time.Duration {
 		defer runtime.UnlockOSThread()
 		buf := make([]byte, 64)
 		for range rounds {
-			n, err := dc.Lane(0).Read(buf)
+			n, err := dc.Read(buf)
 			if err == nil {
-				_, err = dc.Lane(0).Write(buf[:n])
+				_, err = dc.Write(buf[:n])
 			}
 			if err != nil {
 				done <- err
@@ -33,10 +33,10 @@ func pinnedPingPong(tb testing.TB, lc, dc *Conn, rounds int) []time.Duration {
 	samples := make([]time.Duration, 0, rounds)
 	for range rounds {
 		t0 := time.Now()
-		if _, err := lc.Lane(0).Write(msg); err != nil {
+		if _, err := lc.Write(msg); err != nil {
 			tb.Fatal(err)
 		}
-		if _, err := lc.Lane(0).Read(buf); err != nil {
+		if _, err := lc.Read(buf); err != nil {
 			tb.Fatal(err)
 		}
 		samples = append(samples, time.Since(t0))

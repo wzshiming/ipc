@@ -1,36 +1,44 @@
 // Package ipc is a pure-Go shared-memory connection between two processes on
 // one machine, for Linux, macOS and Windows.
 //
-// A Listener on an AF_UNIX socket path accepts connections that Dial makes.
-// Each Conn has Lanes() independent lanes; each lane has one ring per
-// direction inside a single shared-memory segment, so records move without
-// system calls or copies. The socket carries only the handshake, doorbells
-// that wake a parked peer, and goodbye.
+// A Listener on an AF_UNIX socket path accepts the connections that Dial
+// makes, any number of them, like a TCP server. A Conn is one pair of rings,
+// one per direction, in a single shared-memory segment, so records move
+// without system calls or copies; the socket carries only the handshake,
+// doorbells that wake a parked peer, and goodbye. Conn is a net.Conn: Read
+// and Write carry a byte stream over records, while Reserve, Commit, Next
+// and Release work on the records in place.
 //
-//	l, _ := (&ipc.ListenConfig{Lanes: 4}).Listen(ctx, "/tmp/app.sock")
-//	c, _ := l.Accept()
+//	l, _ := ipc.Listen("/tmp/app.sock")
+//	c, _ := l.Accept() // a net.Conn; c.(*ipc.Conn) adds the record API
 //
-//	c, _ := (&ipc.Dialer{Lanes: 4}).Dial("/tmp/app.sock")
-//	lane := c.Lane(0)
-//	p, _ := lane.Reserve(64) // write the record into p in place
-//	lane.Commit()
-//	rec, _ := lane.Next() // read the peer's record in place
-//	lane.Release()
+//	c, _ := ipc.Dial("/tmp/app.sock")
+//	p, _ := c.Reserve(64) // write the record into p in place
+//	c.Commit()
+//	rec, _ := c.Next() // read the peer's record in place
+//	c.Release()
 //
-// A Dialer's Lanes and RingSize are a request: the listener clamps them to
-// its ListenConfig and both ends use the result.
+// The dialer chooses the ring capacity per direction (Dialer.RingSize,
+// default 4 MiB) and the listener grants it, clamped to ListenConfig.RingSize
+// when that is set. More bandwidth comes from more connections.
 //
 // Slices from Reserve and Next alias shared memory: a Reserve slice is valid
-// until Commit or Abort, a Next slice until Release. Write and Read copy
-// instead, one record per call. Each direction of a lane serves one goroutine
-// at a time; use more lanes for more concurrency.
+// until Commit or Abort, a Next slice until Release. Read and Write copy
+// instead: Write splits its bytes into records of at most MaxRecord and Read
+// returns their bytes in order, continuing a long record over several calls
+// and skipping empty ones. On one direction use either the record methods or
+// Read/Write; interleaving them while Read holds a partly consumed record is
+// not supported. Read and Write may be called from any goroutine; the record
+// methods of one direction serve one goroutine at a time, one sending while
+// another receives.
 //
 // Blocking calls busy-spin for the Spin duration without yielding their
-// thread, then park until the peer rings, the lane's deadline passes or the
-// connection closes; past the deadline they return os.ErrDeadlineExceeded.
-// Close wakes them with net.ErrClosed. After the peer closes or dies, sends
-// fail with ErrPeerClosed at once, while receives return the records it
-// committed and then io.EOF after a graceful close or ErrPeerClosed after a
-// crash, until this end's Close. The segment is unmapped once this end has
-// closed and every outstanding slice has been released.
+// thread, then park until the peer rings, the deadline passes or the
+// connection closes; past the deadline they return os.ErrDeadlineExceeded, a
+// net.Error whose Timeout method reports true. Close wakes them with
+// net.ErrClosed. After the peer closes or dies, sends fail with ErrPeerClosed
+// at once, while receives return the records it committed and then io.EOF
+// after a graceful close or ErrPeerClosed after a crash, until this end's
+// Close. The segment is unmapped once this end has closed and every
+// outstanding slice has been released.
 package ipc
