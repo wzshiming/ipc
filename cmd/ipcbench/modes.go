@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,19 +13,18 @@ import (
 	"time"
 )
 
-// stride is the spacing of sequence words in a throughput record: one per
-// 128-byte cache line.
+// stride is the spacing of stamp words in the throughput stream: the first
+// 8 bytes of every 128-byte line hold the line's stream offset.
 const stride = 128
 
-// integrityError reports a record whose payload is not what was produced.
+// integrityError reports a payload that is not what was produced.
 type integrityError struct {
 	conn   int
-	record uint64
 	detail string
 }
 
 func (e *integrityError) Error() string {
-	return fmt.Sprintf("integrity: connection %d record %d: %s", e.conn, e.record, e.detail)
+	return fmt.Sprintf("integrity: connection %d: %s", e.conn, e.detail)
 }
 
 // newTemplate returns a size-byte record template filled with a pattern.
@@ -36,18 +36,46 @@ func newTemplate(size int) []byte {
 	return t
 }
 
-// stampTemplate writes seq into every sequence word of t.
-func stampTemplate(t []byte, seq uint64) {
-	for off := 0; off+8 <= len(t); off += stride {
-		binary.LittleEndian.PutUint64(t[off:], seq)
+// filler is the pattern between stamp words; its length is a multiple of the
+// pattern's period, so filler[o%len(filler)] is the byte at stream offset o.
+var filler = newTemplate(64 << 10)
+
+// fill writes the stream's bytes from offset off into p: the filler, then
+// each line's stamp word, byte by byte where one crosses an end of p.
+func fill(p []byte, off uint64) {
+	for n := 0; n < len(p); {
+		n += copy(p[n:], filler[(off+uint64(n))%uint64(len(filler)):])
+	}
+	end := off + uint64(len(p))
+	for line := off - off%stride; line < end; line += stride {
+		if line >= off && line+8 <= end {
+			binary.LittleEndian.PutUint64(p[line-off:], line)
+			continue
+		}
+		for o := max(line, off); o < min(line+8, end); o++ {
+			p[o-off] = stampByte(line, o)
+		}
 	}
 }
 
-// verifyRecord checks that every sequence word of rec holds seq.
-func verifyRecord(rec []byte, seq uint64) error {
-	for off := 0; off+8 <= len(rec); off += stride {
-		if w := binary.LittleEndian.Uint64(rec[off:]); w != seq {
-			return fmt.Errorf("offset %d holds %#x, want %#x", off, w, seq)
+// stampByte is the byte at stream offset o of the stamp word at line.
+func stampByte(line, o uint64) byte { return byte(line >> (8 * (o - line))) }
+
+// verify checks the stamp words of p, the stream's bytes from offset off,
+// and names the first offset that differs; filler bytes are not checked.
+func verify(p []byte, off uint64) error {
+	end := off + uint64(len(p))
+	for line := off - off%stride; line < end; line += stride {
+		if line >= off && line+8 <= end {
+			if w := binary.LittleEndian.Uint64(p[line-off:]); w != line {
+				return fmt.Errorf("offset %d holds %#x, want %#x", line, w, line)
+			}
+			continue
+		}
+		for o := max(line, off); o < min(line+8, end); o++ {
+			if b, want := p[o-off], stampByte(line, o); b != want {
+				return fmt.Errorf("offset %d holds %#x, want %#x", o, b, want)
+			}
 		}
 	}
 	return nil
@@ -80,24 +108,46 @@ func produceAll(conns []net.Conn, o options) error {
 	return nil
 }
 
-// produce writes size-byte records on connection index until stop is set,
-// then closes it, which ends the consumer's stream. With fill, each record
-// is the template stamped with its sequence number, and record corrupt gets
-// a damaged sequence word.
-func produce(c net.Conn, index, size int, fill bool, corrupt uint64, stop *atomic.Bool) error {
+// source is the producer's io.Reader: each Read takes at most size bytes of
+// the slice, filled with the stream's bytes when payload is set, and
+// reports io.EOF once stop is set. Read number corrupt gets its first byte
+// flipped.
+type source struct {
+	size    int
+	payload bool
+	corrupt uint64
+	stop    *atomic.Bool
+	off     uint64 // stream offset of the next byte
+	reads   uint64
+}
+
+func (s *source) Read(p []byte) (int, error) {
+	if s.stop.Load() {
+		return 0, io.EOF
+	}
+	n := min(len(p), s.size)
+	s.reads++
+	if s.payload && n > 0 {
+		fill(p[:n], s.off)
+		if s.reads == s.corrupt {
+			p[0] ^= 0xff
+		}
+	}
+	s.off += uint64(n)
+	return n, nil
+}
+
+// produce copies a source of size-byte chunks into connection index until
+// stop is set, then closes it, which ends the consumer's stream. With
+// payload, the chunks hold the stream's pattern and chunk corrupt gets a
+// damaged first byte.
+func produce(c net.Conn, index, size int, payload bool, corrupt uint64, stop *atomic.Bool) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	rec := newTemplate(size)
-	for seq := uint64(1); !stop.Load(); seq++ {
-		if fill {
-			stampTemplate(rec, seq)
-			if seq == corrupt {
-				rec[0] ^= 0xff
-			}
-		}
-		if _, err := c.Write(rec); err != nil {
-			return fmt.Errorf("connection %d: %w", index, err)
-		}
+	src := &source{size: size, payload: payload, corrupt: corrupt, stop: stop}
+	// ReadFrom has src.Read fill each ring record in place; nothing is copied.
+	if _, err := io.Copy(c, src); err != nil {
+		return fmt.Errorf("connection %d: %w", index, err)
 	}
 	return c.Close()
 }
@@ -121,7 +171,7 @@ func (r *report) consume(conns []net.Conn, o options) error {
 	for i, c := range conns {
 		wg.Go(func() {
 			var err error
-			stats[i], err = consume(c, i, o.size, o.mode == "throughput")
+			stats[i], err = consume(c, i, o.mode == "throughput")
 			if err != nil {
 				once.Do(func() {
 					first = err
@@ -138,39 +188,48 @@ func (r *report) consume(conns []net.Conn, o options) error {
 	return nil
 }
 
-// consume reads size-byte records on connection index until the producer's
-// Close ends the stream with io.EOF. The window starts after the first
-// record so its bytes and setup are not counted.
-func consume(c net.Conn, index, size int, check bool) (connStats, error) {
+// sink is the consumer's io.Writer: each Write is one ring record. The
+// first starts the window and is not counted; with check, every one is
+// verified as the stream's bytes at the offset it continues.
+type sink struct {
+	conn  int
+	check bool
+	off   uint64 // stream offset of the next byte
+	connStats
+}
+
+func (s *sink) Write(p []byte) (int, error) {
+	if s.check {
+		if err := verify(p, s.off); err != nil {
+			return 0, &integrityError{s.conn, err.Error()}
+		}
+	}
+	s.off += uint64(len(p))
+	if s.start.IsZero() {
+		s.start = time.Now()
+	} else {
+		s.records++
+		s.bytes += uint64(len(p))
+	}
+	return len(p), nil
+}
+
+// consume copies connection index's stream into a sink until the producer's
+// Close ends it with io.EOF, which ends the window.
+func consume(c net.Conn, index int, check bool) (connStats, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	var s connStats
-	rec := make([]byte, size)
-	for seq := uint64(1); ; seq++ {
-		// Read copies the record out of the ring into rec; that copy is part of what is measured.
-		n, err := io.ReadFull(c, rec)
-		switch err {
-		case nil:
-		case io.EOF:
-			s.end = time.Now()
-			return s, nil
-		case io.ErrUnexpectedEOF:
-			return s, &integrityError{index, seq, fmt.Sprintf("length %d, want %d", n, size)}
-		default:
-			return s, fmt.Errorf("connection %d: %w", index, err)
+	s := &sink{conn: index, check: check}
+	// WriteTo hands each ring record's slice to s.Write; nothing is copied.
+	if _, err := io.Copy(s, c); err != nil {
+		var ie *integrityError
+		if errors.As(err, &ie) {
+			return s.connStats, err
 		}
-		if check {
-			if err := verifyRecord(rec, seq); err != nil {
-				return s, &integrityError{index, seq, err.Error()}
-			}
-		}
-		if seq == 1 {
-			s.start = time.Now()
-			continue
-		}
-		s.records++
-		s.bytes += uint64(n)
+		return s.connStats, fmt.Errorf("connection %d: %w", index, err)
 	}
+	s.end = time.Now()
+	return s.connStats, nil
 }
 
 // measureLatency writes size-byte records on c and times each echo until
@@ -195,7 +254,7 @@ func measureLatency(c net.Conn, size int, d time.Duration) (*latency, error) {
 			return nil, err
 		}
 		if binary.LittleEndian.Uint64(reply) != seq {
-			return nil, &integrityError{0, seq, "echo differs from the record sent"}
+			return nil, &integrityError{0, fmt.Sprintf("echo of record %d differs from the record sent", seq)}
 		}
 		if seq > warmup {
 			samples = append(samples, elapsed(t0, nowNanos()))

@@ -3,8 +3,8 @@
 //
 // The process you start listens and consumes; it re-executes itself with
 // -peer to dial and produce, so every rate is measured on the consumer side
-// after Read. Exit codes: 0 success, 1 error or nothing measured,
-// 2 payload integrity failure.
+// as io.Copy delivers each record. Exit codes: 0 success, 1 error or nothing
+// measured, 2 payload integrity failure.
 package main
 
 import (
@@ -128,14 +128,14 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.SetOutput(stderr)
 	fs.StringVar(&o.mode, "mode", "throughput", "throughput, framing or latency")
 	fs.IntVar(&o.conns, "conns", 1, "number of connections, each with its own producer and consumer thread")
-	fs.Var((*sizeValue)(&o.size), "size", "record size in bytes, B/KiB/MiB/GiB suffixes allowed (default 1MiB for throughput, 64B otherwise)")
+	fs.Var((*sizeValue)(&o.size), "size", "bytes the producer offers per Read, the record size while the ring has room; B/KiB/MiB/GiB suffixes allowed (default 1MiB for throughput, 64B otherwise)")
 	fs.Var((*sizeValue)(&o.ring), "ring", "ring size per direction (default 4MiB, or the power of two holding 4 records)")
 	fs.DurationVar(&o.duration, "duration", 5*time.Second, "how long the peer produces")
 	fs.DurationVar(&o.spin, "spin", 0, "poll time before parking (0: library default, negative: park at once)")
 	fs.BoolVar(&o.json, "json", false, "print the report as JSON")
 	fs.StringVar(&o.path, "path", "", "control socket path (default: b.sock in a new temporary directory)")
 	fs.BoolVar(&o.peer, "peer", false, "internal: run as the dialing, producing peer")
-	fs.Uint64Var(&o.corrupt, "corrupt", 0, "internal, for tests: the peer corrupts record `N` of connection 0")
+	fs.Uint64Var(&o.corrupt, "corrupt", 0, "internal, for tests: the peer flips the first byte of chunk `N` of connection 0")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}

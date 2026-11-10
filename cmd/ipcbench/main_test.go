@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -68,52 +69,145 @@ func TestParseSizeRejectsMalformedInput(t *testing.T) {
 	}
 }
 
-func TestVerifyRecordAcceptsStampedTemplate(t *testing.T) {
-	tmpl := newTemplate(4096 + 100)
-	stampTemplate(tmpl, 7)
-	if err := verifyRecord(tmpl, 7); err != nil {
+func TestFillStampsEachLineWithItsStreamOffset(t *testing.T) {
+	p := make([]byte, 4*stride)
+	fill(p, 2*stride)
+	for line := 0; line < len(p); line += stride {
+		if got, want := binary.LittleEndian.Uint64(p[line:]), uint64(2*stride+line); got != want {
+			t.Fatalf("word at stream offset %d holds %d, want %d", want, got, want)
+		}
+	}
+}
+
+// What a chunk holds depends only on its stream offset, so chunks of any
+// length and alignment make the same stream.
+func TestFillIsAFunctionOfStreamOffset(t *testing.T) {
+	whole := make([]byte, 4096)
+	fill(whole, 0)
+	part := make([]byte, 4096-1000)
+	fill(part, 1000)
+	if !bytes.Equal(part, whole[1000:]) {
+		t.Fatal("fill(p, 1000) differs from bytes 1000.. of fill(p, 0)")
+	}
+}
+
+func TestVerifyAcceptsChunksSplitInsideAStampWord(t *testing.T) {
+	p := make([]byte, 2*stride)
+	fill(p, 0)
+	const cut = stride + 3
+	if err := verify(p[:cut], 0); err != nil {
+		t.Fatalf("first chunk: %v", err)
+	}
+	if err := verify(p[cut:], cut); err != nil {
+		t.Fatalf("second chunk: %v", err)
+	}
+}
+
+func TestVerifyRejectsFlippedByteOfASplitStampWord(t *testing.T) {
+	p := make([]byte, 2*stride)
+	fill(p, 0)
+	const cut = stride + 3
+	p[stride+5] ^= 0xff
+	err := verify(p[cut:], cut)
+	if err == nil || !strings.Contains(err.Error(), "offset 133") {
+		t.Fatalf("verify of a split word flipped at offset 133 = %v", err)
+	}
+}
+
+func TestVerifyRejectsFlippedByteOfAWholeStampWord(t *testing.T) {
+	p := make([]byte, 4096)
+	fill(p, 0)
+	p[3*stride+2] ^= 0xff
+	err := verify(p, 0)
+	if err == nil || !strings.Contains(err.Error(), "offset 384") {
+		t.Fatalf("verify of a word flipped at offset 386 = %v", err)
+	}
+}
+
+func TestSourceFillsAtMostSizePerRead(t *testing.T) {
+	const size = 64
+	var stop atomic.Bool
+	src := &source{size: size, payload: true, stop: &stop}
+	p := make([]byte, 3*size)
+	for off := uint64(0); off < 3*size; off += size {
+		n, err := src.Read(p)
+		if n != size || err != nil {
+			t.Fatalf("Read of %d bytes = %d, %v; want %d, nil", len(p), n, err, size)
+		}
+		if err := verify(p[:n], off); err != nil {
+			t.Fatalf("chunk at offset %d: %v", off, err)
+		}
+	}
+	if n, err := src.Read(p[:size/2]); n != size/2 || err != nil {
+		t.Fatalf("Read of %d bytes = %d, %v; want the whole slice, nil", size/2, n, err)
+	}
+}
+
+func TestSourceWithoutPayloadBoundsReadsAndWritesNothing(t *testing.T) {
+	var stop atomic.Bool
+	src := &source{size: 64, stop: &stop}
+	p := bytes.Repeat([]byte{0xaa}, 200)
+	n, err := src.Read(p)
+	if n != 64 || err != nil || !bytes.Equal(p, bytes.Repeat([]byte{0xaa}, 200)) {
+		t.Fatalf("Read = %d, %v and touched the slice; want 64, nil and the slice as it was", n, err)
+	}
+}
+
+func TestSourceReportsEOFOnceStopped(t *testing.T) {
+	var stop atomic.Bool
+	src := &source{size: 64, payload: true, stop: &stop}
+	p := make([]byte, 64)
+	if _, err := src.Read(p); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestVerifyRecordRejectsWrongSequence(t *testing.T) {
-	tmpl := newTemplate(4096)
-	stampTemplate(tmpl, 7)
-	if err := verifyRecord(tmpl, 8); err == nil {
-		t.Fatal("record stamped 7 verified as 8")
-	}
-}
-
-func TestVerifyRecordRejectsCorruptedTemplate(t *testing.T) {
-	tmpl := newTemplate(4096)
-	stampTemplate(tmpl, 7)
-	tmpl[3*128+2] ^= 0xff
-	err := verifyRecord(tmpl, 7)
-	if err == nil || !strings.Contains(err.Error(), "offset 384") {
-		t.Fatalf("verifyRecord on corrupted word at 384 = %v", err)
+	stop.Store(true)
+	if n, err := src.Read(p); n != 0 || err != io.EOF {
+		t.Fatalf("Read after stop = %d, %v; want 0, io.EOF", n, err)
 	}
 }
 
 // The run ends by the producer's Close: the consumer stops at io.EOF with
-// no end marker on the stream.
-func TestConsumeEndsAtProducerClose(t *testing.T) {
-	const size, records = 64, 4
+// no end marker on the stream. Every Write after the first counts as one
+// record, whatever its length.
+func TestConsumeCountsEachChunkAfterTheFirstUntilProducerClose(t *testing.T) {
+	chunks := []int{100, 300, 24, 600}
 	producer, consumer := net.Pipe()
 	consumer.SetDeadline(time.Now().Add(10 * time.Second))
 	go func() {
-		rec := newTemplate(size)
-		for seq := uint64(1); seq <= records; seq++ {
-			stampTemplate(rec, seq)
-			producer.Write(rec)
+		off := uint64(0)
+		for _, n := range chunks {
+			p := make([]byte, n)
+			fill(p, off)
+			producer.Write(p)
+			off += uint64(n)
 		}
 		producer.Close()
 	}()
-	s, err := consume(consumer, 0, size, true)
+	s, err := consume(consumer, 0, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.records != records-1 || s.bytes != (records-1)*size || s.end.IsZero() {
-		t.Fatalf("consumed %+v, want the %d records after the first and an end time", s, records-1)
+	if s.records != 3 || s.bytes != 300+24+600 || s.start.IsZero() || s.end.Before(s.start) {
+		t.Fatalf("consumed %+v, want the 3 chunks after the first and a window from the first to EOF", s)
+	}
+}
+
+func TestConsumeReportsIntegrityErrorWithTheOffset(t *testing.T) {
+	producer, consumer := net.Pipe()
+	consumer.SetDeadline(time.Now().Add(10 * time.Second))
+	go func() {
+		p := make([]byte, 1000)
+		fill(p, 0)
+		producer.Write(p)
+		fill(p, 1000)
+		p[1024-1000] ^= 0xff // the stamp word at stream offset 1024
+		producer.Write(p)
+		producer.Close()
+	}()
+	_, err := consume(consumer, 7, true)
+	var ie *integrityError
+	if !errors.As(err, &ie) || !strings.Contains(err.Error(), "connection 7") || !strings.Contains(err.Error(), "offset 1024") {
+		t.Fatalf("consume of a chunk flipped at offset 1024 = %v, want an integrity error naming connection 7 and offset 1024", err)
 	}
 }
 
@@ -164,13 +258,15 @@ func TestEchoEndsAtPeerClose(t *testing.T) {
 	}
 }
 
-func TestCorruptRecordExitsWithCodeTwo(t *testing.T) {
+// Chunk 5 of 4 KiB starts at stream offset 16384, whose stamp word the
+// flipped first byte damages.
+func TestCorruptChunkExitsWithCodeTwo(t *testing.T) {
 	_, stderr, code := runBench(t, "-mode", "throughput", "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
 	if code != 2 {
 		t.Fatalf("exit code %d, want 2; stderr:\n%s", code, stderr)
 	}
-	if !strings.Contains(stderr, "connection 0 record 5") {
-		t.Fatalf("stderr does not name connection 0 record 5:\n%s", stderr)
+	if !strings.Contains(stderr, "connection 0") || !strings.Contains(stderr, "offset 16384") {
+		t.Fatalf("stderr does not name connection 0 and offset 16384:\n%s", stderr)
 	}
 }
 
