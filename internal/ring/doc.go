@@ -18,6 +18,10 @@
 // are at most MaxRecord = capacity/2 - 8 bytes, the skipped bytes plus the
 // record never exceed capacity.
 //
+// CommitN may publish fewer bytes than were reserved: the record keeps its
+// position after any wrap marker, its header length becomes the committed
+// length, and the next record starts right after the shortened one.
+//
 // # Memory model
 //
 // Every shared header field is accessed only through sync/atomic. The ring

@@ -18,6 +18,8 @@ type Producer struct {
 	head           uint64 // local copy of the shared head
 	cachedTail     uint64
 	pending        uint64 // bytes the outstanding reservation advances head by; 0 if none
+	recOff         uint64 // data offset of the outstanding reservation's record header
+	reserved       int    // payload length of the outstanding reservation
 }
 
 // NewProducer attaches a producer to a formatted region.
@@ -94,6 +96,8 @@ func (p *Producer) TryReserve(n int) ([]byte, error) {
 	}
 	binary.LittleEndian.PutUint64(p.data[off:], uint64(n))
 	p.pending = need
+	p.recOff = off
+	p.reserved = n
 	start := off + recHeader
 	end := start + uint64(n)
 	return p.data[start:end:end], nil
@@ -105,6 +109,26 @@ func (p *Producer) Commit() (wakeConsumer bool) {
 	if p.pending == 0 {
 		panic("ring: Commit without a reservation")
 	}
+	return p.publish()
+}
+
+// CommitN publishes the first n bytes of the reserved record, 0 <= n <= the
+// reserved length, and reports whether the consumer must be woken.
+func (p *Producer) CommitN(n int) (wakeConsumer bool) {
+	if p.pending == 0 {
+		panic("ring: CommitN without a reservation")
+	}
+	if n < 0 || n > p.reserved {
+		panic("ring: CommitN length outside the reservation")
+	}
+	if n != p.reserved {
+		binary.LittleEndian.PutUint64(p.data[p.recOff:], uint64(n))
+		p.pending -= uint64((p.reserved+7)&^7 - (n+7)&^7)
+	}
+	return p.publish()
+}
+
+func (p *Producer) publish() (wakeConsumer bool) {
 	p.head += p.pending
 	p.pending = 0
 	atomic.StoreUint64(p.sharedHead, p.head)
