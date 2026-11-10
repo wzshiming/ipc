@@ -21,17 +21,21 @@ func (addr) Network() string  { return "ipc" }
 func (a addr) String() string { return string(a) }
 
 // Conn is one shared-memory connection: a pair of rings, one per direction,
-// in one segment. It is a net.Conn whose Read and Write carry a byte stream
+// in one segment. It is a net.Conn whose Read and Write copy a byte stream
 // over records, and it offers the records themselves through TryReserve,
 // Reserve, Commit, Abort, TryNext, Next and Release. Their slices alias
 // shared memory: a Reserve slice is valid until Commit or Abort, a Next
-// slice until Release.
+// slice until Release. io.Copy into or out of a Conn uses ReadFrom and
+// WriteTo, which move the bytes between the ring and the other endpoint
+// without a copy.
 //
-// Read and Write may be called from any goroutine. The record methods of one
-// direction serve one goroutine at a time: one may send while another
-// receives. On one direction use either the record methods or Read/Write;
-// interleaving them while Read holds a partly consumed record is not
-// supported. Sends honour the write deadline and receives the read deadline.
+// The stream methods may be called from any goroutine. The record methods of
+// one direction serve one goroutine at a time: one may send while another
+// receives. On one direction use either the record methods or the stream
+// methods, Write and ReadFrom on the send side and Read and WriteTo on the
+// receive side; interleaving them while Read or WriteTo holds a partly
+// consumed record is not supported. Sends honour the write deadline and
+// receives the read deadline.
 type Conn struct {
 	link      *control.Link
 	seg       *shm.Segment
@@ -53,14 +57,18 @@ type Conn struct {
 	live       atomic.Int32 // halves that may still touch the segment
 	unmapped   atomic.Bool  // test hook: the segment has been released
 
-	wmu sync.Mutex // serializes Write
+	wmu sync.Mutex // serializes Write and ReadFrom
 	tx  half
 	rx  half
-	rmu sync.Mutex // serializes Read
-	rec []byte     // unread rest of the record Read holds
+	rmu sync.Mutex // serializes Read and WriteTo
+	rec []byte     // unread rest of the record Read or WriteTo holds
 }
 
-var _ net.Conn = (*Conn)(nil)
+var (
+	_ net.Conn      = (*Conn)(nil)
+	_ io.ReaderFrom = (*Conn)(nil)
+	_ io.WriterTo   = (*Conn)(nil)
+)
 
 // newConn wires the two rings of seg and starts the control reader. On error
 // the caller still owns link and seg.
@@ -240,18 +248,18 @@ func (c *Conn) SetDeadline(t time.Time) error {
 	return nil
 }
 
-// SetReadDeadline sets the deadline for Read and Next, including calls
-// already blocked. Past the deadline they fail with os.ErrDeadlineExceeded,
-// which is a net.Error whose Timeout method reports true; a zero t means no
-// deadline. TryNext ignores it.
+// SetReadDeadline sets the deadline for Read, WriteTo and Next, including
+// calls already blocked. Past the deadline they fail with
+// os.ErrDeadlineExceeded, which is a net.Error whose Timeout method reports
+// true; a zero t means no deadline. TryNext ignores it.
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.rx.dl.set(t)
 	return nil
 }
 
-// SetWriteDeadline sets the deadline for Write and Reserve, including calls
-// already blocked. Past the deadline they fail with os.ErrDeadlineExceeded;
-// a zero t means no deadline. TryReserve ignores it.
+// SetWriteDeadline sets the deadline for Write, ReadFrom and Reserve,
+// including calls already blocked. Past the deadline they fail with
+// os.ErrDeadlineExceeded; a zero t means no deadline. TryReserve ignores it.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.tx.dl.set(t)
 	return nil
@@ -260,8 +268,8 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 // Close tells the peer goodbye, closes the link and wakes every blocked call
 // with net.ErrClosed; records the peer committed are no longer delivered.
 // Slices still held from Reserve or Next stay readable until they are
-// committed, aborted or released, while a record Read holds partly consumed
-// is released; the segment is unmapped once no slice is left.
+// committed, aborted or released, while a record Read or WriteTo holds
+// partly consumed is released; the segment is unmapped once no slice is left.
 func (c *Conn) Close() error {
 	c.closed.Store(true)
 	c.shutdown(net.ErrClosed)

@@ -72,6 +72,29 @@ func (p *Producer) fits(need uint64) (bool, error) {
 	return p.capacity-used >= need, nil
 }
 
+// Room returns the largest payload TryReserve accepts now, 0 if none. It
+// reads the shared tail only when the cached one allows less than MaxRecord.
+func (p *Producer) Room() int {
+	n := p.room()
+	if n < p.maxRecord {
+		if tail := atomic.LoadUint64(p.sharedTail); p.head-tail <= p.capacity {
+			p.cachedTail = tail
+			n = p.room()
+		}
+	}
+	return n
+}
+
+// room is Room as the cached tail shows it.
+func (p *Producer) room() int {
+	free, rem := p.capacity-(p.head-p.cachedTail), p.capacity-p.head&p.mask
+	fit := min(free, rem)
+	if free > 2*rem {
+		fit = free - rem // a wrap marker, then the record at the start
+	}
+	return max(min(int(fit)-recHeader, p.maxRecord), 0)
+}
+
 // TryReserve returns an n-byte payload slice inside the ring without blocking.
 // Only one reservation may be outstanding; finish it with Commit or Abort.
 func (p *Producer) TryReserve(n int) ([]byte, error) {

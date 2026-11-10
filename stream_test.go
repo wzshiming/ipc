@@ -4,16 +4,23 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
+	"unsafe"
 
 	"golang.org/x/net/nettest"
+
+	"github.com/wzshiming/ipc/internal/ring"
 )
 
 // envCopyMiB sets the cross-process io.Copy volume in MiB (default 1024).
@@ -270,6 +277,347 @@ func TestIOCopyThroughput(t *testing.T) {
 	t.Logf("in-process io.Copy of %d MiB: %.2f GB/s (race=%v)", volume>>20, rate/1e9, raceEnabled())
 	if !raceEnabled() && rate < 2e9 {
 		t.Fatalf("throughput %.2f GB/s below 2 GB/s", rate/1e9)
+	}
+}
+
+// within reports whether p lies inside the segment c maps.
+func within(c *Conn, p []byte) bool {
+	seg := c.seg.Bytes()
+	lo := uintptr(unsafe.Pointer(unsafe.SliceData(seg)))
+	a := uintptr(unsafe.Pointer(unsafe.SliceData(p)))
+	return len(seg) > 0 && a >= lo && a+uintptr(len(p)) <= lo+uintptr(len(seg))
+}
+
+// chunkReader serves r in reads of 1 to max bytes.
+type chunkReader struct {
+	r   io.Reader
+	max int
+	rng *rand.Rand
+}
+
+func (c *chunkReader) Read(p []byte) (int, error) {
+	return c.r.Read(p[:min(len(p), 1+c.rng.IntN(c.max))])
+}
+
+// zeroFirst returns (0, nil) once, then reads from r.
+type zeroFirst struct {
+	r    io.Reader
+	done bool
+}
+
+func (z *zeroFirst) Read(p []byte) (int, error) {
+	if !z.done {
+		z.done = true
+		return 0, nil
+	}
+	return z.r.Read(p)
+}
+
+// capReader returns at most capReader bytes per Read, endlessly.
+type capReader int
+
+func (n capReader) Read(p []byte) (int, error) { return min(len(p), int(n)), nil }
+
+var errSource = errors.New("source failed")
+
+// errReader returns its data, then err along with the last of it.
+type errReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	if r.data = r.data[n:]; len(r.data) == 0 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+// probeReader returns one scripted length per Read, recording what each
+// Read returned and how many slices lay outside c's segment.
+type probeReader struct {
+	c        *Conn
+	lens     []int
+	returned []int
+	outside  int
+}
+
+func (r *probeReader) Read(p []byte) (int, error) {
+	if len(r.lens) == 0 {
+		return 0, io.EOF
+	}
+	if !within(r.c, p) {
+		r.outside++
+	}
+	n := min(len(p), r.lens[0])
+	r.lens = r.lens[1:]
+	r.returned = append(r.returned, n)
+	return n, nil
+}
+
+// probeWriter takes every slice whole, recording its length and whether it
+// lay outside c's segment.
+type probeWriter struct {
+	c       *Conn
+	lens    []int
+	outside int
+}
+
+func (w *probeWriter) Write(p []byte) (int, error) {
+	if !within(w.c, p) {
+		w.outside++
+	}
+	w.lens = append(w.lens, len(p))
+	return len(p), nil
+}
+
+// limitWriter takes at most n bytes per Write and returns err with them.
+type limitWriter struct {
+	n   int
+	err error
+	got []byte
+}
+
+func (w *limitWriter) Write(p []byte) (int, error) {
+	k := min(len(p), w.n)
+	w.got = append(w.got, p[:k]...)
+	return k, w.err
+}
+
+func TestIOCopyRoundTripsEverySizeWithPartialReads(t *testing.T) {
+	const ringSize = 64 << 10
+	maxRecord := ring.MaxRecord(ringSize)
+	sources := map[string]func(io.Reader) io.Reader{
+		"whole":      func(r io.Reader) io.Reader { return struct{ io.Reader }{r} },
+		"one byte":   iotest.OneByteReader,
+		"data err":   iotest.DataErrReader,
+		"1-4097":     func(r io.Reader) io.Reader { return &chunkReader{r: r, max: 4097, rng: rand.New(rand.NewPCG(1, 2))} },
+		"zero first": func(r io.Reader) io.Reader { return &zeroFirst{r: r} },
+	}
+	for name, wrap := range sources {
+		for _, size := range []int{0, 1, maxRecord - 1, maxRecord, maxRecord + 1, 3*ringSize + 17} {
+			t.Run(fmt.Sprintf("%s/%d", name, size), func(t *testing.T) {
+				lc, dc := pair(t, ListenConfig{RingSize: ringSize}, Dialer{RingSize: ringSize})
+				want := make([]byte, size)
+				rand.NewChaCha8([32]byte{byte(size)}).Read(want)
+				sent := make(chan error, 1)
+				go func() {
+					n, err := io.Copy(lc, wrap(bytes.NewReader(want)))
+					if err == nil && n != int64(size) {
+						err = fmt.Errorf("io.Copy into the Conn moved %d bytes; want %d", n, size)
+					}
+					lc.Close()
+					sent <- err
+				}()
+				var got bytes.Buffer
+				n, err := io.Copy(&got, dc)
+				if err != nil || n != int64(size) || !bytes.Equal(got.Bytes(), want) {
+					t.Fatalf("io.Copy out of the peer = %d bytes, %v; want the %d bytes sent, intact", n, err, size)
+				}
+				if err := <-sent; err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestReadFromFillsRecordsInPlaceSizedByEachRead(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
+	// All of these fit the ring unread, so every Read gets at least its
+	// length, and over 4 KiB stays free for the Read that reports io.EOF.
+	lens := []int{1, 7, 100, 4096, 4097, 16000, lc.MaxRecord()}
+	src := &probeReader{c: lc, lens: slices.Clone(lens)}
+	if n, err := lc.ReadFrom(src); err != nil || n != 57061 || !slices.Equal(src.returned, lens) {
+		t.Fatalf("ReadFrom = %d, %v with reads %v; want 57061, nil with reads %v", n, err, src.returned, lens)
+	}
+	if src.outside > 0 {
+		t.Fatalf("%d of %d slices given to Read lie outside the segment", src.outside, len(lens))
+	}
+	for i, want := range lens {
+		rec, err := dc.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rec) != want {
+			t.Fatalf("record %d is %d bytes; want the %d bytes that Read returned", i, len(rec), want)
+		}
+		dc.Release()
+	}
+}
+
+func TestWriteToHandsEachRecordSliceFromTheRing(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	lens := []int{1, 100, 4096}
+	for _, n := range lens {
+		if _, err := lc.Write(make([]byte, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lc.Close()
+	dst := &probeWriter{c: dc}
+	if n, err := dc.WriteTo(dst); err != nil || n != 4197 || !slices.Equal(dst.lens, lens) {
+		t.Fatalf("WriteTo = %d, %v with writes %v; want 4197, nil with one write per record %v", n, err, dst.lens, lens)
+	}
+	if dst.outside > 0 {
+		t.Fatalf("%d of %d slices handed to Write lie outside the segment", dst.outside, len(lens))
+	}
+}
+
+func TestWriteToStartsWithTheRestReadHolds(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	for _, s := range []string{"abcdef", "", "gh"} {
+		p, err := lc.Reserve(len(s))
+		if err != nil {
+			t.Fatal(err)
+		}
+		copy(p, s)
+		if err := lc.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lc.Close()
+	buf := make([]byte, 3)
+	if n, err := dc.Read(buf); err != nil || string(buf[:n]) != "abc" {
+		t.Fatalf("Read = %q, %v; want abc", buf[:n], err)
+	}
+	var got bytes.Buffer
+	if n, err := dc.WriteTo(&got); err != nil || got.String() != "defgh" {
+		t.Fatalf("WriteTo = %d, %v (%q); want the held def, then gh, then nil at the peer's close", n, err, got.String())
+	}
+}
+
+func TestReadFromFillsMostOfTheRingWhenThePeerStalls(t *testing.T) {
+	lc, _ := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
+	lc.SetWriteDeadline(time.Now().Add(300 * time.Millisecond))
+	n, err := lc.ReadFrom(capReader(1 << 10))
+	if floor := int64(lc.RingSize() * 3 / 4); !isTimeout(err) || n <= floor {
+		t.Fatalf("ReadFrom with the peer stalled = %d, %v; want more than %d bytes, then os.ErrDeadlineExceeded", n, err, floor)
+	}
+}
+
+func TestReadFromDeliversBytesReadBeforeTheSourceError(t *testing.T) {
+	want := make([]byte, 1000)
+	rand.NewChaCha8([32]byte{5}).Read(want)
+	for name, src := range map[string]io.Reader{
+		"error after data": io.MultiReader(bytes.NewReader(want), iotest.ErrReader(errSource)),
+		"error with data":  &errReader{data: want, err: errSource},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lc, dc := pair(t, ListenConfig{}, Dialer{})
+			if n, err := lc.ReadFrom(src); n != 1000 || err != errSource {
+				t.Fatalf("ReadFrom = %d, %v; want 1000, the source's error", n, err)
+			}
+			got := make([]byte, 1000)
+			if _, err := io.ReadFull(dc, got); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("peer ReadFull = %v; want the 1000 bytes read before the error", err)
+			}
+		})
+	}
+}
+
+func TestLocalCloseWakesBlockedReadFromAndWriteToWithNetErrClosed(t *testing.T) {
+	_, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
+	ch := make(chan error, 2)
+	go func() {
+		_, err := dc.ReadFrom(fillReader{}) // fills the ring, then waits for room
+		ch <- err
+	}()
+	go func() {
+		_, err := dc.WriteTo(io.Discard)
+		ch <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	dc.Close()
+	for range 2 {
+		if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+			t.Fatalf("blocked ReadFrom or WriteTo = %v; want net.ErrClosed", err)
+		}
+	}
+}
+
+func TestPeerCrashFailsReadFromAndEndsWriteToWithErrPeerClosed(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
+	want := []byte("committed before the crash")
+	if _, err := lc.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan error, 1)
+	go func() {
+		_, err := dc.ReadFrom(fillReader{})
+		ch <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	lc.link.Close() // vanish without Bye
+	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("blocked ReadFrom = %v; want ErrPeerClosed", err)
+	}
+	var got bytes.Buffer
+	if n, err := dc.WriteTo(&got); !errors.Is(err, ErrPeerClosed) || !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("WriteTo after the crash = %d, %v (%q); want the bytes the peer committed, then ErrPeerClosed", n, err, got.String())
+	}
+}
+
+func TestWriteToKeepsTheUnwrittenRestForRead(t *testing.T) {
+	errSink := errors.New("sink failed")
+	for name, tc := range map[string]struct{ werr, want error }{
+		"writer error": {errSink, errSink},
+		"short write":  {nil, io.ErrShortWrite},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lc, dc := pair(t, ListenConfig{}, Dialer{})
+			if _, err := lc.Write([]byte("abcdef")); err != nil {
+				t.Fatal(err)
+			}
+			w := &limitWriter{n: 3, err: tc.werr}
+			if n, err := dc.WriteTo(w); n != 3 || err != tc.want || string(w.got) != "abc" {
+				t.Fatalf("WriteTo = %d, %v (wrote %q); want 3, %v (wrote abc)", n, err, w.got, tc.want)
+			}
+			buf := make([]byte, 8)
+			if n, err := dc.Read(buf); err != nil || string(buf[:n]) != "def" {
+				t.Fatalf("Read after the failed WriteTo = %q, %v; want the unwritten def", buf[:n], err)
+			}
+		})
+	}
+}
+
+func TestWriteSucceedsAfterReadFromReturns(t *testing.T) {
+	for name, run := range map[string]func(*Conn) (int64, error){
+		"source EOF":   func(c *Conn) (int64, error) { return c.ReadFrom(strings.NewReader("")) },
+		"source error": func(c *Conn) (int64, error) { return c.ReadFrom(iotest.ErrReader(errSource)) },
+		"write deadline": func(c *Conn) (int64, error) {
+			c.SetWriteDeadline(time.Now().Add(-time.Second))
+			defer c.SetWriteDeadline(time.Time{})
+			return c.ReadFrom(strings.NewReader("x"))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lc, dc := pair(t, ListenConfig{}, Dialer{})
+			if n, _ := run(lc); n != 0 {
+				t.Fatalf("ReadFrom sent %d bytes; want 0", n)
+			}
+			if _, err := lc.Write([]byte("after")); err != nil {
+				t.Fatalf("Write after ReadFrom returned: %v", err)
+			}
+			buf := make([]byte, 8)
+			if n, err := dc.Read(buf); err != nil || string(buf[:n]) != "after" {
+				t.Fatalf("Read = %q, %v; want after", buf[:n], err)
+			}
+		})
+	}
+}
+
+func TestIOCopyUsesReadFromAndWriteTo(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	src := &probeReader{c: lc, lens: []int{100, 100, 100}}
+	if n, err := io.Copy(lc, src); err != nil || n != 300 || src.outside > 0 {
+		t.Fatalf("io.Copy(conn, src) = %d, %v with %d reads into private memory; want 300 bytes read straight into the segment", n, err, src.outside)
+	}
+	lc.Close()
+	dst := &probeWriter{c: dc}
+	if n, err := io.Copy(dst, dc); err != nil || n != 300 || dst.outside > 0 {
+		t.Fatalf("io.Copy(dst, conn) = %d, %v with %d writes from private memory; want 300 bytes written straight from the segment", n, err, dst.outside)
 	}
 }
 

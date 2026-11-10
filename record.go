@@ -154,8 +154,17 @@ func (c *Conn) Commit() error {
 	if !c.tx.held {
 		return errOrder
 	}
+	return c.committed(c.prod.Commit())
+}
+
+// commitN publishes the first n bytes of the reserved record, like Commit.
+func (c *Conn) commitN(n int) error {
+	return c.committed(c.prod.CommitN(n))
+}
+
+// committed ends the reservation the ring published and rings a parked peer.
+func (c *Conn) committed(wake bool) error {
 	c.tx.held = false
-	wake := c.prod.Commit()
 	if c.tx.release(c) {
 		return c.sendErr()
 	}
