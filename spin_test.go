@@ -7,18 +7,18 @@ import (
 	"time"
 )
 
-// pinnedPingPong runs rounds 64 B round trips between two goroutines locked
-// to OS threads and returns each round trip's duration.
-func pinnedPingPong(tb testing.TB, lc, dc *Conn, rounds int) []time.Duration {
+// echo answers rounds messages of up to 64 B on c from a goroutine locked to
+// an OS thread; the channel reports its first error, or nil once done.
+func echo(c *Conn, rounds int) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		buf := make([]byte, 64)
 		for range rounds {
-			n, err := dc.Read(buf)
+			n, err := c.Read(buf)
 			if err == nil {
-				_, err = dc.Write(buf[:n])
+				_, err = c.Write(buf[:n])
 			}
 			if err != nil {
 				done <- err
@@ -27,6 +27,13 @@ func pinnedPingPong(tb testing.TB, lc, dc *Conn, rounds int) []time.Duration {
 		}
 		done <- nil
 	}()
+	return done
+}
+
+// pinnedPingPong runs rounds 64 B round trips between two goroutines locked
+// to OS threads and returns each round trip's duration.
+func pinnedPingPong(tb testing.TB, lc, dc *Conn, rounds int) []time.Duration {
+	done := echo(dc, rounds)
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	msg, buf := make([]byte, 64), make([]byte, 64)
@@ -58,10 +65,4 @@ func TestPinnedPingPongDoesNotPayThreadHandoffPerRoundTrip(t *testing.T) {
 	if p50 := samples[len(samples)/2]; p50 > 8*time.Microsecond {
 		t.Fatalf("pinned 64 B round trip p50 = %v; want ≤ 8µs", p50)
 	}
-}
-
-func BenchmarkPinnedPingPong64B(b *testing.B) {
-	lc, dc := pair(b, ListenConfig{}, Dialer{})
-	b.ResetTimer()
-	pinnedPingPong(b, lc, dc, b.N)
 }

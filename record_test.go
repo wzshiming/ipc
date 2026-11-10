@@ -204,29 +204,35 @@ func TestBlockingCallsWithDataOrRoomAllocateNothing(t *testing.T) {
 	}
 }
 
-func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
-	msg := make([]byte, 64<<10)
+// drain reads total bytes from rx into buf, however many records each Read
+// returns, and fails tb on any error.
+func drain(tb testing.TB, rx *Conn, buf []byte, total int64) {
+	for got := int64(0); got < total; {
+		n, err := rx.Read(buf)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		got += int64(n)
+	}
+}
+
+// writeRead sends records copies of msg from tx on another goroutine while
+// reading them back on rx into buf, and fails tb on any error.
+func writeRead(tb testing.TB, tx, rx *Conn, msg, buf []byte, records int) {
 	done := make(chan error, 1)
-	start := time.Now()
 	go func() {
 		for range records {
-			if _, err := lc.Write(msg); err != nil {
+			if _, err := tx.Write(msg); err != nil {
 				done <- err
 				return
 			}
 		}
 		done <- nil
 	}()
-	buf := make([]byte, 64<<10)
-	for range records {
-		if _, err := dc.Read(buf); err != nil {
-			tb.Fatal(err)
-		}
-	}
+	drain(tb, rx, buf, int64(len(msg))*int64(records))
 	if err := <-done; err != nil {
 		tb.Fatal(err)
 	}
-	return time.Since(start)
 }
 
 func TestWriteRead64KiBThroughput(t *testing.T) {
@@ -235,17 +241,13 @@ func TestWriteRead64KiBThroughput(t *testing.T) {
 	if raceEnabled() {
 		records = 1024
 	}
-	d := transfer64KiB(t, lc, dc, records)
+	msg, buf := make([]byte, 64<<10), make([]byte, 64<<10)
+	start := time.Now()
+	writeRead(t, lc, dc, msg, buf, records)
+	d := time.Since(start)
 	rate := float64(records) * (64 << 10) / d.Seconds()
 	t.Logf("one connection, 64 KiB records: %.2f GB/s (race=%v)", rate/1e9, raceEnabled())
 	if !raceEnabled() && rate < 1e9 {
 		t.Fatalf("throughput %.2f GB/s below 1 GB/s", rate/1e9)
 	}
-}
-
-func BenchmarkWriteRead64KiB(b *testing.B) {
-	lc, dc := pair(b, ListenConfig{}, Dialer{})
-	b.SetBytes(64 << 10)
-	b.ResetTimer()
-	transfer64KiB(b, lc, dc, b.N)
 }
