@@ -19,16 +19,23 @@ type Listener struct {
 }
 
 // Listen listens on the AF_UNIX socket at path. A socket file left behind by
-// a dead listener is removed; a live one fails with EADDRINUSE.
-func Listen(path string) (*Listener, error) {
+// a dead listener is removed; a live one fails with EADDRINUSE. ctx bounds
+// the setup, including the probe of an existing socket file.
+func Listen(ctx context.Context, path string) (*Listener, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	addr := &net.UnixAddr{Name: path, Net: "unix"}
 	l, err := net.ListenUnix("unix", addr)
-	if err != nil && isStale(path) {
+	if err != nil && isStale(ctx, path) {
 		if rerr := os.Remove(path); rerr == nil || os.IsNotExist(rerr) {
 			l, err = net.ListenUnix("unix", addr)
 		}
 	}
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		return nil, unsupportedErr(err)
 	}
 	if runtime.GOOS != "windows" {
@@ -41,12 +48,13 @@ func Listen(path string) (*Listener, error) {
 }
 
 // isStale reports whether path is a socket file nobody is listening on.
-func isStale(path string) bool {
+func isStale(ctx context.Context, path string) bool {
 	fi, err := os.Lstat(path)
 	if err != nil || fi.Mode().Type() != os.ModeSocket {
 		return false
 	}
-	c, err := net.DialTimeout("unix", path, time.Second)
+	d := net.Dialer{Timeout: time.Second}
+	c, err := d.DialContext(ctx, "unix", path)
 	if err == nil {
 		c.Close()
 		return false
@@ -67,6 +75,9 @@ func (l *Listener) Accept() (*Link, error) {
 func (l *Listener) Close() error { return l.l.Close() }
 
 // Addr returns the listener's address.
+
+// SetDeadline sets the deadline for Accept; a zero value disables it.
+func (l *Listener) SetDeadline(t time.Time) error { return closedErr(l.l.SetDeadline(t)) }
 func (l *Listener) Addr() net.Addr { return l.l.Addr() }
 
 // Dial connects to the AF_UNIX socket at path.

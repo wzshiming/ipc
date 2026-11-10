@@ -543,7 +543,7 @@ func TestDialReturnsErrRejected(t *testing.T) {
 
 func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 	path := sockPath(t)
-	cl, err := control.Listen(path)
+	cl, err := control.Listen(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}

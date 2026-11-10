@@ -37,7 +37,7 @@ func Listen(path string, cfg Config) (*Listener, error) {
 	if err := cfg.checkListener(); err != nil {
 		return nil, err
 	}
-	cl, err := control.Listen(path)
+	cl, err := control.Listen(context.Background(), path)
 	if err != nil {
 		return nil, err
 	}

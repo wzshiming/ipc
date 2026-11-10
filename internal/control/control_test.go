@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -25,7 +26,7 @@ func sockPath(t *testing.T) string {
 
 func listen(t *testing.T, path string) *Listener {
 	t.Helper()
-	l, err := Listen(path)
+	l, err := Listen(t.Context(), path)
 	if errors.Is(err, ErrUnsupported) {
 		t.Skipf("AF_UNIX unsupported: %v", err)
 	}
@@ -287,6 +288,27 @@ func TestListenerCloseUnblocksAcceptAndRemovesFile(t *testing.T) {
 	}
 }
 
+func TestListenerDeadlineTimesOutAccept(t *testing.T) {
+	l := listen(t, sockPath(t))
+	if err := l.SetDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Accept(); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Accept past deadline: got %v, want os.ErrDeadlineExceeded", err)
+	}
+}
+
+func TestListenWithDoneCtxFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if l, err := Listen(ctx, sockPath(t)); !errors.Is(err, context.Canceled) {
+		if l != nil {
+			l.Close()
+		}
+		t.Fatalf("Listen with cancelled ctx: got %v, want context.Canceled", err)
+	}
+}
+
 // staleSocket leaves a socket file at path with nobody listening on it.
 func staleSocket(t *testing.T, path string) {
 	t.Helper()
@@ -334,7 +356,7 @@ func TestListenReplacesStaleSocketFile(t *testing.T) {
 func TestListenOnLivePathIsAddrInUse(t *testing.T) {
 	path := sockPath(t)
 	listen(t, path)
-	l2, err := Listen(path)
+	l2, err := Listen(t.Context(), path)
 	if err == nil {
 		l2.Close()
 		t.Fatal("second Listen on a live path succeeded")
@@ -354,7 +376,7 @@ func TestListenDoesNotRemoveRegularFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if l, err := Listen(path); err == nil {
+	if l, err := Listen(t.Context(), path); err == nil {
 		l.Close()
 		t.Fatal("Listen over a regular file succeeded")
 	}
