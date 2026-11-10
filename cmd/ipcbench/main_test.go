@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -183,7 +184,7 @@ func TestConsumeCountsEachChunkAfterTheFirstUntilProducerClose(t *testing.T) {
 		}
 		producer.Close()
 	}()
-	s, err := consume(consumer, 0, true)
+	s, err := consume(consumer, 0, options{mode: "throughput"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +205,7 @@ func TestConsumeReportsIntegrityErrorWithTheOffset(t *testing.T) {
 		producer.Write(p)
 		producer.Close()
 	}()
-	_, err := consume(consumer, 7, true)
+	_, err := consume(consumer, 7, options{mode: "throughput"})
 	var ie *integrityError
 	if !errors.As(err, &ie) || !strings.Contains(err.Error(), "connection 7") || !strings.Contains(err.Error(), "offset 1024") {
 		t.Fatalf("consume of a chunk flipped at offset 1024 = %v, want an integrity error naming connection 7 and offset 1024", err)
@@ -219,7 +220,7 @@ func TestProduceEndsWithClose(t *testing.T) {
 	consumer.SetDeadline(time.Now().Add(10 * time.Second))
 	var stop atomic.Bool
 	errc := make(chan error, 1)
-	go func() { errc <- produce(producer, 0, size, true, 0, &stop) }()
+	go func() { errc <- produce(producer, 0, options{mode: "throughput", size: size}, &stop) }()
 	rec := make([]byte, size)
 	for range 3 {
 		if _, err := io.ReadFull(consumer, rec); err != nil {
@@ -376,5 +377,210 @@ func TestDefaultRingFitsLargeRecords(t *testing.T) {
 	}
 	if o.size > o.ring/2-8 {
 		t.Fatalf("default ring %d cannot carry %d-byte records", o.ring, o.size)
+	}
+}
+
+func TestUnknownTransportAndIOAreRejected(t *testing.T) {
+	_, err := parseFlags([]string{"-net", "udp"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "want ipc, unix or tcp") {
+		t.Errorf("-net udp = %v, want an error listing the transports", err)
+	}
+	_, err = parseFlags([]string{"-io", "splice"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "want copy or rw") {
+		t.Errorf("-io splice = %v, want an error listing the I/O paths", err)
+	}
+}
+
+// Kernel sockets have no ring: -ring is not applied, no size check against
+// it runs, and the report shows ring 0.
+func TestKernelTransportsHaveNoRing(t *testing.T) {
+	for _, network := range []string{"unix", "tcp"} {
+		o, err := parseFlags([]string{"-net", network, "-size", "1MiB", "-ring", "1MiB"}, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("-net %s -size 1MiB -ring 1MiB was rejected: %v", network, err)
+		}
+		if o.ring != 0 {
+			t.Fatalf("-net %s normalized to ring %d, want 0", network, o.ring)
+		}
+	}
+}
+
+func TestThroughputRunsOnKernelTransports(t *testing.T) {
+	for _, network := range []string{"unix", "tcp"} {
+		stdout, stderr, code := runBench(t, "-mode", "throughput", "-net", network, "-size", "64KiB", "-duration", "300ms", "-json")
+		if code != 0 {
+			t.Fatalf("-net %s: exit code %d; stderr:\n%s", network, code, stderr)
+		}
+		var r report
+		if err := json.Unmarshal([]byte(stdout), &r); err != nil {
+			t.Fatalf("-net %s: output is not JSON: %v\n%s", network, err, stdout)
+		}
+		if r.Net != network || r.Ring != 0 {
+			t.Fatalf("-net %s reported net=%q ring=%d, want the transport and no ring", network, r.Net, r.Ring)
+		}
+		if r.Aggregate == nil || r.Aggregate.GBps <= 0 {
+			t.Fatalf("-net %s: aggregate rate not positive: %+v", network, r.Aggregate)
+		}
+	}
+}
+
+func TestLatencyRunsOnKernelTransports(t *testing.T) {
+	for _, network := range []string{"unix", "tcp"} {
+		stdout, stderr, code := runBench(t, "-mode", "latency", "-net", network, "-duration", "300ms", "-json")
+		if code != 0 {
+			t.Fatalf("-net %s: exit code %d; stderr:\n%s", network, code, stderr)
+		}
+		var r report
+		if err := json.Unmarshal([]byte(stdout), &r); err != nil {
+			t.Fatalf("-net %s: output is not JSON: %v\n%s", network, err, stdout)
+		}
+		if l := r.Latency; l == nil || l.Samples == 0 || l.P50 <= 0 {
+			t.Fatalf("-net %s: no round trips measured: %+v", network, l)
+		}
+	}
+}
+
+// Once the parent quits on an integrity failure, the peer's next Write
+// fails with the socket's reset; that ends the run and is not a peer error.
+func TestPeerExitsQuietlyWhenParentClosesKernelTransportFirst(t *testing.T) {
+	for _, network := range []string{"unix", "tcp"} {
+		_, stderr, code := runBench(t, "-mode", "throughput", "-net", network, "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
+		if code != 2 || !strings.Contains(stderr, "offset 16384") {
+			t.Fatalf("-net %s: exit code %d, want 2 naming offset 16384; stderr:\n%s", network, code, stderr)
+		}
+		if strings.Contains(stderr, "ipcbench peer:") {
+			t.Fatalf("-net %s: the peer reported an error after the parent closed:\n%s", network, stderr)
+		}
+	}
+}
+
+// With -io rw every record is one message: the consumer reads exactly -size
+// bytes per record it counts.
+func TestReadWriteIOReportsPositiveRatesPerMessage(t *testing.T) {
+	stdout, stderr, code := runBench(t, "-mode", "throughput", "-io", "rw", "-size", "64KiB", "-duration", "300ms", "-json")
+	if code != 0 {
+		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
+	}
+	var r report
+	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
+	}
+	if r.IO != "rw" || r.Aggregate == nil || r.Aggregate.GBps <= 0 || r.Aggregate.RecordsPerSec <= 0 {
+		t.Fatalf("report io=%q aggregate %+v, want io=rw and positive rates", r.IO, r.Aggregate)
+	}
+	if r.Aggregate.Bytes != r.Aggregate.Records*(64<<10) {
+		t.Fatalf("%d bytes in %d records, want %d-byte messages", r.Aggregate.Bytes, r.Aggregate.Records, 64<<10)
+	}
+}
+
+func TestReportNamesTransportAndIO(t *testing.T) {
+	r := newReport(options{mode: "throughput", net: "tcp", io: "rw", conns: 1, size: 64}, 4)
+	var text, js bytes.Buffer
+	if err := r.writeText(&text); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "mode=throughput net=tcp io=rw ") {
+		t.Fatalf("text header lacks net and io:\n%s", text.String())
+	}
+	if err := r.writeJSON(&js); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"net": "tcp"`, `"io": "rw"`} {
+		if !strings.Contains(js.String(), want) {
+			t.Fatalf("JSON lacks %s:\n%s", want, js.String())
+		}
+	}
+}
+
+// A -io rw stream ends with Close after whole messages; a short last one
+// is a truncated stream, an integrity failure naming the message.
+func TestConsumeWithReadWriteIORejectsAShortLastMessage(t *testing.T) {
+	const size = 256
+	producer, consumer := net.Pipe()
+	consumer.SetDeadline(time.Now().Add(10 * time.Second))
+	go func() {
+		p := make([]byte, size+size/2)
+		fill(p, 0)
+		producer.Write(p)
+		producer.Close()
+	}()
+	_, err := consume(consumer, 3, options{mode: "throughput", io: "rw", size: size})
+	var ie *integrityError
+	if !errors.As(err, &ie) || !strings.Contains(err.Error(), "connection 3") || !strings.Contains(err.Error(), "message 2") {
+		t.Fatalf("consume of 1.5 messages = %v, want an integrity error naming connection 3 and message 2", err)
+	}
+}
+
+// With -io rw the peer flips the first byte of message 5, stream offset 16384.
+func TestCorruptMessageWithReadWriteIOExitsWithCodeTwo(t *testing.T) {
+	_, stderr, code := runBench(t, "-mode", "throughput", "-io", "rw", "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
+	if code != 2 {
+		t.Fatalf("exit code %d, want 2; stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "connection 0") || !strings.Contains(stderr, "offset 16384") {
+		t.Fatalf("stderr does not name connection 0 and offset 16384:\n%s", stderr)
+	}
+}
+
+func TestCompareRejectsSingleConfigurationFlags(t *testing.T) {
+	for _, args := range [][]string{{"-conns", "1"}, {"-size", "64KiB"}, {"-net", "ipc"}, {"-io", "copy"}, {"-json"}} {
+		_, err := parseFlags(append([]string{"-mode", "compare"}, args...), &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "compare") || !strings.Contains(err.Error(), args[0]) {
+			t.Errorf("-mode compare %s = %v, want an error naming %s and compare", strings.Join(args, " "), err, args[0])
+		}
+	}
+	if _, err := parseFlags([]string{"-mode", "compare", "-duration", "1s"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("-mode compare -duration 1s was rejected: %v", err)
+	}
+}
+
+// compareRows returns the body rows of every markdown table in out.
+func compareRows(out string) []string {
+	var rows []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "| ") && !strings.HasPrefix(line, "| Transport") && !strings.HasPrefix(line, "| ---") {
+			rows = append(rows, line)
+		}
+	}
+	return rows
+}
+
+func TestCompareListsEveryConfigurationInOrder(t *testing.T) {
+	stdout, stderr, code := runBench(t, "-mode", "compare", "-duration", "150ms")
+	if code != 0 {
+		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
+	}
+	if first := strings.SplitN(stdout, "\n", 2)[0]; !strings.Contains(first, runtime.GOOS+"/"+runtime.GOARCH) || !strings.Contains(first, "150ms") {
+		t.Fatalf("first line %q does not name the platform and duration", first)
+	}
+	for _, header := range []string{
+		"| Transport | I/O | Connections | Record size | GB/s | Gbps | GB/s per connection |",
+		"| Transport | p50 | p99 | p999 |",
+	} {
+		if !strings.Contains(stdout, header) {
+			t.Fatalf("output lacks the table header %q:\n%s", header, stdout)
+		}
+	}
+	want := []string{
+		"| ipc | copy | 1 | 64 KiB |",
+		"| unix | copy | 1 | 64 KiB |",
+		"| tcp | copy | 1 | 64 KiB |",
+		"| ipc | copy | 2 | 64 KiB |",
+		"| ipc | copy | 4 | 64 KiB |",
+		"| ipc | copy | 1 | 4 KiB |",
+		"| ipc | copy | 1 | 1 MiB |",
+		"| ipc | rw | 1 | 64 KiB |",
+		"| ipc |",
+		"| unix |",
+		"| tcp |",
+	}
+	rows := compareRows(stdout)
+	if len(rows) != len(want) {
+		t.Fatalf("%d table rows, want %d:\n%s", len(rows), len(want), stdout)
+	}
+	for i, w := range want {
+		if !strings.HasPrefix(rows[i], w) {
+			t.Fatalf("row %d is %q, want it to start with %q", i, rows[i], w)
+		}
 	}
 }

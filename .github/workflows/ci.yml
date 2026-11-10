@@ -56,8 +56,8 @@ jobs:
             Linux) lscpu | grep -E '^ *(Model name|CPU\(s\)):' || true ;;
             macOS) sysctl -n machdep.cpu.brand_string hw.ncpu || true ;;
             Windows) powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name; [Environment]::ProcessorCount" || true ;;
-          esac
-      - name: Throughput smoke
-        run: go run ./cmd/ipcbench -mode throughput -conns 2 -size 64KiB -duration 1s
-      - name: Latency smoke
-        run: go run ./cmd/ipcbench -mode latency -duration 1s
+          esac | tee -a "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+      - name: Compare
+        shell: bash
+        run: go run ./cmd/ipcbench -mode compare -duration 1s | tee -a "$GITHUB_STEP_SUMMARY"

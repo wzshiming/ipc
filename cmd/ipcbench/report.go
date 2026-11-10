@@ -11,6 +11,8 @@ import (
 // report is the tool's output. GB and Gbit are decimal (1e9).
 type report struct {
 	Mode       string  `json:"mode"`
+	Net        string  `json:"net"`
+	IO         string  `json:"io"`
 	Conns      int     `json:"conns"`
 	Size       int     `json:"size"`
 	Ring       int     `json:"ring"`
@@ -48,6 +50,8 @@ type latency struct {
 func newReport(o options, gomaxprocs int) *report {
 	return &report{
 		Mode:       o.mode,
+		Net:        o.net,
+		IO:         o.io,
 		Conns:      o.conns,
 		Size:       o.size,
 		Ring:       o.ring,
@@ -105,8 +109,8 @@ func (r *report) writeJSON(w io.Writer) error {
 }
 
 func (r *report) writeText(w io.Writer) error {
-	fmt.Fprintf(w, "mode=%s conns=%d size=%d ring=%d duration=%gs spin=%v gomaxprocs=%d\n",
-		r.Mode, r.Conns, r.Size, r.Ring, r.DurationS, time.Duration(r.SpinNS), r.GOMAXPROCS)
+	fmt.Fprintf(w, "mode=%s net=%s io=%s conns=%d size=%d ring=%d duration=%gs spin=%v gomaxprocs=%d\n",
+		r.Mode, r.Net, r.IO, r.Conns, r.Size, r.Ring, r.DurationS, time.Duration(r.SpinNS), r.GOMAXPROCS)
 	if l := r.Latency; l != nil {
 		_, err := fmt.Fprintf(w, "round trip: samples=%d p50=%.2fus p99=%.2fus p999=%.2fus min=%.2fus mean=%.2fus max=%.2fus\n",
 			l.Samples, l.P50, l.P99, l.P999, l.Min, l.Mean, l.Max)

@@ -92,11 +92,7 @@ func produceAll(conns []net.Conn, o options) error {
 	var wg sync.WaitGroup
 	for i, c := range conns {
 		wg.Go(func() {
-			corrupt := uint64(0)
-			if i == 0 {
-				corrupt = o.corrupt
-			}
-			errs[i] = produce(c, i, o.size, o.mode == "throughput", corrupt, &stop)
+			errs[i] = produce(c, i, o, &stop)
 		})
 	}
 	wg.Wait()
@@ -137,19 +133,43 @@ func (s *source) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// produce copies a source of size-byte chunks into connection index until
-// stop is set, then closes it, which ends the consumer's stream. With
-// payload, the chunks hold the stream's pattern and chunk corrupt gets a
-// damaged first byte.
-func produce(c net.Conn, index, size int, payload bool, corrupt uint64, stop *atomic.Bool) error {
+// produce sends a source of o.size-byte chunks on connection index until
+// stop is set, then closes it, which ends the consumer's stream. With -io
+// copy, io.Copy has the source fill each ring record in place; with rw each
+// chunk is written from one buffer. Throughput chunks hold the stream's
+// pattern, and chunk o.corrupt of connection 0 gets a damaged first byte.
+func produce(c net.Conn, index int, o options, stop *atomic.Bool) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	src := &source{size: size, payload: payload, corrupt: corrupt, stop: stop}
-	// ReadFrom has src.Read fill each ring record in place; nothing is copied.
-	if _, err := io.Copy(c, src); err != nil {
+	src := &source{size: o.size, payload: o.mode == "throughput", stop: stop}
+	if index == 0 {
+		src.corrupt = o.corrupt
+	}
+	var err error
+	if o.io == "rw" {
+		err = writeMessages(c, src)
+	} else {
+		// ReadFrom has src.Read fill each ring record in place; nothing is copied.
+		_, err = io.Copy(c, src)
+	}
+	if err != nil {
 		return fmt.Errorf("connection %d: %w", index, err)
 	}
 	return c.Close()
+}
+
+// writeMessages writes src's chunks on c from one buffer until io.EOF.
+func writeMessages(c net.Conn, src *source) error {
+	buf := make([]byte, src.size)
+	for {
+		n, err := src.Read(buf)
+		if err == io.EOF {
+			return nil
+		}
+		if _, err = c.Write(buf[:n]); err != nil {
+			return err
+		}
+	}
 }
 
 // connStats is what one consumer measured.
@@ -171,7 +191,7 @@ func (r *report) consume(conns []net.Conn, o options) error {
 	for i, c := range conns {
 		wg.Go(func() {
 			var err error
-			stats[i], err = consume(c, i, o.mode == "throughput")
+			stats[i], err = consume(c, i, o)
 			if err != nil {
 				once.Do(func() {
 					first = err
@@ -188,7 +208,7 @@ func (r *report) consume(conns []net.Conn, o options) error {
 	return nil
 }
 
-// sink is the consumer's io.Writer: each Write is one ring record. The
+// sink is the consumer's io.Writer: each Write is one delivered record. The
 // first starts the window and is not counted; with check, every one is
 // verified as the stream's bytes at the offset it continues.
 type sink struct {
@@ -214,14 +234,21 @@ func (s *sink) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// consume copies connection index's stream into a sink until the producer's
-// Close ends it with io.EOF, which ends the window.
-func consume(c net.Conn, index int, check bool) (connStats, error) {
+// consume delivers connection index's stream to a sink until the producer's
+// Close ends it with io.EOF, which ends the window: with -io copy by
+// io.Copy, with rw by reading each o.size-byte message into one buffer.
+func consume(c net.Conn, index int, o options) (connStats, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	s := &sink{conn: index, check: check}
-	// WriteTo hands each ring record's slice to s.Write; nothing is copied.
-	if _, err := io.Copy(s, c); err != nil {
+	s := &sink{conn: index, check: o.mode == "throughput"}
+	var err error
+	if o.io == "rw" {
+		err = readMessages(c, s, o.size)
+	} else {
+		// WriteTo hands each ring record's slice to s.Write; nothing is copied.
+		_, err = io.Copy(s, c)
+	}
+	if err != nil {
 		var ie *integrityError
 		if errors.As(err, &ie) {
 			return s.connStats, err
@@ -230,6 +257,27 @@ func consume(c net.Conn, index int, check bool) (connStats, error) {
 	}
 	s.end = time.Now()
 	return s.connStats, nil
+}
+
+// readMessages reads c as size-byte messages into one buffer, each handed
+// to s, until io.EOF; a short last message is a truncated stream.
+func readMessages(c net.Conn, s *sink, size int) error {
+	buf := make([]byte, size)
+	for seq := uint64(1); ; seq++ {
+		n, err := io.ReadFull(c, buf)
+		switch err {
+		case nil:
+		case io.EOF:
+			return nil
+		case io.ErrUnexpectedEOF:
+			return &integrityError{s.conn, fmt.Sprintf("message %d is %d bytes, want %d", seq, n, size)}
+		default:
+			return err
+		}
+		if _, err := s.Write(buf); err != nil {
+			return err
+		}
+	}
 }
 
 // measureLatency writes size-byte records on c and times each echo until

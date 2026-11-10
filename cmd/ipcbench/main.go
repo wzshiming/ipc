@@ -1,10 +1,11 @@
 // Command ipcbench measures the throughput and latency of package ipc
-// between two processes.
+// between two processes, and of unix and tcp sockets for comparison.
 //
 // The process you start listens and consumes; it re-executes itself with
 // -peer to dial and produce, so every rate is measured on the consumer side
-// as io.Copy delivers each record. Exit codes: 0 success, 1 error or nothing
-// measured, 2 payload integrity failure.
+// as each record is delivered. -mode compare runs a fixed set of
+// configurations and prints markdown tables. Exit codes: 0 success, 1 error
+// or nothing measured, 2 payload integrity failure.
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +38,8 @@ const (
 
 type options struct {
 	mode     string
+	net      string
+	io       string
 	conns    int
 	size     int
 	ring     int
@@ -58,7 +62,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ipcbench:", err)
 		return exitError
 	}
-	runtime.GOMAXPROCS(max(runtime.GOMAXPROCS(0), o.conns+2))
+	procs := runtime.GOMAXPROCS(0)
+	if o.mode == "compare" {
+		if err := runCompare(o, procs, stdout, stderr); err != nil {
+			fmt.Fprintln(stderr, "ipcbench:", err)
+			return exitError
+		}
+		return 0
+	}
+	runtime.GOMAXPROCS(max(procs, o.conns+2))
 	if o.peer {
 		if err := runPeer(o); err != nil {
 			fmt.Fprintln(stderr, "ipcbench peer:", err)
@@ -126,14 +138,16 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	var o options
 	fs := flag.NewFlagSet("ipcbench", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.StringVar(&o.mode, "mode", "throughput", "throughput, framing or latency")
+	fs.StringVar(&o.mode, "mode", "throughput", "throughput, framing, latency or compare")
+	fs.StringVar(&o.net, "net", "ipc", "transport under test: ipc, unix or tcp")
+	fs.StringVar(&o.io, "io", "copy", "throughput and framing I/O: copy (io.Copy on both ends) or rw (one Write and io.ReadFull per record)")
 	fs.IntVar(&o.conns, "conns", 1, "number of connections, each with its own producer and consumer thread")
-	fs.Var((*sizeValue)(&o.size), "size", "bytes the producer offers per Read, the record size while the ring has room; B/KiB/MiB/GiB suffixes allowed (default 1MiB for throughput, 64B otherwise)")
-	fs.Var((*sizeValue)(&o.ring), "ring", "ring size per direction (default 4MiB, or the power of two holding 4 records)")
+	fs.Var((*sizeValue)(&o.size), "size", "record size: what the producer offers per Read, or writes per message with -io rw; B/KiB/MiB/GiB suffixes allowed (default 1MiB for throughput, 64B otherwise)")
+	fs.Var((*sizeValue)(&o.ring), "ring", "ring size per direction of -net ipc (default 4MiB, or the power of two holding 4 records)")
 	fs.DurationVar(&o.duration, "duration", 5*time.Second, "how long the peer produces")
-	fs.DurationVar(&o.spin, "spin", 0, "poll time before parking (0: library default, negative: park at once)")
+	fs.DurationVar(&o.spin, "spin", 0, "poll time before parking of -net ipc (0: library default, negative: park at once)")
 	fs.BoolVar(&o.json, "json", false, "print the report as JSON")
-	fs.StringVar(&o.path, "path", "", "control socket path (default: b.sock in a new temporary directory)")
+	fs.StringVar(&o.path, "path", "", "socket path of -net ipc and unix (default: b.sock in a new temporary directory)")
 	fs.BoolVar(&o.peer, "peer", false, "internal: run as the dialing, producing peer")
 	fs.Uint64Var(&o.corrupt, "corrupt", 0, "internal, for tests: the peer flips the first byte of chunk `N` of connection 0")
 	if err := fs.Parse(args); err != nil {
@@ -142,11 +156,35 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	if fs.NArg() > 0 {
 		return o, fmt.Errorf("unexpected arguments %q", fs.Args())
 	}
+	if o.mode == "compare" {
+		var set []string
+		fs.Visit(func(f *flag.Flag) {
+			if slices.Contains([]string{"conns", "size", "net", "io", "json"}, f.Name) {
+				set = append(set, "-"+f.Name)
+			}
+		})
+		if len(set) > 0 {
+			return o, fmt.Errorf("%s: -mode compare runs a fixed set of configurations", strings.Join(set, ", "))
+		}
+	}
 	return o, o.normalize()
 }
 
 // normalize fills mode-dependent defaults and rejects unusable settings.
 func (o *options) normalize() error {
+	switch o.net {
+	case "ipc", "unix", "tcp":
+	default:
+		return fmt.Errorf("-net %q: want ipc, unix or tcp", o.net)
+	}
+	switch o.io {
+	case "copy", "rw":
+	default:
+		return fmt.Errorf("-io %q: want copy or rw", o.io)
+	}
+	if o.duration < 0 {
+		return fmt.Errorf("-duration %v is negative", o.duration)
+	}
 	switch o.mode {
 	case "throughput":
 		if o.size == 0 {
@@ -156,8 +194,10 @@ func (o *options) normalize() error {
 		if o.size == 0 {
 			o.size = 64
 		}
+	case "compare":
+		return nil // each configuration of the set is normalized as it runs
 	default:
-		return fmt.Errorf("-mode %q: want throughput, framing or latency", o.mode)
+		return fmt.Errorf("-mode %q: want throughput, framing, latency or compare", o.mode)
 	}
 	if o.mode == "latency" && o.conns != 1 {
 		return fmt.Errorf("-mode latency uses one connection, not -conns %d", o.conns)
@@ -168,8 +208,9 @@ func (o *options) normalize() error {
 	if o.size < 8 && o.mode != "framing" {
 		return fmt.Errorf("-size %d: %s records carry an 8-byte sequence number", o.size, o.mode)
 	}
-	if o.duration < 0 {
-		return fmt.Errorf("-duration %v is negative", o.duration)
+	if o.net != "ipc" {
+		o.ring = 0 // kernel sockets have no ring
+		return nil
 	}
 	if o.ring == 0 {
 		o.ring = defaultRing
@@ -187,17 +228,19 @@ func (o *options) normalize() error {
 	return nil
 }
 
-// peerArgs is the command line of the peer that dials path.
-func (o options) peerArgs(path string) []string {
+// peerArgs is the command line of the peer that dials addr.
+func (o options) peerArgs(addr string) []string {
 	return []string{
 		"-peer",
 		"-mode=" + o.mode,
+		"-net=" + o.net,
+		"-io=" + o.io,
 		"-conns=" + strconv.Itoa(o.conns),
 		"-size=" + strconv.Itoa(o.size),
 		"-ring=" + strconv.Itoa(o.ring),
 		"-duration=" + o.duration.String(),
 		"-spin=" + o.spin.String(),
-		"-path=" + path,
+		"-path=" + addr,
 		"-corrupt=" + strconv.FormatUint(o.corrupt, 10),
 	}
 }
@@ -209,12 +252,12 @@ type peer struct {
 	err  error
 }
 
-func startPeer(o options, path string, stderr io.Writer) (*peer, error) {
+func startPeer(o options, addr string, stderr io.Writer) (*peer, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
-	p := &peer{cmd: exec.Command(exe, o.peerArgs(path)...), done: make(chan struct{})}
+	p := &peer{cmd: exec.Command(exe, o.peerArgs(addr)...), done: make(chan struct{})}
 	p.cmd.Stdout, p.cmd.Stderr = stderr, stderr
 	if err := p.cmd.Start(); err != nil {
 		return nil, err
@@ -247,13 +290,12 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 		defer os.RemoveAll(dir)
 		path = filepath.Join(dir, "b.sock")
 	}
-	lc := ipc.ListenConfig{RingSize: o.ring, Spin: o.spin}
-	ln, err := lc.Listen(context.Background(), path)
+	ln, err := listen(o, path)
 	if err != nil {
 		return nil, err
 	}
 	defer ln.Close()
-	p, err := startPeer(o, path, stderr)
+	p, err := startPeer(o, ln.Addr().String(), stderr)
 	if err != nil {
 		return nil, err
 	}
@@ -277,8 +319,27 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 	return r, nil
 }
 
+// listener is a net.Listener whose Accept a deadline can give up, as every
+// -net transport's is.
+type listener interface {
+	net.Listener
+	SetDeadline(time.Time) error
+}
+
+// listen opens the parent's -net listener; ipc and unix sockets live at path.
+func listen(o options, path string) (listener, error) {
+	switch o.net {
+	case "unix":
+		return net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	case "tcp":
+		return net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	}
+	lc := ipc.ListenConfig{RingSize: o.ring, Spin: o.spin}
+	return lc.Listen(context.Background(), path)
+}
+
 // accept takes n connections from ln, giving up once the peer has exited.
-func accept(ln *ipc.Listener, n int, p *peer) ([]net.Conn, error) {
+func accept(ln listener, n int, p *peer) ([]net.Conn, error) {
 	ln.SetDeadline(time.Now().Add(30 * time.Second))
 	done := make(chan struct{})
 	defer close(done)
@@ -312,13 +373,22 @@ func closeAll(conns []net.Conn) {
 	}
 }
 
+// dial connects the peer to the parent's listener at o.path over -net.
+func dial(o options) (net.Conn, error) {
+	switch o.net {
+	case "unix", "tcp":
+		return net.Dial(o.net, o.path)
+	}
+	d := ipc.Dialer{RingSize: o.ring, Spin: o.spin, Timeout: time.Minute}
+	return d.Dial(o.path)
+}
+
 // runPeer dials, then produces or echoes until the run ends.
 func runPeer(o options) error {
-	d := ipc.Dialer{RingSize: o.ring, Spin: o.spin, Timeout: time.Minute}
 	conns := make([]net.Conn, 0, o.conns)
 	defer func() { closeAll(conns) }()
 	for len(conns) < o.conns {
-		c, err := d.Dial(o.path)
+		c, err := dial(o)
 		if err != nil {
 			return err
 		}
@@ -332,7 +402,7 @@ func runPeer(o options) error {
 	} else {
 		err = produceAll(conns, o)
 	}
-	if errors.Is(err, ipc.ErrPeerClosed) {
+	if errors.Is(err, ipc.ErrPeerClosed) || peerGone(err) {
 		return nil // the parent quit first, e.g. on an integrity failure, and reports why
 	}
 	return err
