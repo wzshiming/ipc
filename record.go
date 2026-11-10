@@ -75,14 +75,24 @@ func (c *Conn) ringErr(err error) error {
 // has no room for n bytes, ErrTooLarge when n exceeds MaxRecord, and
 // ErrPeerClosed or net.ErrClosed once the connection is closed. It ignores
 // the write deadline.
-func (c *Conn) TryReserve(n int) ([]byte, error) {
+func (c *Conn) TryReserve(n int) ([]byte, error) { return c.tryReserve(n, false) }
+
+// tryReserve is TryReserve; with run set it reserves the ring's whole free
+// run instead, n bytes at least, still in one ring access.
+func (c *Conn) tryReserve(n int, run bool) ([]byte, error) {
 	if c.tx.held {
 		return nil, errOrder
 	}
 	if !c.tx.acquire(c) {
 		return nil, c.sendErr()
 	}
-	p, err := c.prod.TryReserve(n)
+	var p []byte
+	var err error
+	if run {
+		p, err = c.prod.TryReserveRun(n)
+	} else {
+		p, err = c.prod.TryReserve(n)
+	}
 	if err != nil {
 		c.tx.release(c)
 		return nil, c.ringErr(err)
@@ -95,18 +105,22 @@ func (c *Conn) TryReserve(n int) ([]byte, error) {
 // deadline passes or the connection closes. Past the deadline it returns
 // os.ErrDeadlineExceeded. It spins for the connection's Spin duration before
 // parking until the peer frees room.
-func (c *Conn) Reserve(n int) ([]byte, error) {
+func (c *Conn) Reserve(n int) ([]byte, error) { return c.reserve(n, false) }
+
+// reserve is Reserve; with run set it reserves the ring's whole free run
+// once at least n bytes are free, like tryReserve.
+func (c *Conn) reserve(n int, run bool) ([]byte, error) {
 	if c.tx.dl.expired.Load() {
 		return nil, os.ErrDeadlineExceeded
 	}
-	p, err := c.TryReserve(n)
+	p, err := c.tryReserve(n, run)
 	if err != ErrWouldBlock {
 		return p, err
 	}
 	if c.spin > 0 {
 		deadline := time.Now().Add(c.spin)
 		for i := 1; ; i++ {
-			if p, err = c.TryReserve(n); err != ErrWouldBlock {
+			if p, err = c.tryReserve(n, run); err != ErrWouldBlock {
 				return p, err
 			}
 			if i%spinCheckEvery == 0 {
@@ -141,7 +155,7 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 				return nil, c.sendErr()
 			}
 		}
-		if p, err = c.TryReserve(n); err != ErrWouldBlock {
+		if p, err = c.tryReserve(n, run); err != ErrWouldBlock {
 			return p, err
 		}
 	}

@@ -126,6 +126,20 @@ func (p *Producer) TryReserve(n int) ([]byte, error) {
 	return p.data[start:end:end], nil
 }
 
+// TryReserveRun reserves the largest record the ring takes now, Room(), when
+// that is at least min bytes, reading the shared tail at most once for both.
+// Otherwise it returns ErrFull, or ErrTooLarge when min exceeds MaxRecord.
+func (p *Producer) TryReserveRun(min int) ([]byte, error) {
+	if min < 0 || min > p.maxRecord {
+		return nil, ErrTooLarge
+	}
+	n := p.Room()
+	if n < min {
+		return nil, ErrFull
+	}
+	return p.TryReserve(n)
+}
+
 // Commit publishes the reserved record and reports whether the consumer was
 // parked and must be woken.
 func (p *Producer) Commit() (wakeConsumer bool) {

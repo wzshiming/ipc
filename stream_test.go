@@ -356,6 +356,29 @@ func (r *probeReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// stallReader fills the first slice it is handed, then on its second Read
+// closes stalled and waits for resume before returning 0, nil, which sends
+// ReadFrom back to reserving with nothing committed since; later Reads come
+// from rest.
+type stallReader struct {
+	stalled, resume chan struct{}
+	rest            io.Reader
+	reads           int
+}
+
+func (r *stallReader) Read(p []byte) (int, error) {
+	r.reads++
+	switch r.reads {
+	case 1:
+		return len(p), nil
+	case 2:
+		close(r.stalled)
+		<-r.resume
+		return 0, nil
+	}
+	return r.rest.Read(p)
+}
+
 // probeWriter takes every slice whole, recording its length and whether it
 // lay outside c's segment.
 type probeWriter struct {
@@ -497,6 +520,36 @@ func TestReadFromFillsMostOfTheRingWhenThePeerStalls(t *testing.T) {
 	}
 }
 
+func TestReadFromHandsTheSourceTheWholeRunAfterWaitingForRoom(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10, Spin: -1}, Dialer{RingSize: 64 << 10})
+	// Two MaxRecord records fill the ring exactly; releasing the first frees
+	// a MaxRecord run, so the run ReadFrom wakes to is MaxRecord either way.
+	for range 2 {
+		if _, err := lc.Write(make([]byte, lc.MaxRecord())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src := &probeReader{c: lc, lens: []int{lc.MaxRecord()}} // returns all it is handed
+	ch := make(chan error, 1)
+	go func() {
+		_, err := lc.ReadFrom(src)
+		ch <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	for range 2 {
+		if _, err := dc.Next(); err != nil {
+			t.Fatal(err)
+		}
+		dc.Release()
+	}
+	if err := waitErr(t, ch, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if want := lc.MaxRecord(); len(src.returned) != 1 || src.returned[0] != want {
+		t.Fatalf("ReadFrom woken for room handed the source %v bytes; want the whole %d-byte run", src.returned, want)
+	}
+}
+
 func TestReadFromDeliversBytesReadBeforeTheSourceError(t *testing.T) {
 	want := make([]byte, 1000)
 	rand.NewChaCha8([32]byte{5}).Read(want)
@@ -556,6 +609,49 @@ func TestPeerCrashFailsReadFromAndEndsWriteToWithErrPeerClosed(t *testing.T) {
 	var got bytes.Buffer
 	if n, err := dc.WriteTo(&got); !errors.Is(err, ErrPeerClosed) || !bytes.Equal(got.Bytes(), want) {
 		t.Fatalf("WriteTo after the crash = %d, %v (%q); want the bytes the peer committed, then ErrPeerClosed", n, err, got.String())
+	}
+}
+
+// readFromPastPeerClose runs lc.ReadFrom over a stallReader whose Reads
+// after the stall come from rest: while the source stalls, the peer takes
+// the one record ReadFrom committed and closes, so the reservation ReadFrom
+// makes next meets the peer's close. It returns ReadFrom's result and the
+// bytes the peer took.
+func readFromPastPeerClose(t *testing.T, rest io.Reader) (n, sent int64, err error) {
+	t.Helper()
+	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10})
+	src := &stallReader{stalled: make(chan struct{}), resume: make(chan struct{}), rest: rest}
+	ch := make(chan error, 1)
+	go func() {
+		var err error
+		n, err = lc.ReadFrom(src)
+		ch <- err
+	}()
+	<-src.stalled
+	rec, err := dc.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent = int64(len(rec))
+	dc.Release()
+	dc.Close()
+	<-lc.Done()
+	close(src.resume)
+	err = waitErr(t, ch, time.Second)
+	return n, sent, err
+}
+
+func TestReadFromOfAnExhaustedSourceEndsWithNilOnceThePeerTookAllAndClosed(t *testing.T) {
+	n, sent, err := readFromPastPeerClose(t, strings.NewReader(""))
+	if err != nil || n != sent {
+		t.Fatalf("ReadFrom = %d, %v; want %d, nil: the peer took every byte sent and the source has no more", n, err, sent)
+	}
+}
+
+func TestReadFromWithSourceDataLeftFailsWithErrPeerClosedOnceThePeerClosed(t *testing.T) {
+	n, sent, err := readFromPastPeerClose(t, strings.NewReader("left behind"))
+	if !errors.Is(err, ErrPeerClosed) || n != sent {
+		t.Fatalf("ReadFrom = %d, %v; want %d, ErrPeerClosed: the source has data the peer will never take", n, err, sent)
 	}
 }
 
