@@ -34,7 +34,7 @@ type Conn struct {
 	closeOnce  sync.Once
 	rxOnce     sync.Once
 	done       chan struct{}
-	err        error // written once before done is closed
+	err        error       // written once before done is closed
 	closed     atomic.Bool // Close was called on this end
 	bye        atomic.Bool // the peer said goodbye
 	readerDone chan struct{}

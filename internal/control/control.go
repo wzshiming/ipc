@@ -75,10 +75,10 @@ func (l *Listener) Accept() (*Link, error) {
 func (l *Listener) Close() error { return l.l.Close() }
 
 // Addr returns the listener's address.
+func (l *Listener) Addr() net.Addr { return l.l.Addr() }
 
 // SetDeadline sets the deadline for Accept; a zero value disables it.
 func (l *Listener) SetDeadline(t time.Time) error { return closedErr(l.l.SetDeadline(t)) }
-func (l *Listener) Addr() net.Addr { return l.l.Addr() }
 
 // Dial connects to the AF_UNIX socket at path.
 func Dial(ctx context.Context, path string) (*Link, error) {
