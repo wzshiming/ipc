@@ -13,24 +13,47 @@ go get github.com/wzshiming/ipc
 ### `github.com/wzshiming/ipc`
 
 ```go
-// Config sizes a connection: limits and defaults on a Listener, a request on Dial.
-type Config struct {
-	Lanes    int           // independent bidirectional lanes; 0 means 1
-	RingSize int           // ring bytes per lane direction, a power of two in [64 KiB, 1 GiB]; 0 means 4 MiB
-	Spin     time.Duration // busy re-check time before parking; 0 means 50 µs, negative parks at once
+// ListenConfig contains options for listening: the limits and defaults for accepted connections.
+type ListenConfig struct {
+	// Lanes is the most lanes a connection may have; 0 means 1.
+	Lanes int
+	// RingSize is the largest ring bytes per lane direction, a power of two in [64 KiB, 1 GiB]; 0 means 4 MiB.
+	RingSize int
+	// Spin is the busy re-check time before parking; 0 means 50 µs, negative parks at once.
+	Spin time.Duration
 }
 
-// Listen listens on the AF_UNIX socket at path.
-func Listen(path string, cfg Config) (*Listener, error)
-// Accept waits for a dialer and completes its handshake.
-func (l *Listener) Accept(ctx context.Context) (*Conn, error)
-// Close stops listening; connections already accepted stay open.
+// Listen listens on the AF_UNIX socket at path with the default ListenConfig.
+func Listen(path string) (*Listener, error)
+// Listen listens on the AF_UNIX socket at path; ctx bounds the setup only. A nil lc uses the defaults.
+func (lc *ListenConfig) Listen(ctx context.Context, path string) (*Listener, error)
+// Accept waits for a dialer, completes its handshake and returns the connection.
+func (l *Listener) Accept() (*Conn, error)
+// SetDeadline sets the deadline for Accept and its handshakes; a zero t means none.
+func (l *Listener) SetDeadline(t time.Time) error
+// Close stops listening and removes the socket file; connections already accepted stay open.
 func (l *Listener) Close() error
 // Addr returns the listener's socket path.
 func (l *Listener) Addr() net.Addr
 
-// Dial connects to the listener at path; the listener clamps cfg to its own limits.
-func Dial(ctx context.Context, path string, cfg Config) (*Conn, error)
+// Dialer contains options for connecting; Lanes and RingSize are a request the listener clamps.
+type Dialer struct {
+	// Lanes is the number of lanes requested; 0 means 1.
+	Lanes int
+	// RingSize is the ring bytes per lane direction requested; 0 means 4 MiB.
+	RingSize int
+	// Spin is the busy re-check time before parking; 0 means 50 µs, negative parks at once.
+	Spin time.Duration
+	// Timeout bounds the dial and handshake; 0 means only the handshake's own 5 s bound.
+	Timeout time.Duration
+}
+
+// Dial connects to the listener at path with the default Dialer.
+func Dial(path string) (*Conn, error)
+// Dial connects to the listener at path, as DialContext does with a background context.
+func (d *Dialer) Dial(path string) (*Conn, error)
+// DialContext connects and completes the handshake; ctx bounds the dial only. A nil d uses the defaults.
+func (d *Dialer) DialContext(ctx context.Context, path string) (*Conn, error)
 
 // Lanes returns the number of lanes.
 func (c *Conn) Lanes() int
@@ -43,47 +66,56 @@ func (c *Conn) MaxRecord() int
 // LocalAddr and RemoteAddr return the socket path the connection was made on.
 func (c *Conn) LocalAddr() net.Addr
 func (c *Conn) RemoteAddr() net.Addr
-// Close says goodbye and wakes every blocked call with ErrClosed (ErrPeerClosed on the peer,
-// whose receives still drain the records committed before Close).
+// Close tells the peer goodbye and wakes every blocked call with net.ErrClosed.
 func (c *Conn) Close() error
 // Done is closed once the connection is closed by either end or fails.
 func (c *Conn) Done() <-chan struct{}
-// Err returns nil while open, then why the connection closed.
+// Err returns nil while open, then net.ErrClosed, ErrPeerClosed, ErrCorrupt or the link error.
 func (c *Conn) Err() error
 
 // Conn returns the connection the lane belongs to.
 func (l *Lane) Conn() *Conn
 // Index returns the lane's index in its connection.
 func (l *Lane) Index() int
-// TryReserve returns an n-byte slice of the ring to fill, or ErrWouldBlock.
+// TryReserve returns an n-byte slice of the ring to fill, or ErrWouldBlock; it never blocks.
 func (l *Lane) TryReserve(n int) ([]byte, error)
-// Reserve is TryReserve that waits for room (spin, then park).
-func (l *Lane) Reserve(ctx context.Context, n int) ([]byte, error)
+// Reserve is like TryReserve but blocks for room (spin, then park) until the write deadline.
+func (l *Lane) Reserve(n int) ([]byte, error)
 // Commit publishes the reserved record.
 func (l *Lane) Commit() error
 // Abort discards the reserved record, if any.
 func (l *Lane) Abort()
-// TryNext returns the next record in place, or ErrWouldBlock.
+// TryNext returns the next record in place, or ErrWouldBlock; it never blocks.
 func (l *Lane) TryNext() ([]byte, error)
-// Next is TryNext that waits for a record (spin, then park).
-func (l *Lane) Next(ctx context.Context) ([]byte, error)
+// Next is like TryNext but blocks for a record (spin, then park) until the read deadline.
+func (l *Lane) Next() ([]byte, error)
 // Release frees the record returned by Next or TryNext.
 func (l *Lane) Release() error
-// Send copies p into one record.
-func (l *Lane) Send(ctx context.Context, p []byte) error
-// Recv copies the next record into p; a longer record yields io.ErrShortBuffer.
-func (l *Lane) Recv(ctx context.Context, p []byte) (int, error)
+// Write sends p as one record; a p longer than MaxRecord yields 0, ErrTooLarge.
+func (l *Lane) Write(p []byte) (int, error)
+// Read receives one record into p; a longer record fills p, is consumed and yields io.ErrShortBuffer.
+func (l *Lane) Read(p []byte) (int, error)
+// SetDeadline sets both the read and the write deadline.
+func (l *Lane) SetDeadline(t time.Time) error
+// SetReadDeadline sets the deadline for Next and Read; a zero t means none.
+func (l *Lane) SetReadDeadline(t time.Time) error
+// SetWriteDeadline sets the deadline for Reserve and Write; a zero t means none.
+func (l *Lane) SetWriteDeadline(t time.Time) error
 
-// NewStream presents a lane as a net.Conn byte stream; Close sends EOF.
+// NewStream presents a lane as a net.Conn byte stream whose deadlines are the lane's; Close sends EOF.
 func NewStream(l *Lane) net.Conn
 
 var (
-	ErrClosed     // this end closed the connection or listener
-	ErrPeerClosed // the peer closed the connection or died
-	ErrWouldBlock // TryReserve on a full lane, TryNext on an empty one
-	ErrTooLarge   // record longer than MaxRecord
-	ErrCorrupt    // shared memory violates the ring format
-	ErrRejected   // Dial: the listener refused the handshake
+	// the peer closed (sends) or died (receives, once drained)
+	ErrPeerClosed = errors.New("ipc: peer closed")
+	// TryReserve on a full lane, TryNext on an empty one
+	ErrWouldBlock = errors.New("ipc: operation would block")
+	// record longer than MaxRecord
+	ErrTooLarge = errors.New("ipc: record larger than MaxRecord")
+	// shared memory violates the ring format
+	ErrCorrupt = errors.New("ipc: shared memory corrupt")
+	// Dial: the listener refused the handshake
+	ErrRejected = errors.New("ipc: rejected by listener")
 )
 ```
 
@@ -130,27 +162,27 @@ import (
 
 // connect listens on a fresh socket and returns both ends of one connection.
 // In real use the listener and the dialer are two processes.
-func connect(ctx context.Context, cfg ipc.Config) (server, client *ipc.Conn, cleanup func()) {
+func connect(lc *ipc.ListenConfig, d *ipc.Dialer) (server, client *ipc.Conn, cleanup func()) {
 	dir, err := os.MkdirTemp("", "ipc") // keep the path short: sun_path is ≤ 104 bytes on macOS
 	if err != nil {
 		log.Fatal(err)
 	}
 	path := filepath.Join(dir, "s")
 
-	l, err := ipc.Listen(path, cfg)
+	l, err := lc.Listen(context.Background(), path)
 	if err != nil {
 		log.Fatal(err)
 	}
 	accepted := make(chan *ipc.Conn, 1)
 	go func() {
-		c, err := l.Accept(ctx)
+		c, err := l.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
 		accepted <- c
 	}()
 
-	client, err = ipc.Dial(ctx, path, cfg)
+	client, err = d.Dial(path)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -165,13 +197,15 @@ func connect(ctx context.Context, cfg ipc.Config) (server, client *ipc.Conn, cle
 
 // Records are written and read in place in shared memory.
 func Example() {
-	ctx := context.Background()
-	server, client, cleanup := connect(ctx, ipc.Config{Lanes: 2, RingSize: 64 << 10})
+	server, client, cleanup := connect(
+		&ipc.ListenConfig{Lanes: 2, RingSize: 64 << 10},
+		&ipc.Dialer{Lanes: 2, RingSize: 64 << 10},
+	)
 	defer cleanup()
 	fmt.Println("lanes:", client.Lanes(), "max record:", client.MaxRecord())
 
 	tx := client.Lane(1)
-	p, err := tx.Reserve(ctx, len("hello"))
+	p, err := tx.Reserve(len("hello"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -181,7 +215,7 @@ func Example() {
 	}
 
 	rx := server.Lane(1)
-	rec, err := rx.Next(ctx)
+	rec, err := rx.Next()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -196,8 +230,7 @@ func Example() {
 
 // NewStream turns a lane into a net.Conn byte stream.
 func ExampleNewStream() {
-	ctx := context.Background()
-	server, client, cleanup := connect(ctx, ipc.Config{})
+	server, client, cleanup := connect(nil, nil) // nil configs use the defaults
 	defer cleanup()
 
 	w := ipc.NewStream(client.Lane(0))
@@ -251,9 +284,9 @@ On Linux and macOS no name outlives the hand-off; the memory is freed when both 
 
 A blocking `Reserve` or `Next` that cannot proceed:
 
-1. spins for `Config.Spin`, busy re-checking the ring without yielding its thread;
+1. spins for the connection's `Spin` (from `ListenConfig` or `Dialer`), busy re-checking the ring without yielding its thread;
 2. sets its parked flag with an atomic swap and re-checks the ring;
-3. blocks on a doorbell frame from the control socket.
+3. blocks on a doorbell frame from the control socket, or until the lane's read (`Next`, `Read`) or write (`Reserve`, `Write`) deadline.
 
 The committing (or releasing) side swaps the peer's parked flag back and sends one doorbell frame only if the peer was parked. Both sides swap the same flag word, so no wakeup is lost even under plain acquire/release atomics such as the race detector's. An uncontended ring therefore costs no system call.
 
@@ -270,7 +303,11 @@ either   -> Doorbell{lane, dir}   (wake a parked peer)
 either   -> Bye                   (orderly close)
 ```
 
-The listener clamps the requested lanes and ring size to its own `Config`; both ends then use the granted values.
+The `Dialer`'s `Lanes` and `RingSize` are a request: the listener clamps them to its `ListenConfig` and both ends then use the granted values.
+
+### Close, errors and deadlines
+
+Blocking calls take no context; as on a `net.Conn`, they honour deadlines set with `Lane.SetDeadline`, `SetReadDeadline` and `SetWriteDeadline` (and `Listener.SetDeadline` for `Accept`), and past one they return `os.ErrDeadlineExceeded`, a `net.Error` whose `Timeout()` is true. `TryReserve` and `TryNext` never block and ignore deadlines. A local `Close` wakes every blocked call with `net.ErrClosed`. After the peer closes or dies, `Reserve`, `TryReserve` and `Write` fail at once with `ErrPeerClosed`, while receives drain the records it committed and then return `io.EOF` after a graceful `Close` or `ErrPeerClosed` after a crash. `Conn.Done` is closed and `Conn.Err` reports the cause either way.
 
 ## Performance
 
@@ -300,7 +337,7 @@ CI only smoke-tests `ipcbench` (1-second runs on shared runners, no performance 
 
 ## Platform notes
 
-- **Windows** needs Windows 10 1803 or later for AF_UNIX sockets. Go's clock there ticks in 0.5–15.6 ms steps, so `ipcbench` times latency samples with `QueryPerformanceCounter`, and the same coarse clock bounds `Config.Spin`: a spin may last up to one timer tick before parking.
+- **Windows** needs Windows 10 1803 or later for AF_UNIX sockets. Go's clock there ticks in 0.5–15.6 ms steps, so `ipcbench` times latency samples with `QueryPerformanceCounter`, and the same coarse clock bounds `Spin`: a spin may last up to one timer tick before parking.
 - **Linux and macOS** pass the segment as a file descriptor; fd passing is used only there. The socket file is chmod 0600.
 - **macOS** shared-memory names are limited to 31 characters; the library's random names fit (an internal detail). Socket paths are limited to 104 bytes, so keep them short.
 - **Other GOOS** compile, but creating or attaching a segment fails with an error for which `errors.Is(err, errors.ErrUnsupported)` is true: `Listener.Accept` returns it, and `Dial` returns `ErrRejected`.
@@ -309,7 +346,7 @@ CI only smoke-tests `ipcbench` (1-second runs on shared runners, no performance 
 
 - Each direction of a lane serves one goroutine at a time; use more lanes for more concurrency.
 - A record is at most `MaxRecord = RingSize/2 − 8` bytes.
-- Connections are not persistent: a crashed or exiting peer ends the connection with `ErrPeerClosed` once the records it committed are drained, and nothing is replayed.
+- Connections are not persistent: once the records a closing peer committed are drained, receives return `io.EOF` (graceful close) or `ErrPeerClosed` (crash), and nothing is replayed.
 - A lane is used either through the Lane API or through one `NewStream` on each end, never both.
 - `Spin` busy-waits a CPU for up to `Spin` per blocking call; set it small or negative when CPUs are scarce.
 - Small-record rates depend on spacing: with a tight spin, producer and consumer run one record apart and the head index crosses cores per record (≈ 23 M records/s at 64 B above); parking batches records and raises the rate (≈ 59 M records/s).
