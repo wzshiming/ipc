@@ -46,6 +46,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -61,3 +63,12 @@ jobs:
       - name: Compare
         shell: bash
         run: go run ./cmd/ipcbench -mode compare -duration 1s | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: A/B against base
+        shell: bash
+        env:
+          # The PR's base commit, or the commit master pointed at before the push.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"
+          bash hack/ab-bench.sh "$BASE" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
