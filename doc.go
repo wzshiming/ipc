@@ -7,29 +7,30 @@
 // system calls or copies. The socket carries only the handshake, doorbells
 // that wake a parked peer, and goodbye.
 //
-//	l, _ := ipc.Listen("/tmp/app.sock", ipc.Config{Lanes: 4})
-//	c, _ := l.Accept(ctx)
+//	l, _ := (&ipc.ListenConfig{Lanes: 4}).Listen(ctx, "/tmp/app.sock")
+//	c, _ := l.Accept()
 //
-//	c, _ := ipc.Dial(ctx, "/tmp/app.sock", ipc.Config{Lanes: 4})
+//	c, _ := (&ipc.Dialer{Lanes: 4}).Dial("/tmp/app.sock")
 //	lane := c.Lane(0)
-//	p, _ := lane.Reserve(ctx, 64) // write the record into p in place
+//	p, _ := lane.Reserve(64) // write the record into p in place
 //	lane.Commit()
-//	rec, _ := lane.Next(ctx) // read the peer's record in place
+//	rec, _ := lane.Next() // read the peer's record in place
 //	lane.Release()
 //
-// The dialer's Config is a request: the listener clamps lanes and ring size
-// to its own Config and both ends use the result.
+// A Dialer's Lanes and RingSize are a request: the listener clamps them to
+// its ListenConfig and both ends use the result.
 //
 // Slices from Reserve and Next alias shared memory: a Reserve slice is valid
-// until Commit or Abort, a Next slice until Release. Send and Recv copy
-// instead. Each direction of a lane serves one goroutine at a time; use more
-// lanes for more concurrency.
+// until Commit or Abort, a Next slice until Release. Write and Read copy
+// instead, one record per call. Each direction of a lane serves one goroutine
+// at a time; use more lanes for more concurrency.
 //
-// Blocking calls busy-spin for Config.Spin without yielding their thread,
-// then park until the peer rings, ctx is done or the connection closes.
-// Close wakes them with ErrClosed on this end and ErrPeerClosed on the
-// other, as does the peer's death. After the peer's close or death, sends
-// fail at once but receives return the records it committed before failing
-// with ErrPeerClosed, until this end's Close. The segment is unmapped once
-// this end has closed and every outstanding slice has been released.
+// Blocking calls busy-spin for the Spin duration without yielding their
+// thread, then park until the peer rings, the lane's deadline passes or the
+// connection closes; past the deadline they return os.ErrDeadlineExceeded.
+// Close wakes them with net.ErrClosed. After the peer closes or dies, sends
+// fail with ErrPeerClosed at once, while receives return the records it
+// committed and then io.EOF after a graceful close or ErrPeerClosed after a
+// crash, until this end's Close. The segment is unmapped once this end has
+// closed and every outstanding slice has been released.
 package ipc

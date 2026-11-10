@@ -58,7 +58,8 @@ func (h *half) close(c *Conn) {
 }
 
 // Lane is one bidirectional pair of rings. Each direction may be used by one
-// goroutine at a time: one may send while another receives.
+// goroutine at a time: one may send while another receives. Sends honour the
+// write deadline and receives the read deadline, as on a net.Conn.
 //
 // Slices returned by Reserve and Next alias shared memory: a Reserve slice is
 // valid until Commit or Abort, a Next slice until Release.
