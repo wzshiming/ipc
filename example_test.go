@@ -23,32 +23,28 @@ func Example() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c, err := ipc.Dial(path)
+		c, err := ipc.Dial(path) // a net.Conn
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer c.Close()
-		p, err := c.Reserve(len("hello")) // the record API: p is shared memory
-		if err != nil {
-			log.Fatal(err)
-		}
-		copy(p, "hello")
-		c.Commit()
-		b, err := io.ReadAll(c) // the byte stream the listener sends, until its Close
-		fmt.Printf("dialer read %q, %v\n", b, err)
+		io.WriteString(c, "hello")
+		reply := make([]byte, len("hello, stream"))
+		io.ReadFull(c, reply)
+		_, err = c.Read(reply) // the listener's Close ends the stream
+		fmt.Printf("dialer read %q, then %v\n", reply, err)
 	}()
-	nc, err := l.Accept() // a net.Conn
+	c, err := l.Accept() // a net.Conn
 	if err != nil {
 		log.Fatal(err)
 	}
-	c := nc.(*ipc.Conn) // *Conn adds the record API
-	rec, _ := c.Next()  // rec aliases the ring until Release
-	fmt.Printf("listener got %q\n", rec)
-	c.Release()
+	b := make([]byte, len("hello"))
+	io.ReadFull(c, b)
+	fmt.Printf("listener got %q\n", b)
 	io.WriteString(c, "hello, stream")
-	c.Close() // the dialer's Read sees io.EOF
+	c.Close()
 	<-done
 	// Output:
 	// listener got "hello"
-	// dialer read "hello, stream", <nil>
+	// dialer read "hello, stream", then EOF
 }

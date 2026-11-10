@@ -3,13 +3,13 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
+	"net"
 	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/wzshiming/ipc"
 )
 
 // stride is the spacing of sequence words in a throughput record: one per
@@ -53,9 +53,9 @@ func verifyRecord(rec []byte, seq uint64) error {
 	return nil
 }
 
-// produceAll runs one locked producer per connection for o.duration, then
-// ends each connection with a zero-length record.
-func produceAll(conns []*ipc.Conn, o options) error {
+// produceAll runs one locked producer per connection for o.duration; each
+// ends its connection with Close.
+func produceAll(conns []net.Conn, o options) error {
 	var stop atomic.Bool
 	stop.Store(o.duration <= 0)
 	t := time.AfterFunc(o.duration, func() { stop.Store(true) })
@@ -80,33 +80,26 @@ func produceAll(conns []*ipc.Conn, o options) error {
 	return nil
 }
 
-// produce sends size-byte records on connection index until stop is set.
-// With fill, each record is a copy of the template stamped with its
-// sequence number, and record corrupt gets a damaged sequence word.
-func produce(c *ipc.Conn, index, size int, fill bool, corrupt uint64, stop *atomic.Bool) error {
+// produce writes size-byte records on connection index until stop is set,
+// then closes it, which ends the consumer's stream. With fill, each record
+// is the template stamped with its sequence number, and record corrupt gets
+// a damaged sequence word.
+func produce(c net.Conn, index, size int, fill bool, corrupt uint64, stop *atomic.Bool) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	tmpl := newTemplate(size)
+	rec := newTemplate(size)
 	for seq := uint64(1); !stop.Load(); seq++ {
-		b, err := c.Reserve(size)
-		if err != nil {
-			return fmt.Errorf("connection %d: %w", index, err)
-		}
 		if fill {
-			stampTemplate(tmpl, seq)
+			stampTemplate(rec, seq)
 			if seq == corrupt {
-				tmpl[0] ^= 0xff
+				rec[0] ^= 0xff
 			}
-			copy(b, tmpl)
 		}
-		if err := c.Commit(); err != nil {
+		if _, err := c.Write(rec); err != nil {
 			return fmt.Errorf("connection %d: %w", index, err)
 		}
 	}
-	if _, err := c.Reserve(0); err != nil {
-		return fmt.Errorf("connection %d: %w", index, err)
-	}
-	return c.Commit()
+	return c.Close()
 }
 
 // connStats is what one consumer measured.
@@ -117,8 +110,8 @@ type connStats struct {
 }
 
 // consume runs one locked consumer per connection until each connection's
-// end marker, then fills the report. The first failure closes all to stop all.
-func (r *report) consume(conns []*ipc.Conn, o options) error {
+// stream ends, then fills the report. The first failure closes all to stop all.
+func (r *report) consume(conns []net.Conn, o options) error {
 	var (
 		once  sync.Once
 		first error
@@ -145,35 +138,31 @@ func (r *report) consume(conns []*ipc.Conn, o options) error {
 	return nil
 }
 
-// consume receives records on connection index until the zero-length end
-// marker. The window starts after the first record so its bytes and setup
-// are not counted.
-func consume(c *ipc.Conn, index, size int, check bool) (connStats, error) {
+// consume reads size-byte records on connection index until the producer's
+// Close ends the stream with io.EOF. The window starts after the first
+// record so its bytes and setup are not counted.
+func consume(c net.Conn, index, size int, check bool) (connStats, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	var s connStats
+	rec := make([]byte, size)
 	for seq := uint64(1); ; seq++ {
-		rec, err := c.Next()
-		if err != nil {
-			return s, fmt.Errorf("connection %d: %w", index, err)
-		}
-		n := len(rec)
-		if n == 0 {
+		// Read copies the record out of the ring into rec; that copy is part of what is measured.
+		n, err := io.ReadFull(c, rec)
+		switch err {
+		case nil:
+		case io.EOF:
 			s.end = time.Now()
-			return s, c.Release()
-		}
-		if n != size {
-			c.Release()
+			return s, nil
+		case io.ErrUnexpectedEOF:
 			return s, &integrityError{index, seq, fmt.Sprintf("length %d, want %d", n, size)}
+		default:
+			return s, fmt.Errorf("connection %d: %w", index, err)
 		}
 		if check {
 			if err := verifyRecord(rec, seq); err != nil {
-				c.Release()
 				return s, &integrityError{index, seq, err.Error()}
 			}
-		}
-		if err := c.Release(); err != nil {
-			return s, fmt.Errorf("connection %d: %w", index, err)
 		}
 		if seq == 1 {
 			s.start = time.Now()
@@ -184,13 +173,13 @@ func consume(c *ipc.Conn, index, size int, check bool) (connStats, error) {
 	}
 }
 
-// measureLatency sends size-byte records on c and times each echo until
+// measureLatency writes size-byte records on c and times each echo until
 // the run ends, discarding a warm-up.
-func measureLatency(c *ipc.Conn, size int, d time.Duration) (*latency, error) {
+func measureLatency(c net.Conn, size int, d time.Duration) (*latency, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	const warmup = 1000
-	msg := newTemplate(size)
+	msg, reply := newTemplate(size), make([]byte, size)
 	samples := make([]time.Duration, 0, 1<<20)
 	start := nowNanos()
 	for seq := uint64(1); ; seq++ {
@@ -202,57 +191,34 @@ func measureLatency(c *ipc.Conn, size int, d time.Duration) (*latency, error) {
 		if _, err := c.Write(msg); err != nil {
 			return nil, err
 		}
-		rec, err := c.Next()
-		if err != nil {
+		if _, err := io.ReadFull(c, reply); err != nil {
 			return nil, err
 		}
-		if len(rec) != size || binary.LittleEndian.Uint64(rec) != seq {
-			c.Release()
+		if binary.LittleEndian.Uint64(reply) != seq {
 			return nil, &integrityError{0, seq, "echo differs from the record sent"}
-		}
-		if err := c.Release(); err != nil {
-			return nil, err
 		}
 		if seq > warmup {
 			samples = append(samples, elapsed(t0, nowNanos()))
 		}
 	}
-	if _, err := c.Reserve(0); err != nil {
-		return nil, err
-	}
-	if err := c.Commit(); err != nil {
-		return nil, err
-	}
-	if _, err := c.Next(); err != nil {
-		return nil, err
-	}
-	c.Release()
 	return newLatency(samples), nil
 }
 
-// echo returns every record on c until it echoes the zero-length end.
-func echo(c *ipc.Conn) error {
+// echo writes every size-byte record read on c back until the parent's
+// Close ends the stream with io.EOF.
+func echo(c net.Conn, size int) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	rec := make([]byte, size)
 	for {
-		rec, err := c.Next()
-		if err != nil {
+		if _, err := io.ReadFull(c, rec); err != nil {
+			if err == io.EOF {
+				return nil
+			}
 			return err
 		}
-		b, err := c.Reserve(len(rec))
-		if err != nil {
+		if _, err := c.Write(rec); err != nil {
 			return err
-		}
-		copy(b, rec)
-		n := len(rec)
-		if err := c.Release(); err != nil {
-			return err
-		}
-		if err := c.Commit(); err != nil {
-			return err
-		}
-		if n == 0 {
-			return nil
 		}
 	}
 }

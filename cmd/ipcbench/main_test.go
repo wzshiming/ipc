@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestMain lets the tests run the real tool, and the peer it re-executes,
@@ -87,6 +91,76 @@ func TestVerifyRecordRejectsCorruptedTemplate(t *testing.T) {
 	err := verifyRecord(tmpl, 7)
 	if err == nil || !strings.Contains(err.Error(), "offset 384") {
 		t.Fatalf("verifyRecord on corrupted word at 384 = %v", err)
+	}
+}
+
+// The run ends by the producer's Close: the consumer stops at io.EOF with
+// no end marker on the stream.
+func TestConsumeEndsAtProducerClose(t *testing.T) {
+	const size, records = 64, 4
+	producer, consumer := net.Pipe()
+	consumer.SetDeadline(time.Now().Add(10 * time.Second))
+	go func() {
+		rec := newTemplate(size)
+		for seq := uint64(1); seq <= records; seq++ {
+			stampTemplate(rec, seq)
+			producer.Write(rec)
+		}
+		producer.Close()
+	}()
+	s, err := consume(consumer, 0, size, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.records != records-1 || s.bytes != (records-1)*size || s.end.IsZero() {
+		t.Fatalf("consumed %+v, want the %d records after the first and an end time", s, records-1)
+	}
+}
+
+// The producer ends its stream with Close, not a zero-length record: after
+// stop the consumer reads whole records, then io.EOF.
+func TestProduceEndsWithClose(t *testing.T) {
+	const size = 64
+	producer, consumer := net.Pipe()
+	consumer.SetDeadline(time.Now().Add(10 * time.Second))
+	var stop atomic.Bool
+	errc := make(chan error, 1)
+	go func() { errc <- produce(producer, 0, size, true, 0, &stop) }()
+	rec := make([]byte, size)
+	for range 3 {
+		if _, err := io.ReadFull(consumer, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop.Store(true)
+	rest, err := io.ReadAll(consumer)
+	if err != nil || len(rest)%size != 0 {
+		t.Fatalf("after stop the stream held %d bytes, %v; want whole %d-byte records then io.EOF", len(rest), err, size)
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The parent's Close ends the echo loop: echo returns nil at io.EOF.
+func TestEchoEndsAtPeerClose(t *testing.T) {
+	const size = 64
+	parent, peer := net.Pipe()
+	parent.SetDeadline(time.Now().Add(10 * time.Second))
+	peer.SetDeadline(time.Now().Add(10 * time.Second))
+	errc := make(chan error, 1)
+	go func() { errc <- echo(peer, size) }()
+	msg := newTemplate(size)
+	if _, err := parent.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, size)
+	if _, err := io.ReadFull(parent, reply); err != nil || !bytes.Equal(reply, msg) {
+		t.Fatalf("echo replied %x, %v; want the record sent", reply, err)
+	}
+	parent.Close()
+	if err := <-errc; err != nil {
+		t.Fatalf("echo after the parent's Close = %v, want nil", err)
 	}
 }
 

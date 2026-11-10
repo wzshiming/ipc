@@ -3,7 +3,7 @@
 //
 // The process you start listens and consumes; it re-executes itself with
 // -peer to dial and produce, so every rate is measured on the consumer side
-// after Release. Exit codes: 0 success, 1 error or nothing measured,
+// after Read. Exit codes: 0 success, 1 error or nothing measured,
 // 2 payload integrity failure.
 package main
 
@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -167,9 +168,6 @@ func (o *options) normalize() error {
 	if o.size < 8 && o.mode != "framing" {
 		return fmt.Errorf("-size %d: %s records carry an 8-byte sequence number", o.size, o.mode)
 	}
-	if o.size < 1 {
-		return fmt.Errorf("-size %d: zero-length records mark the end of the run", o.size)
-	}
 	if o.duration < 0 {
 		return fmt.Errorf("-duration %v is negative", o.duration)
 	}
@@ -265,11 +263,6 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 		return nil, err
 	}
 	defer closeAll(conns)
-	for _, c := range conns {
-		if err := checkConn(o, c); err != nil {
-			return nil, err
-		}
-	}
 	stop := time.AfterFunc(o.duration+time.Minute, func() { closeAll(conns) })
 	defer stop.Stop()
 	r := newReport(o, runtime.GOMAXPROCS(0))
@@ -285,7 +278,7 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 }
 
 // accept takes n connections from ln, giving up once the peer has exited.
-func accept(ln *ipc.Listener, n int, p *peer) ([]*ipc.Conn, error) {
+func accept(ln *ipc.Listener, n int, p *peer) ([]net.Conn, error) {
 	ln.SetDeadline(time.Now().Add(30 * time.Second))
 	done := make(chan struct{})
 	defer close(done)
@@ -296,7 +289,7 @@ func accept(ln *ipc.Listener, n int, p *peer) ([]*ipc.Conn, error) {
 		case <-done:
 		}
 	}()
-	conns := make([]*ipc.Conn, 0, n)
+	conns := make([]net.Conn, 0, n)
 	for len(conns) < n {
 		c, err := ln.Accept()
 		if err != nil {
@@ -308,32 +301,21 @@ func accept(ln *ipc.Listener, n int, p *peer) ([]*ipc.Conn, error) {
 				return nil, err
 			}
 		}
-		conns = append(conns, c.(*ipc.Conn))
+		conns = append(conns, c)
 	}
 	return conns, nil
 }
 
-func closeAll(conns []*ipc.Conn) {
+func closeAll(conns []net.Conn) {
 	for _, c := range conns {
 		c.Close()
 	}
 }
 
-// checkConn rejects a connection granted other settings than asked.
-func checkConn(o options, conn *ipc.Conn) error {
-	if conn.RingSize() != o.ring {
-		return fmt.Errorf("granted %d-byte rings, asked %d", conn.RingSize(), o.ring)
-	}
-	if o.size > conn.MaxRecord() {
-		return fmt.Errorf("-size %d exceeds MaxRecord %d", o.size, conn.MaxRecord())
-	}
-	return nil
-}
-
-// runPeer dials, then produces or echoes until the parent closes.
+// runPeer dials, then produces or echoes until the run ends.
 func runPeer(o options) error {
 	d := ipc.Dialer{RingSize: o.ring, Spin: o.spin, Timeout: time.Minute}
-	conns := make([]*ipc.Conn, 0, o.conns)
+	conns := make([]net.Conn, 0, o.conns)
 	defer func() { closeAll(conns) }()
 	for len(conns) < o.conns {
 		c, err := d.Dial(o.path)
@@ -342,31 +324,16 @@ func runPeer(o options) error {
 		}
 		conns = append(conns, c)
 	}
-	for _, c := range conns {
-		if err := checkConn(o, c); err != nil {
-			return err
-		}
-	}
 	stop := time.AfterFunc(o.duration+time.Minute, func() { closeAll(conns) })
 	defer stop.Stop()
 	var err error
 	if o.mode == "latency" {
-		err = echo(conns[0])
+		err = echo(conns[0], o.size)
 	} else {
 		err = produceAll(conns, o)
 	}
-	if err != nil {
-		for _, c := range conns {
-			select {
-			case <-c.Done():
-				return nil // the parent quit first, e.g. on an integrity failure
-			default:
-			}
-		}
-		return err
+	if errors.Is(err, ipc.ErrPeerClosed) {
+		return nil // the parent quit first, e.g. on an integrity failure, and reports why
 	}
-	for _, c := range conns {
-		<-c.Done()
-	}
-	return nil
+	return err
 }

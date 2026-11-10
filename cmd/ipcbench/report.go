@@ -23,7 +23,7 @@ type report struct {
 	Latency   *latency `json:"latency,omitempty"`
 }
 
-// rate is what the consumer released over a measured window.
+// rate is what the consumer read over a measured window.
 type rate struct {
 	Conn          int     `json:"conn"`
 	Records       uint64  `json:"records"`
