@@ -235,10 +235,10 @@ func TestStreamCloseLeavesConnOpen(t *testing.T) {
 	if err := lc.Err(); err != nil {
 		t.Fatalf("Conn.Err after Stream.Close = %v; want nil", err)
 	}
-	if err := lc.Lane(1).Send(context.Background(), []byte("x")); err != nil {
+	if _, err := lc.Lane(1).Write([]byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dc.Lane(1).Recv(context.Background(), make([]byte, 1)); err != nil {
+	if _, err := dc.Lane(1).Read(make([]byte, 1)); err != nil {
 		t.Fatal(err)
 	}
 }

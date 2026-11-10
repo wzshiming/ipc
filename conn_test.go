@@ -135,31 +135,30 @@ func waitErr(t *testing.T, ch <-chan error, d time.Duration) error {
 	}
 }
 
-func TestCancelledNextReturnsCtxErrAndKeepsData(t *testing.T) {
+func TestInterruptedParkedNextKeepsData(t *testing.T) {
 	lc, dc := pair(t, Config{}, Config{Spin: -1})
-	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan error, 1)
 	go func() {
-		_, err := dc.Lane(0).Next(ctx)
+		_, err := dc.Lane(0).Next()
 		ch <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
-	cancel()
-	if err := waitErr(t, ch, 100*time.Millisecond); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Next after cancel = %v; want context.Canceled", err)
+	dc.Lane(0).SetReadDeadline(time.Now())
+	if err := waitErr(t, ch, 100*time.Millisecond); err != os.ErrDeadlineExceeded {
+		t.Fatalf("Next after deadline = %v; want os.ErrDeadlineExceeded", err)
 	}
-	bg := context.Background()
-	if err := lc.Lane(0).Send(bg, []byte("after")); err != nil {
+	dc.Lane(0).SetReadDeadline(time.Time{})
+	if _, err := lc.Lane(0).Write([]byte("after")); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 16)
-	n, err := dc.Lane(0).Recv(bg, buf)
+	n, err := dc.Lane(0).Read(buf)
 	if err != nil || string(buf[:n]) != "after" {
-		t.Fatalf("Recv = %q, %v; want after", buf[:n], err)
+		t.Fatalf("Read = %q, %v; want after", buf[:n], err)
 	}
 }
 
-func TestCancelledReserveReturnsCtxErrAndKeepsData(t *testing.T) {
+func TestInterruptedParkedReserveKeepsData(t *testing.T) {
 	lc, dc := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10, Spin: -1})
 	tx, rx := dc.Lane(0), lc.Lane(0)
 	var sent uint64
@@ -177,23 +176,25 @@ func TestCancelledReserveReturnsCtxErrAndKeepsData(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan error, 1)
 	go func() {
-		_, err := tx.Reserve(ctx, 1000)
+		_, err := tx.Reserve(1000)
 		ch <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
-	cancel()
-	if err := waitErr(t, ch, 100*time.Millisecond); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Reserve after cancel = %v; want context.Canceled", err)
+	tx.SetWriteDeadline(time.Now())
+	if err := waitErr(t, ch, 100*time.Millisecond); err != os.ErrDeadlineExceeded {
+		t.Fatalf("Reserve after deadline = %v; want os.ErrDeadlineExceeded", err)
 	}
-	bg := context.Background()
+	tx.SetWriteDeadline(time.Time{})
 	p := make([]byte, 1000)
 	putSeq(p, sent)
-	go func() { ch <- tx.Send(bg, p) }()
+	go func() {
+		_, err := tx.Write(p)
+		ch <- err
+	}()
 	for want := uint64(0); want <= sent; want++ {
-		rec, err := rx.Next(bg)
+		rec, err := rx.Next()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -203,7 +204,7 @@ func TestCancelledReserveReturnsCtxErrAndKeepsData(t *testing.T) {
 		rx.Release()
 	}
 	if err := waitErr(t, ch, time.Second); err != nil {
-		t.Fatal("Send after cancel:", err)
+		t.Fatal("Write after deadline:", err)
 	}
 }
 
@@ -224,7 +225,7 @@ func TestPeerCloseWakesBlockedNextWithEOF(t *testing.T) {
 	lc, dc := pair(t, Config{}, Config{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
-		_, err := dc.Lane(0).Next(context.Background())
+		_, err := dc.Lane(0).Next()
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -249,7 +250,7 @@ func TestPeerCloseWakesBlockedReserveWithErrPeerClosed(t *testing.T) {
 	}
 	ch := make(chan error, 1)
 	go func() {
-		_, err := tx.Reserve(context.Background(), 4000)
+		_, err := tx.Reserve(4000)
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -275,18 +276,17 @@ func commitSeq(t *testing.T, l *Lane, n, size int) {
 }
 
 // drainSeq reads n records numbered 0..n-1 from l, alternating TryNext and
-// Next, then expects end from both.
+// Next, then expects end from Next, TryNext and Read.
 func drainSeq(t *testing.T, l *Lane, n int, end error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	l.SetReadDeadline(time.Now().Add(5 * time.Second))
 	for i := range n {
 		var rec []byte
 		var err error
 		if i%2 == 0 {
 			rec, err = l.TryNext()
 		} else {
-			rec, err = l.Next(ctx)
+			rec, err = l.Next()
 		}
 		if err != nil {
 			t.Fatalf("record %d after peer close: %v", i, err)
@@ -298,11 +298,14 @@ func drainSeq(t *testing.T, l *Lane, n int, end error) {
 			t.Fatalf("Release record %d after peer close: %v", i, err)
 		}
 	}
-	if _, err := l.Next(ctx); err != end {
+	if _, err := l.Next(); err != end {
 		t.Fatalf("Next on drained lane = %v; want %v", err, end)
 	}
 	if _, err := l.TryNext(); err != end {
 		t.Fatalf("TryNext on drained lane = %v; want %v", err, end)
+	}
+	if _, err := l.Read(make([]byte, 8)); err != end {
+		t.Fatalf("Read on drained lane = %v; want %v", err, end)
 	}
 }
 
@@ -325,7 +328,7 @@ func TestParkedNextWokenByPeerCloseReturnsRecordCommittedBeforeIt(t *testing.T) 
 	}
 	ch := make(chan result, 1)
 	go func() {
-		rec, err := dc.Lane(0).Next(context.Background())
+		rec, err := dc.Lane(0).Next()
 		if err != nil {
 			ch <- result{err: err}
 			return
@@ -378,7 +381,7 @@ func TestReleaseAfterPeerCloseSucceedsWhenPeerWasParked(t *testing.T) {
 	}
 	ch := make(chan error, 1)
 	go func() {
-		_, err := tx.Reserve(context.Background(), 4000)
+		_, err := tx.Reserve(4000)
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -388,7 +391,7 @@ func TestReleaseAfterPeerCloseSucceedsWhenPeerWasParked(t *testing.T) {
 	drainSeq(t, dc.Lane(0), n, io.EOF)
 }
 
-func TestPeerCloseFailsReserveTryReserveAndSendAtOnce(t *testing.T) {
+func TestPeerCloseFailsReserveTryReserveAndWriteAtOnce(t *testing.T) {
 	lc, dc := pair(t, Config{}, Config{})
 	commitSeq(t, lc.Lane(0), 10, 100)
 	lc.Close()
@@ -397,11 +400,11 @@ func TestPeerCloseFailsReserveTryReserveAndSendAtOnce(t *testing.T) {
 	if _, err := l.TryReserve(8); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("TryReserve = %v; want ErrPeerClosed", err)
 	}
-	if _, err := l.Reserve(context.Background(), 8); !errors.Is(err, ErrPeerClosed) {
+	if _, err := l.Reserve(8); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("Reserve = %v; want ErrPeerClosed", err)
 	}
-	if err := l.Send(context.Background(), []byte("x")); !errors.Is(err, ErrPeerClosed) {
-		t.Fatalf("Send = %v; want ErrPeerClosed", err)
+	if _, err := l.Write([]byte("x")); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("Write = %v; want ErrPeerClosed", err)
 	}
 }
 
@@ -432,7 +435,7 @@ func TestLocalCloseWakesBlockedNextWithNetErrClosed(t *testing.T) {
 	_, dc := pair(t, Config{}, Config{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
-		_, err := dc.Lane(0).Next(context.Background())
+		_, err := dc.Lane(0).Next()
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -459,13 +462,35 @@ func TestLocalCloseWakesBlockedReserveWithNetErrClosed(t *testing.T) {
 	}
 	ch := make(chan error, 1)
 	go func() {
-		_, err := tx.Reserve(context.Background(), 4000)
+		_, err := tx.Reserve(4000)
 		ch <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
 	dc.Close()
 	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
 		t.Fatalf("Reserve = %v; want net.ErrClosed", err)
+	}
+}
+
+func TestLocalCloseWakesBlockedReadAndWriteWithNetErrClosed(t *testing.T) {
+	_, dc := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10, Spin: -1})
+	l := dc.Lane(0)
+	fill(t, l)
+	ch := make(chan error, 2)
+	go func() {
+		_, err := l.Write(make([]byte, 4000))
+		ch <- err
+	}()
+	go func() {
+		_, err := l.Read(make([]byte, 8))
+		ch <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	dc.Close()
+	for range 2 {
+		if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+			t.Fatalf("blocked Read or Write = %v; want net.ErrClosed", err)
+		}
 	}
 }
 
@@ -482,11 +507,10 @@ func TestCommitAfterLocalCloseIsNetErrClosed(t *testing.T) {
 
 func TestCloseDefersUnmapUntilInflightNextReleased(t *testing.T) {
 	lc, dc := pair(t, Config{}, Config{})
-	bg := context.Background()
-	if err := lc.Lane(0).Send(bg, []byte("hello")); err != nil {
+	if _, err := lc.Lane(0).Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	rec, err := dc.Lane(0).Next(bg)
+	rec, err := dc.Lane(0).Next()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +529,7 @@ func TestCloseDefersUnmapUntilInflightNextReleased(t *testing.T) {
 
 func TestCloseDefersUnmapUntilInflightReserveAborted(t *testing.T) {
 	_, dc := pair(t, Config{}, Config{})
-	p, err := dc.Lane(0).Reserve(context.Background(), 100)
+	p, err := dc.Lane(0).Reserve(100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,14 +700,14 @@ func TestCloseLeaksNoGoroutines(t *testing.T) {
 		}
 		blocked := make(chan error, 1)
 		go func() {
-			_, err := dc.Lane(1).Next(ctx)
+			_, err := dc.Lane(1).Next()
 			blocked <- err
 		}()
-		if err := lc.Lane(0).Send(ctx, []byte("x")); err != nil {
+		if _, err := lc.Lane(0).Write([]byte("x")); err != nil {
 			t.Fatal(err)
 		}
 		buf := make([]byte, 1)
-		if _, err := dc.Lane(0).Recv(ctx, buf); err != nil {
+		if _, err := dc.Lane(0).Read(buf); err != nil {
 			t.Fatal(err)
 		}
 		lc.Close()

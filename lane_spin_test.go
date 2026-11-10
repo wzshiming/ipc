@@ -1,7 +1,6 @@
 package ipc
 
 import (
-	"context"
 	"runtime"
 	"slices"
 	"testing"
@@ -11,16 +10,15 @@ import (
 // pinnedPingPong runs rounds 64 B round trips between two goroutines locked
 // to OS threads and returns each round trip's duration.
 func pinnedPingPong(tb testing.TB, lc, dc *Conn, rounds int) []time.Duration {
-	ctx := context.Background()
 	done := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		buf := make([]byte, 64)
 		for range rounds {
-			n, err := dc.Lane(0).Recv(ctx, buf)
+			n, err := dc.Lane(0).Read(buf)
 			if err == nil {
-				err = dc.Lane(0).Send(ctx, buf[:n])
+				_, err = dc.Lane(0).Write(buf[:n])
 			}
 			if err != nil {
 				done <- err
@@ -35,10 +33,10 @@ func pinnedPingPong(tb testing.TB, lc, dc *Conn, rounds int) []time.Duration {
 	samples := make([]time.Duration, 0, rounds)
 	for range rounds {
 		t0 := time.Now()
-		if err := lc.Lane(0).Send(ctx, msg); err != nil {
+		if _, err := lc.Lane(0).Write(msg); err != nil {
 			tb.Fatal(err)
 		}
-		if _, err := lc.Lane(0).Recv(ctx, buf); err != nil {
+		if _, err := lc.Lane(0).Read(buf); err != nil {
 			tb.Fatal(err)
 		}
 		samples = append(samples, time.Since(t0))

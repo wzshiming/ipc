@@ -2,7 +2,6 @@ package ipc
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"runtime/debug"
@@ -23,9 +22,8 @@ func raceEnabled() bool {
 	return false
 }
 
-func TestSendRecvBothDirectionsOnEveryLane(t *testing.T) {
+func TestWriteReadBothDirectionsOnEveryLane(t *testing.T) {
 	lc, dc := pair(t, Config{Lanes: 3}, Config{Lanes: 3})
-	ctx := context.Background()
 	buf := make([]byte, 64)
 	for i := range 3 {
 		for _, ends := range [][2]*Conn{{lc, dc}, {dc, lc}} {
@@ -34,45 +32,55 @@ func TestSendRecvBothDirectionsOnEveryLane(t *testing.T) {
 				t.Fatalf("Lane(%d).Index, Conn = %d, %p", i, from.Index(), from.Conn())
 			}
 			msg := []byte{byte(i), 'm'}
-			if err := from.Send(ctx, msg); err != nil {
-				t.Fatal(err)
+			if n, err := from.Write(msg); n != len(msg) || err != nil {
+				t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(msg))
 			}
-			n, err := to.Recv(ctx, buf)
+			n, err := to.Read(buf)
 			if err != nil || !bytes.Equal(buf[:n], msg) {
-				t.Fatalf("lane %d Recv = %q, %v; want %q", i, buf[:n], err, msg)
+				t.Fatalf("lane %d Read = %q, %v; want %q", i, buf[:n], err, msg)
 			}
 		}
 	}
 }
 
-func TestRecvShortBufferConsumesRecord(t *testing.T) {
+func TestReadShortBufferConsumesRecord(t *testing.T) {
 	lc, dc := pair(t, Config{}, Config{})
-	ctx := context.Background()
-	lc.Lane(0).Send(ctx, []byte("abcdef"))
-	lc.Lane(0).Send(ctx, []byte("next"))
+	lc.Lane(0).Write([]byte("abcdef"))
+	lc.Lane(0).Write([]byte("next"))
 	buf := make([]byte, 3)
-	n, err := dc.Lane(0).Recv(ctx, buf)
-	if !errors.Is(err, io.ErrShortBuffer) || string(buf[:n]) != "abc" {
-		t.Fatalf("Recv = %q, %v; want abc, io.ErrShortBuffer", buf[:n], err)
+	n, err := dc.Lane(0).Read(buf)
+	if !errors.Is(err, io.ErrShortBuffer) || n != 3 || string(buf[:n]) != "abc" {
+		t.Fatalf("Read = %d %q, %v; want 3 abc, io.ErrShortBuffer", n, buf[:n], err)
 	}
 	buf = make([]byte, 8)
-	n, err = dc.Lane(0).Recv(ctx, buf)
+	n, err = dc.Lane(0).Read(buf)
 	if err != nil || string(buf[:n]) != "next" {
-		t.Fatalf("Recv after short = %q, %v; want next", buf[:n], err)
+		t.Fatalf("Read after short = %q, %v; want next", buf[:n], err)
 	}
 }
 
-func TestSendAboveMaxRecordIsErrTooLarge(t *testing.T) {
-	lc, _ := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10})
-	err := lc.Lane(0).Send(context.Background(), make([]byte, lc.MaxRecord()+1))
-	if !errors.Is(err, ErrTooLarge) {
-		t.Fatalf("Send = %v; want ErrTooLarge", err)
+func TestWriteEmptySendsZeroLengthRecord(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	if n, err := lc.Lane(0).Write(nil); n != 0 || err != nil {
+		t.Fatalf("Write(nil) = %d, %v; want 0, nil", n, err)
 	}
-	if _, err := lc.Lane(0).Reserve(context.Background(), lc.MaxRecord()+1); !errors.Is(err, ErrTooLarge) {
+	rec, err := dc.Lane(0).TryNext()
+	if err != nil || len(rec) != 0 {
+		t.Fatalf("TryNext = %q, %v; want an empty record", rec, err)
+	}
+}
+
+func TestWriteAboveMaxRecordIsErrTooLarge(t *testing.T) {
+	lc, _ := pair(t, Config{RingSize: 64 << 10}, Config{RingSize: 64 << 10})
+	n, err := lc.Lane(0).Write(make([]byte, lc.MaxRecord()+1))
+	if n != 0 || !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("Write = %d, %v; want 0, ErrTooLarge", n, err)
+	}
+	if _, err := lc.Lane(0).Reserve(lc.MaxRecord() + 1); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("Reserve = %v; want ErrTooLarge", err)
 	}
-	if err := lc.Lane(0).Send(context.Background(), make([]byte, lc.MaxRecord())); err != nil {
-		t.Fatalf("Send(MaxRecord) = %v", err)
+	if _, err := lc.Lane(0).Write(make([]byte, lc.MaxRecord())); err != nil {
+		t.Fatalf("Write(MaxRecord) = %v", err)
 	}
 }
 
@@ -128,15 +136,15 @@ func TestBlockedNextIsWokenByDoorbell(t *testing.T) {
 	ch := make(chan []byte, 1)
 	go func() {
 		buf := make([]byte, 8)
-		n, _ := dc.Lane(0).Recv(context.Background(), buf)
+		n, _ := dc.Lane(0).Read(buf)
 		ch <- buf[:n]
 	}()
 	time.Sleep(20 * time.Millisecond)
-	lc.Lane(0).Send(context.Background(), []byte("ding"))
+	lc.Lane(0).Write([]byte("ding"))
 	select {
 	case got := <-ch:
 		if string(got) != "ding" {
-			t.Fatalf("Recv = %q; want ding", got)
+			t.Fatalf("Read = %q; want ding", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("parked Next was not woken by the doorbell")
@@ -153,7 +161,10 @@ func TestBlockedReserveIsWokenByRelease(t *testing.T) {
 		tx.Commit()
 	}
 	ch := make(chan error, 1)
-	go func() { ch <- tx.Send(context.Background(), make([]byte, 4000)) }()
+	go func() {
+		_, err := tx.Write(make([]byte, 4000))
+		ch <- err
+	}()
 	time.Sleep(20 * time.Millisecond)
 	for range 2 {
 		if _, err := rx.TryNext(); err != nil {
@@ -186,14 +197,45 @@ func TestSteadyStateHotPathAllocatesNothing(t *testing.T) {
 	}
 }
 
+func TestBlockingCallsWithDataOrRoomAllocateNothing(t *testing.T) {
+	lc, dc := pair(t, Config{}, Config{})
+	tx, rx := lc.Lane(0), dc.Lane(0)
+	allocs := testing.AllocsPerRun(1000, func() {
+		p, err := tx.Reserve(64)
+		if err != nil {
+			panic(err)
+		}
+		p[0] = 1
+		tx.Commit()
+		if _, err := rx.Next(); err != nil {
+			panic(err)
+		}
+		rx.Release()
+	})
+	if allocs != 0 {
+		t.Fatalf("Reserve/Commit/Next/Release allocate %v per run; want 0", allocs)
+	}
+	msg, buf := make([]byte, 64), make([]byte, 64)
+	allocs = testing.AllocsPerRun(1000, func() {
+		if _, err := tx.Write(msg); err != nil {
+			panic(err)
+		}
+		if _, err := rx.Read(buf); err != nil {
+			panic(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("Write/Read allocate %v per run; want 0", allocs)
+	}
+}
+
 func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
-	ctx := context.Background()
 	msg := make([]byte, 64<<10)
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
 		for range records {
-			if err := lc.Lane(0).Send(ctx, msg); err != nil {
+			if _, err := lc.Lane(0).Write(msg); err != nil {
 				done <- err
 				return
 			}
@@ -202,7 +244,7 @@ func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
 	}()
 	buf := make([]byte, 64<<10)
 	for range records {
-		if _, err := dc.Lane(0).Recv(ctx, buf); err != nil {
+		if _, err := dc.Lane(0).Read(buf); err != nil {
 			tb.Fatal(err)
 		}
 	}

@@ -1,10 +1,11 @@
 package ipc
 
 import (
-	"context"
 	"io"
+	"os"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/wzshiming/ipc/internal/ring"
 )
@@ -17,17 +18,18 @@ const (
 )
 
 // spinCheckEvery is how many failed re-checks a spin makes between reads
-// of the clock, ctx and the connection's done channel.
+// of the clock, the deadline and the connection's done channel.
 const spinCheckEvery = 128
 
 // half is one direction of a lane as seen by this end: its ring access gate,
-// its doorbell signal and the doorbell it sends to the peer.
+// its doorbell signal, the doorbell it sends to the peer and its deadline.
 type half struct {
 	state atomic.Int32
 	held  bool // a Reserve or Next slice is outstanding
 	sig   chan struct{}
 	bell  doorbell
-	_     [128 - 24]byte
+	dl    deadline
+	_     [128 - 24 - unsafe.Sizeof(deadline{})]byte
 }
 
 // acquire admits one ring access; it fails once the connection is closed.
@@ -89,8 +91,11 @@ func (l *Lane) ringErr(err error) error {
 	return ErrCorrupt
 }
 
-// TryReserve returns an n-byte slice to fill and Commit, or ErrWouldBlock
-// when the lane has no room for it.
+// TryReserve returns an n-byte slice of the lane's send ring to fill and
+// then Commit or Abort, without blocking. It returns ErrWouldBlock when the
+// ring has no room for n bytes, ErrTooLarge when n exceeds MaxRecord, and
+// ErrPeerClosed or net.ErrClosed once the connection is closed. It ignores
+// the write deadline.
 func (l *Lane) TryReserve(n int) ([]byte, error) {
 	if l.tx.held {
 		return nil, errOrder
@@ -107,9 +112,14 @@ func (l *Lane) TryReserve(n int) ([]byte, error) {
 	return p, nil
 }
 
-// Reserve is TryReserve that waits for room until ctx is done or the
-// connection closes.
-func (l *Lane) Reserve(ctx context.Context, n int) ([]byte, error) {
+// Reserve is like TryReserve but blocks until the ring has room, the write
+// deadline passes or the connection closes. Past the deadline it returns
+// os.ErrDeadlineExceeded. It spins for the connection's Spin duration before
+// parking until the peer frees room.
+func (l *Lane) Reserve(n int) ([]byte, error) {
+	if l.tx.dl.expired.Load() {
+		return nil, os.ErrDeadlineExceeded
+	}
 	p, err := l.TryReserve(n)
 	if err != ErrWouldBlock {
 		return p, err
@@ -121,8 +131,11 @@ func (l *Lane) Reserve(ctx context.Context, n int) ([]byte, error) {
 				return p, err
 			}
 			if i%spinCheckEvery == 0 {
-				if err := l.c.interrupted(ctx); err != nil {
-					return nil, err
+				if l.tx.dl.expired.Load() {
+					return nil, os.ErrDeadlineExceeded
+				}
+				if isClosed(l.c.done) {
+					return nil, l.c.sendErr()
 				}
 				if !time.Now().Before(deadline) {
 					break
@@ -139,12 +152,12 @@ func (l *Lane) Reserve(ctx context.Context, n int) ([]byte, error) {
 		if !ready {
 			select {
 			case <-l.tx.sig:
-			case <-ctx.Done():
+			case <-l.tx.dl.done():
 				if l.tx.acquire(l.c) {
 					l.prod.Unpark()
 					l.tx.release(l.c)
 				}
-				return nil, ctx.Err()
+				return nil, os.ErrDeadlineExceeded
 			case <-l.c.done:
 				return nil, l.c.sendErr()
 			}
@@ -155,8 +168,9 @@ func (l *Lane) Reserve(ctx context.Context, n int) ([]byte, error) {
 	}
 }
 
-// Commit publishes the reserved record. After the connection closed it
-// returns the close reason, as the peer will not read the record.
+// Commit publishes the record reserved by Reserve or TryReserve to the peer
+// and wakes the peer if it is parked. After the connection closed it returns
+// ErrPeerClosed or net.ErrClosed, as the peer will not read the record.
 func (l *Lane) Commit() error {
 	if !l.tx.held {
 		return errOrder
@@ -172,7 +186,7 @@ func (l *Lane) Commit() error {
 	return nil
 }
 
-// Abort discards the reserved record, if any.
+// Abort discards the record reserved by Reserve or TryReserve, if any.
 func (l *Lane) Abort() {
 	if !l.tx.held {
 		return
@@ -182,9 +196,12 @@ func (l *Lane) Abort() {
 	l.tx.release(l.c)
 }
 
-// TryNext returns the next record, or ErrWouldBlock when there is none. After
-// the peer closed or died it still returns the records the peer committed,
-// then the close reason instead of ErrWouldBlock.
+// TryNext returns the next record from the lane's receive ring without
+// blocking; the slice aliases shared memory until Release. It returns
+// ErrWouldBlock when there is no record. After the peer closed it still
+// returns the records the peer committed, then io.EOF if the peer closed
+// gracefully or ErrPeerClosed if it died; after Close it returns
+// net.ErrClosed. It ignores the read deadline.
 func (l *Lane) TryNext() ([]byte, error) {
 	if l.rx.held {
 		return nil, errOrder
@@ -208,9 +225,15 @@ func (l *Lane) TryNext() ([]byte, error) {
 	return p, nil
 }
 
-// Next is TryNext that waits for a record until ctx is done or the
-// connection closes; after the peer's close it drains without waiting.
-func (l *Lane) Next(ctx context.Context) ([]byte, error) {
+// Next is like TryNext but blocks until a record arrives, the read deadline
+// passes or the connection closes. Past the deadline it returns
+// os.ErrDeadlineExceeded. After the peer closed it drains without blocking.
+// It spins for the connection's Spin duration before parking until the peer
+// commits.
+func (l *Lane) Next() ([]byte, error) {
+	if l.rx.dl.expired.Load() {
+		return nil, os.ErrDeadlineExceeded
+	}
 	p, err := l.TryNext()
 	if err != ErrWouldBlock {
 		return p, err
@@ -223,10 +246,8 @@ func (l *Lane) Next(ctx context.Context) ([]byte, error) {
 			}
 			if i%spinCheckEvery == 0 {
 				// No done check: TryNext reports the close once drained.
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				default:
+				if l.rx.dl.expired.Load() {
+					return nil, os.ErrDeadlineExceeded
 				}
 				if !time.Now().Before(deadline) {
 					break
@@ -243,12 +264,12 @@ func (l *Lane) Next(ctx context.Context) ([]byte, error) {
 		if !ready {
 			select {
 			case <-l.rx.sig:
-			case <-ctx.Done():
+			case <-l.rx.dl.done():
 				if l.rx.acquire(l.c) {
 					l.cons.Unpark()
 					l.rx.release(l.c)
 				}
-				return nil, ctx.Err()
+				return nil, os.ErrDeadlineExceeded
 			case <-l.c.done:
 			}
 		}
@@ -258,7 +279,8 @@ func (l *Lane) Next(ctx context.Context) ([]byte, error) {
 	}
 }
 
-// Release frees the record returned by Next or TryNext.
+// Release frees the record returned by Next or TryNext, making its room
+// available to the peer.
 func (l *Lane) Release() error {
 	if !l.rx.held {
 		return errOrder
@@ -275,24 +297,29 @@ func (l *Lane) Release() error {
 	return nil
 }
 
-// Send copies p into one record, waiting for room like Reserve.
-func (l *Lane) Send(ctx context.Context, p []byte) error {
+// Write sends p as one record, blocking for room like Reserve, and returns
+// len(p) on success. A p longer than MaxRecord is not sent and yields 0,
+// ErrTooLarge; an empty p sends a zero-length record.
+func (l *Lane) Write(p []byte) (int, error) {
 	if len(p) > l.c.maxRecord {
-		return ErrTooLarge
+		return 0, ErrTooLarge
 	}
-	b, err := l.Reserve(ctx, len(p))
+	b, err := l.Reserve(len(p))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	copy(b, p)
-	return l.Commit()
+	if err := l.Commit(); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
-// Recv copies the next record into p, waiting and draining like Next. A
-// record longer than p fills p, is consumed anyway and yields
-// io.ErrShortBuffer.
-func (l *Lane) Recv(ctx context.Context, p []byte) (int, error) {
-	rec, err := l.Next(ctx)
+// Read receives one record into p, blocking and draining like Next, and
+// returns its length. A record longer than p fills p, is consumed anyway and
+// yields len(p), io.ErrShortBuffer.
+func (l *Lane) Read(p []byte) (int, error) {
+	rec, err := l.Next()
 	if err != nil {
 		return 0, err
 	}
@@ -306,14 +333,27 @@ func (l *Lane) Recv(ctx context.Context, p []byte) (int, error) {
 	return n, nil
 }
 
-// interrupted returns why a spinning call must stop, or nil.
-func (c *Conn) interrupted(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.done:
-		return c.sendErr()
-	default:
-		return nil
-	}
+// SetDeadline sets both the read and the write deadline, as
+// SetReadDeadline and SetWriteDeadline do.
+func (l *Lane) SetDeadline(t time.Time) error {
+	l.rx.dl.set(t)
+	l.tx.dl.set(t)
+	return nil
+}
+
+// SetReadDeadline sets the deadline for Next and Read, including calls
+// already blocked. Past the deadline they fail with os.ErrDeadlineExceeded,
+// which is a net.Error whose Timeout method reports true; a zero t means no
+// deadline. TryNext ignores it.
+func (l *Lane) SetReadDeadline(t time.Time) error {
+	l.rx.dl.set(t)
+	return nil
+}
+
+// SetWriteDeadline sets the deadline for Reserve and Write, including calls
+// already blocked. Past the deadline they fail with os.ErrDeadlineExceeded;
+// a zero t means no deadline. TryReserve ignores it.
+func (l *Lane) SetWriteDeadline(t time.Time) error {
+	l.tx.dl.set(t)
+	return nil
 }

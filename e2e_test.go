@@ -61,14 +61,14 @@ func runChild(role, path string) error {
 	case "echo":
 		l := c.Lane(0)
 		for {
-			rec, err := l.Next(context.Background())
+			rec, err := l.Next()
 			if err == io.EOF {
 				return nil
 			}
 			if err != nil {
 				return err
 			}
-			p, err := l.Reserve(context.Background(), len(rec))
+			p, err := l.Reserve(len(rec))
 			if err != nil {
 				return err
 			}
@@ -81,7 +81,7 @@ func runChild(role, path string) error {
 			}
 		}
 	case "hang":
-		_, err := c.Lane(0).Next(context.Background())
+		_, err := c.Lane(0).Next()
 		return err
 	case "copy":
 		return runCopyChild(c)
@@ -136,13 +136,12 @@ func runStream(c *Conn, dir uint64, volume int64) error {
 }
 
 func sendStream(l *Lane, dir uint64, volume int64) error {
-	ctx := context.Background()
 	r := rand.New(rand.NewPCG(uint64(l.Index()), dir))
 	var seq uint64
 	for sent := int64(0); sent < volume; seq++ {
 		body := r.IntN(maxBody + 1)
 		off := int(seq*4099) % (len(pattern) - maxBody)
-		p, err := l.Reserve(ctx, recHdr+body)
+		p, err := l.Reserve(recHdr + body)
 		if err != nil {
 			return err
 		}
@@ -156,17 +155,16 @@ func sendStream(l *Lane, dir uint64, volume int64) error {
 		sent += int64(recHdr + body)
 	}
 	// A header-less record marks the end of the stream.
-	if _, err := l.Reserve(ctx, 0); err != nil {
+	if _, err := l.Reserve(0); err != nil {
 		return err
 	}
 	return l.Commit()
 }
 
 func recvStream(l *Lane, volume int64) error {
-	ctx := context.Background()
 	var got int64
 	for seq := uint64(0); ; seq++ {
-		rec, err := l.Next(ctx)
+		rec, err := l.Next()
 		if err != nil {
 			return err
 		}
@@ -254,10 +252,9 @@ func TestE2EFourLanesStreamDrainsAfterChildCloses(t *testing.T) {
 func TestE2EPingPong64B(t *testing.T) {
 	c, cmd := startPeer(t, "echo", Config{})
 	l := c.Lane(0)
-	ctx := context.Background()
 	start := time.Now()
 	for seq := uint64(0); seq < pingPongCount; seq++ {
-		p, err := l.Reserve(ctx, 64)
+		p, err := l.Reserve(64)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -265,7 +262,7 @@ func TestE2EPingPong64B(t *testing.T) {
 		if err := l.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		rec, err := l.Next(ctx)
+		rec, err := l.Next()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -288,7 +285,7 @@ func TestE2EKilledPeerWakesBlockedNextWithErrPeerClosed(t *testing.T) {
 	c, cmd := startPeer(t, "hang", Config{Spin: -1})
 	ch := make(chan error, 1)
 	go func() {
-		_, err := c.Lane(0).Next(context.Background())
+		_, err := c.Lane(0).Next()
 		ch <- err
 	}()
 	time.Sleep(50 * time.Millisecond)

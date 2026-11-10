@@ -288,11 +288,13 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 	if err := checkConn(o, conn); err != nil {
 		return nil, err
 	}
+	stop := time.AfterFunc(o.duration+time.Minute, func() { conn.Close() })
+	defer stop.Stop()
 	r := newReport(o, runtime.GOMAXPROCS(0))
 	if o.mode == "latency" {
-		r.Latency, err = measureLatency(ctx, conn.Lane(0), o.size, o.duration)
+		r.Latency, err = measureLatency(conn.Lane(0), o.size, o.duration)
 	} else {
-		err = r.consume(ctx, conn, o)
+		err = r.consume(conn, o)
 	}
 	if err != nil {
 		return nil, err
@@ -323,10 +325,12 @@ func runPeer(o options) error {
 	if err := checkConn(o, conn); err != nil {
 		return err
 	}
+	stop := time.AfterFunc(o.duration+time.Minute, func() { conn.Close() })
+	defer stop.Stop()
 	if o.mode == "latency" {
-		err = echo(ctx, conn.Lane(0))
+		err = echo(conn.Lane(0))
 	} else {
-		err = produceAll(ctx, conn, o)
+		err = produceAll(conn, o)
 	}
 	if err != nil {
 		select {
@@ -336,9 +340,6 @@ func runPeer(o options) error {
 			return err
 		}
 	}
-	select {
-	case <-conn.Done():
-	case <-ctx.Done():
-	}
+	<-conn.Done()
 	return nil
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/binary"
 	"fmt"
 	"runtime"
@@ -56,7 +55,7 @@ func verifyRecord(rec []byte, seq uint64) error {
 
 // produceAll runs one locked producer per lane for o.duration, then ends
 // each lane with a zero-length record.
-func produceAll(ctx context.Context, conn *ipc.Conn, o options) error {
+func produceAll(conn *ipc.Conn, o options) error {
 	var stop atomic.Bool
 	stop.Store(o.duration <= 0)
 	t := time.AfterFunc(o.duration, func() { stop.Store(true) })
@@ -69,7 +68,7 @@ func produceAll(ctx context.Context, conn *ipc.Conn, o options) error {
 			if i == 0 {
 				corrupt = o.corrupt
 			}
-			errs[i] = produce(ctx, conn.Lane(i), o.size, o.mode == "throughput", corrupt, &stop)
+			errs[i] = produce(conn.Lane(i), o.size, o.mode == "throughput", corrupt, &stop)
 		})
 	}
 	wg.Wait()
@@ -84,12 +83,12 @@ func produceAll(ctx context.Context, conn *ipc.Conn, o options) error {
 // produce sends size-byte records until stop is set. With fill, each record
 // is a copy of the template stamped with its sequence number, and record
 // corrupt gets a damaged sequence word.
-func produce(ctx context.Context, l *ipc.Lane, size int, fill bool, corrupt uint64, stop *atomic.Bool) error {
+func produce(l *ipc.Lane, size int, fill bool, corrupt uint64, stop *atomic.Bool) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	tmpl := newTemplate(size)
 	for seq := uint64(1); !stop.Load(); seq++ {
-		b, err := l.Reserve(ctx, size)
+		b, err := l.Reserve(size)
 		if err != nil {
 			return fmt.Errorf("lane %d: %w", l.Index(), err)
 		}
@@ -104,7 +103,7 @@ func produce(ctx context.Context, l *ipc.Lane, size int, fill bool, corrupt uint
 			return fmt.Errorf("lane %d: %w", l.Index(), err)
 		}
 	}
-	if _, err := l.Reserve(ctx, 0); err != nil {
+	if _, err := l.Reserve(0); err != nil {
 		return fmt.Errorf("lane %d: %w", l.Index(), err)
 	}
 	return l.Commit()
@@ -118,24 +117,29 @@ type laneStats struct {
 }
 
 // consume runs one locked consumer per lane until each lane's end
-// marker, then fills the report. The first integrity failure stops all.
-func (r *report) consume(ctx context.Context, conn *ipc.Conn, o options) error {
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
+// marker, then fills the report. The first failure closes conn to stop all.
+func (r *report) consume(conn *ipc.Conn, o options) error {
+	var (
+		once  sync.Once
+		first error
+	)
 	stats := make([]laneStats, conn.Lanes())
 	var wg sync.WaitGroup
 	for i := range conn.Lanes() {
 		wg.Go(func() {
 			var err error
-			stats[i], err = consume(ctx, conn.Lane(i), o.size, o.mode == "throughput")
+			stats[i], err = consume(conn.Lane(i), o.size, o.mode == "throughput")
 			if err != nil {
-				cancel(err)
+				once.Do(func() {
+					first = err
+					conn.Close()
+				})
 			}
 		})
 	}
 	wg.Wait()
-	if err := context.Cause(ctx); err != nil {
-		return err
+	if first != nil {
+		return first
 	}
 	r.addThroughput(stats)
 	return nil
@@ -143,12 +147,12 @@ func (r *report) consume(ctx context.Context, conn *ipc.Conn, o options) error {
 
 // consume receives records until the zero-length end marker. The window
 // starts after the first record so its bytes and setup are not counted.
-func consume(ctx context.Context, l *ipc.Lane, size int, check bool) (laneStats, error) {
+func consume(l *ipc.Lane, size int, check bool) (laneStats, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	var s laneStats
 	for seq := uint64(1); ; seq++ {
-		rec, err := l.Next(ctx)
+		rec, err := l.Next()
 		if err != nil {
 			return s, fmt.Errorf("lane %d: %w", l.Index(), err)
 		}
@@ -181,7 +185,7 @@ func consume(ctx context.Context, l *ipc.Lane, size int, check bool) (laneStats,
 
 // measureLatency sends size-byte records on l and times each echo until
 // the run ends, discarding a warm-up.
-func measureLatency(ctx context.Context, l *ipc.Lane, size int, d time.Duration) (*latency, error) {
+func measureLatency(l *ipc.Lane, size int, d time.Duration) (*latency, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	const warmup = 1000
@@ -194,10 +198,10 @@ func measureLatency(ctx context.Context, l *ipc.Lane, size int, d time.Duration)
 			break
 		}
 		binary.LittleEndian.PutUint64(msg, seq)
-		if err := l.Send(ctx, msg); err != nil {
+		if _, err := l.Write(msg); err != nil {
 			return nil, err
 		}
-		rec, err := l.Next(ctx)
+		rec, err := l.Next()
 		if err != nil {
 			return nil, err
 		}
@@ -212,10 +216,10 @@ func measureLatency(ctx context.Context, l *ipc.Lane, size int, d time.Duration)
 			samples = append(samples, elapsed(t0, nowNanos()))
 		}
 	}
-	if err := l.Send(ctx, nil); err != nil {
+	if _, err := l.Write(nil); err != nil {
 		return nil, err
 	}
-	if _, err := l.Next(ctx); err != nil {
+	if _, err := l.Next(); err != nil {
 		return nil, err
 	}
 	l.Release()
@@ -223,15 +227,15 @@ func measureLatency(ctx context.Context, l *ipc.Lane, size int, d time.Duration)
 }
 
 // echo returns every record on l until it echoes the zero-length end.
-func echo(ctx context.Context, l *ipc.Lane) error {
+func echo(l *ipc.Lane) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	for {
-		rec, err := l.Next(ctx)
+		rec, err := l.Next()
 		if err != nil {
 			return err
 		}
-		b, err := l.Reserve(ctx, len(rec))
+		b, err := l.Reserve(len(rec))
 		if err != nil {
 			return err
 		}

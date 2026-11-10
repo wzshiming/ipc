@@ -54,7 +54,7 @@ func Example() {
 	fmt.Println("lanes:", client.Lanes(), "max record:", client.MaxRecord())
 
 	tx := client.Lane(1)
-	p, err := tx.Reserve(ctx, len("hello"))
+	p, err := tx.Reserve(len("hello"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func Example() {
 	}
 
 	rx := server.Lane(1)
-	rec, err := rx.Next(ctx)
+	rec, err := rx.Next()
 	if err != nil {
 		log.Fatal(err)
 	}
