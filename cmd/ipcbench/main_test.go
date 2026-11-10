@@ -95,13 +95,13 @@ func TestCorruptRecordExitsWithCodeTwo(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("exit code %d, want 2; stderr:\n%s", code, stderr)
 	}
-	if !strings.Contains(stderr, "lane 0 record 5") {
-		t.Fatalf("stderr does not name lane 0 record 5:\n%s", stderr)
+	if !strings.Contains(stderr, "connection 0 record 5") {
+		t.Fatalf("stderr does not name connection 0 record 5:\n%s", stderr)
 	}
 }
 
 func TestThroughputJSONParsesWithPositiveRates(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "throughput", "-lanes", "2", "-size", "64KiB", "-duration", "300ms", "-json")
+	stdout, stderr, code := runBench(t, "-mode", "throughput", "-conns", "2", "-size", "64KiB", "-duration", "300ms", "-json")
 	if code != 0 {
 		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
 	}
@@ -109,15 +109,18 @@ func TestThroughputJSONParsesWithPositiveRates(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
 		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
 	}
-	if r.Mode != "throughput" || r.Lanes != 2 || r.Size != 64<<10 || len(r.PerLane) != 2 {
+	if r.Mode != "throughput" || r.Conns != 2 || r.Size != 64<<10 || len(r.PerConn) != 2 {
 		t.Fatalf("unexpected report header: %+v", r)
+	}
+	if !strings.Contains(stdout, `"conns"`) || !strings.Contains(stdout, `"per_conn"`) {
+		t.Fatalf("JSON lacks the conns and per_conn fields:\n%s", stdout)
 	}
 	if r.Aggregate == nil || r.Aggregate.GBps <= 0 || r.Aggregate.Gbps <= 0 || r.Aggregate.RecordsPerSec <= 0 {
 		t.Fatalf("aggregate rates not positive: %+v", r.Aggregate)
 	}
-	for _, l := range r.PerLane {
-		if l.GBps <= 0 {
-			t.Fatalf("lane %d rate not positive: %+v", l.Lane, l)
+	for _, c := range r.PerConn {
+		if c.GBps <= 0 {
+			t.Fatalf("connection %d rate not positive: %+v", c.Conn, c)
 		}
 	}
 }
@@ -152,14 +155,30 @@ func TestLatencyJSONReportsPercentiles(t *testing.T) {
 }
 
 func TestThroughputTextReportsRates(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "throughput", "-lanes", "2", "-size", "64KiB", "-duration", "300ms")
+	stdout, stderr, code := runBench(t, "-mode", "throughput", "-conns", "2", "-size", "64KiB", "-duration", "300ms")
 	if code != 0 {
 		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
 	}
-	for _, want := range []string{"GB/s", "Gbps", "records/s", "all"} {
+	for _, want := range []string{"conns=2", "conn", "GB/s", "Gbps", "records/s", "all"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("text report lacks %q:\n%s", want, stdout)
 		}
+	}
+}
+
+func TestRemovedFlagIsUnknown(t *testing.T) {
+	_, err := parseFlags([]string{"-lanes", "2"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "not defined") {
+		t.Fatalf("parseFlags(-lanes 2) = %v, want a flag-not-defined error", err)
+	}
+}
+
+func TestLatencyModeRequiresOneConnection(t *testing.T) {
+	if _, err := parseFlags([]string{"-mode", "latency", "-conns", "2"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("-mode latency -conns 2 was accepted")
+	}
+	if _, err := parseFlags([]string{"-mode", "latency", "-conns", "1"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("-mode latency -conns 1 was rejected: %v", err)
 	}
 }
 

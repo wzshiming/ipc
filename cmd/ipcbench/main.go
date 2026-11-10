@@ -35,7 +35,7 @@ const (
 
 type options struct {
 	mode     string
-	lanes    int
+	conns    int
 	size     int
 	ring     int
 	duration time.Duration
@@ -57,7 +57,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ipcbench:", err)
 		return exitError
 	}
-	runtime.GOMAXPROCS(max(runtime.GOMAXPROCS(0), o.lanes+2))
+	runtime.GOMAXPROCS(max(runtime.GOMAXPROCS(0), o.conns+2))
 	if o.peer {
 		if err := runPeer(o); err != nil {
 			fmt.Fprintln(stderr, "ipcbench peer:", err)
@@ -126,15 +126,15 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs := flag.NewFlagSet("ipcbench", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.StringVar(&o.mode, "mode", "throughput", "throughput, framing or latency")
-	fs.IntVar(&o.lanes, "lanes", 1, "number of lanes, each with its own producer and consumer thread")
+	fs.IntVar(&o.conns, "conns", 1, "number of connections, each with its own producer and consumer thread")
 	fs.Var((*sizeValue)(&o.size), "size", "record size in bytes, B/KiB/MiB/GiB suffixes allowed (default 1MiB for throughput, 64B otherwise)")
-	fs.Var((*sizeValue)(&o.ring), "ring", "ring size per lane direction (default 4MiB, or the power of two holding 4 records)")
+	fs.Var((*sizeValue)(&o.ring), "ring", "ring size per direction (default 4MiB, or the power of two holding 4 records)")
 	fs.DurationVar(&o.duration, "duration", 5*time.Second, "how long the peer produces")
 	fs.DurationVar(&o.spin, "spin", 0, "poll time before parking (0: library default, negative: park at once)")
 	fs.BoolVar(&o.json, "json", false, "print the report as JSON")
 	fs.StringVar(&o.path, "path", "", "control socket path (default: b.sock in a new temporary directory)")
 	fs.BoolVar(&o.peer, "peer", false, "internal: run as the dialing, producing peer")
-	fs.Uint64Var(&o.corrupt, "corrupt", 0, "internal, for tests: the peer corrupts record `N` of lane 0")
+	fs.Uint64Var(&o.corrupt, "corrupt", 0, "internal, for tests: the peer corrupts record `N` of connection 0")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -158,17 +158,17 @@ func (o *options) normalize() error {
 	default:
 		return fmt.Errorf("-mode %q: want throughput, framing or latency", o.mode)
 	}
-	if o.mode == "latency" && o.lanes != 1 {
-		return fmt.Errorf("-mode latency uses one lane, not -lanes %d", o.lanes)
+	if o.mode == "latency" && o.conns != 1 {
+		return fmt.Errorf("-mode latency uses one connection, not -conns %d", o.conns)
 	}
-	if o.lanes < 1 {
-		return fmt.Errorf("-lanes %d: want at least 1", o.lanes)
+	if o.conns < 1 {
+		return fmt.Errorf("-conns %d: want at least 1", o.conns)
 	}
 	if o.size < 8 && o.mode != "framing" {
 		return fmt.Errorf("-size %d: %s records carry an 8-byte sequence number", o.size, o.mode)
 	}
 	if o.size < 1 {
-		return fmt.Errorf("-size %d: zero-length records mark the end of a lane", o.size)
+		return fmt.Errorf("-size %d: zero-length records mark the end of the run", o.size)
 	}
 	if o.duration < 0 {
 		return fmt.Errorf("-duration %v is negative", o.duration)
@@ -194,7 +194,7 @@ func (o options) peerArgs(path string) []string {
 	return []string{
 		"-peer",
 		"-mode=" + o.mode,
-		"-lanes=" + strconv.Itoa(o.lanes),
+		"-conns=" + strconv.Itoa(o.conns),
 		"-size=" + strconv.Itoa(o.size),
 		"-ring=" + strconv.Itoa(o.ring),
 		"-duration=" + o.duration.String(),
@@ -249,7 +249,7 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 		defer os.RemoveAll(dir)
 		path = filepath.Join(dir, "b.sock")
 	}
-	lc := ipc.ListenConfig{Lanes: o.lanes, RingSize: o.ring, Spin: o.spin}
+	lc := ipc.ListenConfig{RingSize: o.ring, Spin: o.spin}
 	ln, err := lc.Listen(context.Background(), path)
 	if err != nil {
 		return nil, err
@@ -260,37 +260,23 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 		return nil, err
 	}
 	defer p.stop()
-
-	ln.SetDeadline(time.Now().Add(30 * time.Second))
-	accepted := make(chan struct{})
-	go func() {
-		select {
-		case <-p.done:
-			ln.SetDeadline(time.Unix(1, 0))
-		case <-accepted:
-		}
-	}()
-	conn, err := ln.Accept()
-	close(accepted)
+	conns, err := accept(ln, o.conns, p)
 	if err != nil {
-		select {
-		case <-p.done:
-			return nil, fmt.Errorf("peer exited before connecting: %v", p.err)
-		default:
+		return nil, err
+	}
+	defer closeAll(conns)
+	for _, c := range conns {
+		if err := checkConn(o, c); err != nil {
 			return nil, err
 		}
 	}
-	defer conn.Close()
-	if err := checkConn(o, conn); err != nil {
-		return nil, err
-	}
-	stop := time.AfterFunc(o.duration+time.Minute, func() { conn.Close() })
+	stop := time.AfterFunc(o.duration+time.Minute, func() { closeAll(conns) })
 	defer stop.Stop()
 	r := newReport(o, runtime.GOMAXPROCS(0))
 	if o.mode == "latency" {
-		r.Latency, err = measureLatency(conn.Lane(0), o.size, o.duration)
+		r.Latency, err = measureLatency(conns[0], o.size, o.duration)
 	} else {
-		err = r.consume(conn, o)
+		err = r.consume(conns, o)
 	}
 	if err != nil {
 		return nil, err
@@ -298,10 +284,45 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 	return r, nil
 }
 
+// accept takes n connections from ln, giving up once the peer has exited.
+func accept(ln *ipc.Listener, n int, p *peer) ([]*ipc.Conn, error) {
+	ln.SetDeadline(time.Now().Add(30 * time.Second))
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-p.done:
+			ln.SetDeadline(time.Unix(1, 0))
+		case <-done:
+		}
+	}()
+	conns := make([]*ipc.Conn, 0, n)
+	for len(conns) < n {
+		c, err := ln.Accept()
+		if err != nil {
+			closeAll(conns)
+			select {
+			case <-p.done:
+				return nil, fmt.Errorf("peer exited before connecting: %v", p.err)
+			default:
+				return nil, err
+			}
+		}
+		conns = append(conns, c.(*ipc.Conn))
+	}
+	return conns, nil
+}
+
+func closeAll(conns []*ipc.Conn) {
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
 // checkConn rejects a connection granted other settings than asked.
 func checkConn(o options, conn *ipc.Conn) error {
-	if conn.Lanes() != o.lanes || conn.RingSize() != o.ring {
-		return fmt.Errorf("granted %d lanes of %d-byte rings, asked %d of %d", conn.Lanes(), conn.RingSize(), o.lanes, o.ring)
+	if conn.RingSize() != o.ring {
+		return fmt.Errorf("granted %d-byte rings, asked %d", conn.RingSize(), o.ring)
 	}
 	if o.size > conn.MaxRecord() {
 		return fmt.Errorf("-size %d exceeds MaxRecord %d", o.size, conn.MaxRecord())
@@ -311,30 +332,41 @@ func checkConn(o options, conn *ipc.Conn) error {
 
 // runPeer dials, then produces or echoes until the parent closes.
 func runPeer(o options) error {
-	d := ipc.Dialer{Lanes: o.lanes, RingSize: o.ring, Spin: o.spin, Timeout: time.Minute}
-	conn, err := d.Dial(o.path)
-	if err != nil {
-		return err
+	d := ipc.Dialer{RingSize: o.ring, Spin: o.spin, Timeout: time.Minute}
+	conns := make([]*ipc.Conn, 0, o.conns)
+	defer func() { closeAll(conns) }()
+	for len(conns) < o.conns {
+		c, err := d.Dial(o.path)
+		if err != nil {
+			return err
+		}
+		conns = append(conns, c)
 	}
-	defer conn.Close()
-	if err := checkConn(o, conn); err != nil {
-		return err
-	}
-	stop := time.AfterFunc(o.duration+time.Minute, func() { conn.Close() })
-	defer stop.Stop()
-	if o.mode == "latency" {
-		err = echo(conn.Lane(0))
-	} else {
-		err = produceAll(conn, o)
-	}
-	if err != nil {
-		select {
-		case <-conn.Done():
-			return nil // the parent quit first, e.g. on an integrity failure
-		default:
+	for _, c := range conns {
+		if err := checkConn(o, c); err != nil {
 			return err
 		}
 	}
-	<-conn.Done()
+	stop := time.AfterFunc(o.duration+time.Minute, func() { closeAll(conns) })
+	defer stop.Stop()
+	var err error
+	if o.mode == "latency" {
+		err = echo(conns[0])
+	} else {
+		err = produceAll(conns, o)
+	}
+	if err != nil {
+		for _, c := range conns {
+			select {
+			case <-c.Done():
+				return nil // the parent quit first, e.g. on an integrity failure
+			default:
+			}
+		}
+		return err
+	}
+	for _, c := range conns {
+		<-c.Done()
+	}
 	return nil
 }

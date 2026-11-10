@@ -50,6 +50,6 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Throughput smoke
-        run: go run ./cmd/ipcbench -mode throughput -lanes 2 -size 64KiB -duration 1s
+        run: go run ./cmd/ipcbench -mode throughput -conns 2 -size 64KiB -duration 1s
       - name: Latency smoke
         run: go run ./cmd/ipcbench -mode latency -duration 1s

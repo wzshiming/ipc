@@ -11,7 +11,7 @@ import (
 // report is the tool's output. GB and Gbit are decimal (1e9).
 type report struct {
 	Mode       string  `json:"mode"`
-	Lanes      int     `json:"lanes"`
+	Conns      int     `json:"conns"`
 	Size       int     `json:"size"`
 	Ring       int     `json:"ring"`
 	DurationS  float64 `json:"duration_s"`
@@ -19,13 +19,13 @@ type report struct {
 	GOMAXPROCS int     `json:"gomaxprocs"`
 
 	Aggregate *rate    `json:"aggregate,omitempty"`
-	PerLane   []rate   `json:"per_lane,omitempty"`
+	PerConn   []rate   `json:"per_conn,omitempty"`
 	Latency   *latency `json:"latency,omitempty"`
 }
 
 // rate is what the consumer released over a measured window.
 type rate struct {
-	Lane          int     `json:"lane"`
+	Conn          int     `json:"conn"`
 	Records       uint64  `json:"records"`
 	Bytes         uint64  `json:"bytes"`
 	Seconds       float64 `json:"seconds"`
@@ -48,7 +48,7 @@ type latency struct {
 func newReport(o options, gomaxprocs int) *report {
 	return &report{
 		Mode:       o.mode,
-		Lanes:      o.lanes,
+		Conns:      o.conns,
 		Size:       o.size,
 		Ring:       o.ring,
 		DurationS:  o.duration.Seconds(),
@@ -57,8 +57,8 @@ func newReport(o options, gomaxprocs int) *report {
 	}
 }
 
-func newRate(lane int, records, bytes uint64, d time.Duration) rate {
-	r := rate{Lane: lane, Records: records, Bytes: bytes, Seconds: d.Seconds()}
+func newRate(conn int, records, bytes uint64, d time.Duration) rate {
+	r := rate{Conn: conn, Records: records, Bytes: bytes, Seconds: d.Seconds()}
 	if d > 0 {
 		r.GBps = float64(bytes) / d.Seconds() / 1e9
 		r.Gbps = r.GBps * 8
@@ -67,13 +67,13 @@ func newRate(lane int, records, bytes uint64, d time.Duration) rate {
 	return r
 }
 
-// addThroughput fills per-lane rates and the aggregate over the span from
-// the earliest lane start to the latest lane end.
-func (r *report) addThroughput(stats []laneStats) {
+// addThroughput fills per-connection rates and the aggregate over the span
+// from the earliest connection start to the latest connection end.
+func (r *report) addThroughput(stats []connStats) {
 	var records, bytes uint64
 	var first, last time.Time
 	for i, s := range stats {
-		r.PerLane = append(r.PerLane, newRate(i, s.records, s.bytes, s.end.Sub(s.start)))
+		r.PerConn = append(r.PerConn, newRate(i, s.records, s.bytes, s.end.Sub(s.start)))
 		if s.records == 0 {
 			continue
 		}
@@ -105,20 +105,20 @@ func (r *report) writeJSON(w io.Writer) error {
 }
 
 func (r *report) writeText(w io.Writer) error {
-	fmt.Fprintf(w, "mode=%s lanes=%d size=%d ring=%d duration=%gs spin=%v gomaxprocs=%d\n",
-		r.Mode, r.Lanes, r.Size, r.Ring, r.DurationS, time.Duration(r.SpinNS), r.GOMAXPROCS)
+	fmt.Fprintf(w, "mode=%s conns=%d size=%d ring=%d duration=%gs spin=%v gomaxprocs=%d\n",
+		r.Mode, r.Conns, r.Size, r.Ring, r.DurationS, time.Duration(r.SpinNS), r.GOMAXPROCS)
 	if l := r.Latency; l != nil {
 		_, err := fmt.Fprintf(w, "round trip: samples=%d p50=%.2fus p99=%.2fus p999=%.2fus min=%.2fus mean=%.2fus max=%.2fus\n",
 			l.Samples, l.P50, l.P99, l.P999, l.Min, l.Mean, l.Max)
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(tw, "lane\trecords\tseconds\tGB/s\tGbps\trecords/s\t")
+	fmt.Fprintln(tw, "conn\trecords\tseconds\tGB/s\tGbps\trecords/s\t")
 	row := func(name string, x rate) {
 		fmt.Fprintf(tw, "%s\t%d\t%.3f\t%.2f\t%.1f\t%.0f\t\n", name, x.Records, x.Seconds, x.GBps, x.Gbps, x.RecordsPerSec)
 	}
-	for _, x := range r.PerLane {
-		row(fmt.Sprint(x.Lane), x)
+	for _, x := range r.PerConn {
+		row(fmt.Sprint(x.Conn), x)
 	}
 	if r.Aggregate != nil {
 		row("all", *r.Aggregate)
