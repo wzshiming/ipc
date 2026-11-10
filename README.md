@@ -46,13 +46,13 @@ fmt.Println(string(reply), err) // hello, stream EOF
 
 ## Performance
 
-Measured by the CI bench job (`.github/workflows/ci.yml`) in master run [42800855346](https://github.com/wzshiming/ipc/actions/runs/42800855346); the job re-measures these on every push to master, on GitHub-hosted runners, with GOMAXPROCS 4 (3 for the macOS latency run). Throughput is `ipcbench -mode throughput -conns 2 -size 64KiB -duration 1s`, which drives each connection through `io.Copy`, that is the zero-copy `ReadFrom` and `WriteTo` (the consumer checks one word per 128 bytes in place); latency is `ipcbench -mode latency -duration 1s`, a 64-byte round trip through Write and `io.ReadFull`; producer and consumer are pinned with `runtime.LockOSThread`; GB = 10⁹ bytes. GitHub-hosted runners differ between runs, so the numbers move with the runner: the same code measured 21.53 and 32.78 GB/s on ubuntu-latest in the consecutive runs [42797638307](https://github.com/wzshiming/ipc/actions/runs/42797638307) and 42800855346.
+Measured by the CI bench job (`.github/workflows/ci.yml`) in master run [42808714536](https://github.com/wzshiming/ipc/actions/runs/42808714536): throughput at one connection with a 64 KiB record size through `io.Copy`, and the p50 of a 64 B round trip, per transport; GB = 10⁹ bytes. The summary of each bench job (one per runner) carries the full comparison (connections 1/2/4, record sizes 4 KiB to 1 MiB, `io.Copy` vs Write/Read, p99/p999) and is re-measured on every push to master on GitHub-hosted runners, whose hardware varies between runs; `go run ./cmd/ipcbench -mode compare -duration 1s` prints the same tables locally. `io.Copy` delivers ipc's records in place but copies AF_UNIX and TCP through its own 32 KiB buffer, and ipc's blocking calls spin for Spin (50 µs by default) before parking, whereas the kernel transports block in Go's netpoller.
 
-| Runner | CPU | Throughput, 2 connections aggregate | Latency p50 | p99 |
-| --- | --- | --- | --- | --- |
-| ubuntu-latest | AMD EPYC 7763 64-Core Processor, 4 CPUs | 32.78 GB/s (262.2 Gbps) | 0.33us | 0.47us |
-| macos-latest | Apple M1 (Virtual), 3 CPUs | 16.53 GB/s (132.2 Gbps) | 0.42us | 1.25us |
-| windows-latest | AMD EPYC 7763 64-Core Processor, 4 CPUs | 34.18 GB/s (273.4 Gbps) | 0.40us | 0.60us |
+| Runner | CPU | ipc GB/s | AF_UNIX GB/s | TCP GB/s | ipc p50 | AF_UNIX p50 | TCP p50 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ubuntu-latest | AMD EPYC 7763 64-Core Processor, 4 CPUs | 21.58 | 4.74 | 1.91 | 0.35 µs | 52.18 µs | 76.33 µs |
+| macos-latest | Apple M1 (Virtual), 3 CPUs | 15.29 | 0.13 | 2.11 | 0.29 µs | 44.92 µs | 93.54 µs |
+| windows-latest | AMD EPYC 7763 64-Core Processor, 4 CPUs | 21.07 | 2.46 | 2.14 | 0.40 µs | 71.40 µs | 77.60 µs |
 
 ## Platform notes and limitations
 
