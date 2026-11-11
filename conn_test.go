@@ -821,6 +821,55 @@ func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 	}
 }
 
+func TestDialFailsAWelcomeGrantingMoreThanItAskedFor(t *testing.T) {
+	path := sockPath(t)
+	cl, err := control.Listen(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	const asked, granted = 64 << 10, 1 << 20
+	seg, err := shm.Create(int(segmentSize(granted)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seg.Close()
+	mem, rs := seg.Bytes(), ring.Size(granted)
+	for k := range 2 {
+		if err := ring.Format(mem[k*rs:(k+1)*rs], granted); err != nil {
+			t.Fatal(err)
+		}
+	}
+	go func() {
+		link, err := cl.Accept()
+		if err != nil {
+			return
+		}
+		defer link.Close()
+		if _, _, fds, err := link.Recv(); err != nil {
+			return
+		} else {
+			control.CloseFDs(fds)
+		}
+		tok, err := seg.Export()
+		if err != nil {
+			return
+		}
+		payload, fds := tok.Encode()
+		link.Send(frameWelcome, welcome{ringSize: granted, token: payload}.encode(), fds)
+		tok.Close()
+		link.Recv()
+	}()
+	c, err := (&Dialer{RingSize: asked}).Dial(path)
+	if !errors.Is(err, errProtocol) {
+		if c != nil {
+			t.Errorf("RingSize = %d", c.RingSize())
+			c.Close()
+		}
+		t.Fatalf("Dial asking for %d bytes per ring = %v against a grant of %d; want the protocol violation", asked, err, granted)
+	}
+}
+
 func TestAcceptAfterListenerCloseReturnsNilConnAndNetErrClosed(t *testing.T) {
 	l, _ := listen(t, ListenConfig{})
 	ch := make(chan error, 1)

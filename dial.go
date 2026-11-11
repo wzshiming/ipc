@@ -105,6 +105,9 @@ func dialHandshake(ctx context.Context, link *control.Link, path string, ringSiz
 		return nil, errProtocol
 	}
 	w, err := decodeWelcome(p)
+	if err == nil && w.ringSize > uint64(ringSize) {
+		err = errProtocol // a grant above the request
+	}
 	if err != nil {
 		control.CloseFDs(fds)
 		return nil, err
