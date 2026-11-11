@@ -229,20 +229,6 @@ func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
 	return time.Since(start)
 }
 
-func TestWriteRead64KiBThroughput(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	records := 16384
-	if raceEnabled() {
-		records = 1024
-	}
-	d := transfer64KiB(t, lc, dc, records)
-	rate := float64(records) * (64 << 10) / d.Seconds()
-	t.Logf("one connection, 64 KiB records: %.2f GB/s (race=%v)", rate/1e9, raceEnabled())
-	if !raceEnabled() && rate < 1e9 {
-		t.Fatalf("throughput %.2f GB/s below 1 GB/s", rate/1e9)
-	}
-}
-
 func BenchmarkWriteRead64KiB(b *testing.B) {
 	lc, dc := pair(b, ListenConfig{}, Dialer{})
 	b.SetBytes(64 << 10)

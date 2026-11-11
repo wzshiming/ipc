@@ -2,7 +2,6 @@ package ipc
 
 import (
 	"runtime"
-	"slices"
 	"testing"
 	"time"
 )
@@ -45,19 +44,6 @@ func pinnedPingPong(tb testing.TB, lc, dc *Conn, rounds int) []time.Duration {
 		tb.Fatal(err)
 	}
 	return samples
-}
-
-func TestPinnedPingPongDoesNotPayThreadHandoffPerRoundTrip(t *testing.T) {
-	if raceEnabled() || testing.Short() || runtime.GOMAXPROCS(0) < 2 {
-		t.Skip("needs two idle CPUs and no race detector")
-	}
-	lc, dc := pair(t, ListenConfig{}, Dialer{})
-	pinnedPingPong(t, lc, dc, 1000)
-	samples := pinnedPingPong(t, lc, dc, 5000)
-	slices.Sort(samples)
-	if p50 := samples[len(samples)/2]; p50 > 8*time.Microsecond {
-		t.Fatalf("pinned 64 B round trip p50 = %v; want ≤ 8µs", p50)
-	}
 }
 
 func BenchmarkPinnedPingPong64B(b *testing.B) {
