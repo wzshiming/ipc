@@ -14,17 +14,22 @@ import (
 // sender writes TrySend's frames on the raw socket, so that it tries before
 // any clock runs and stops waiting once the bound has passed.
 type sender struct {
-	raw  syscall.RawConn
-	try  func(fd uintptr) bool
-	b    []byte
-	err  error
-	poll [1]unix.PollFd
+	raw   syscall.RawConn
+	try   func(fd uintptr) bool
+	b     []byte
+	err   error
+	bound time.Duration // trySendWait unless a test raised it
+	poll  [1]unix.PollFd
 }
 
 func (s *sender) init(c *net.UnixConn) {
 	s.raw, _ = c.SyscallConn()
 	s.try = s.write
+	s.bound = trySendWait
 }
+
+// setBound replaces trySendWait for a test that load must not fail.
+func (s *sender) setBound(d time.Duration) { s.bound = d }
 
 func (s *sender) close() {}
 
@@ -37,7 +42,7 @@ func (s *sender) send(b []byte) error {
 }
 
 // write writes s.b; while the socket refuses it, it waits for room until
-// trySendWait has passed since the first refusal, then tries a last time.
+// s.bound has passed since the first refusal, then tries a last time.
 func (s *sender) write(fd uintptr) bool {
 	var end time.Time
 	for {
@@ -56,7 +61,7 @@ func (s *sender) write(fd uintptr) bool {
 		}
 		now := time.Now()
 		if end.IsZero() {
-			end = now.Add(trySendWait)
+			end = now.Add(s.bound)
 		} else if !now.Before(end) {
 			s.err = ErrBusy
 			return true

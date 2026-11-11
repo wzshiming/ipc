@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -243,6 +244,56 @@ func TestTrySendToAPeerThatNeverReadsIsErrBusyWithinTheBound(t *testing.T) {
 		}
 	}
 	t.Fatal("64 MiB went into a socket nobody reads without ErrBusy")
+}
+
+func TestTrySendThatFindsTheSocketFullSucceedsOnceTheReaderDrains(t *testing.T) {
+	a, b := pair(t)
+	tx, ok := any(&a.tx).(interface{ setBound(time.Duration) })
+	if !ok {
+		t.Skipf("on %s TrySend's wait cannot be raised above a bound that load can reach", runtime.GOOS)
+	}
+	// A bound no load reaches: only the reader may end the wait.
+	tx.setBound(time.Minute)
+	// Fill the socket while nobody reads: a write that timed out after taking
+	// bytes found no room left.
+	filled := 0
+	for junk := make([]byte, 4<<20); filled == 0; {
+		a.c.SetWriteDeadline(time.Now().Add(trySendWait))
+		n, err := a.c.Write(junk)
+		if !os.IsTimeout(err) {
+			t.Fatalf("filling the socket: %d bytes, %v; want a time-out", n, err)
+		}
+		filled = n
+	}
+	a.c.SetWriteDeadline(time.Time{})
+	payload := make([]byte, MaxPayload) // more than any room a full socket has left
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	sent := make(chan error, 1)
+	go func() {
+		err := a.TrySend(1, payload)
+		if err != nil {
+			a.Close() // ends the reader's wait for the rest of the frame
+		}
+		sent <- err
+	}()
+	select {
+	case err := <-sent:
+		t.Fatalf("TrySend = %v into a full socket nobody reads; want it still waiting after %v", err, 2*trySendWait)
+	case <-time.After(2 * trySendWait):
+	}
+	b.SetReadDeadline(time.Now().Add(time.Minute))
+	if _, err := io.CopyN(io.Discard, b.c, int64(filled)); err != nil {
+		t.Fatalf("reading the %d bytes that filled the socket: %v", filled, err)
+	}
+	typ, p, _, err := b.Recv()
+	if serr := <-sent; serr != nil {
+		t.Fatalf("TrySend = %v once the reader drained; want the frame taken", serr)
+	}
+	if err != nil || typ != 1 || !bytes.Equal(p, payload) {
+		t.Fatalf("Recv = %d, %d bytes, %v; want the whole frame", typ, len(p), err)
+	}
 }
 
 func TestTrySendDelivers100000FramesInOrderToAReadingPeer(t *testing.T) {
