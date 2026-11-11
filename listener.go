@@ -172,6 +172,11 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 			return nil, true, err
 		}
 	}
+	// Wired before the dialer holds the segment, so nothing it writes there fails this end.
+	c, err = newConn(link, seg, int(ringSize), l.spin, string(l.addr), true)
+	if err != nil {
+		return nil, true, err
+	}
 	tok, err := seg.Export()
 	if err != nil {
 		return nil, true, err
@@ -183,10 +188,7 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 		return nil, false, err
 	}
 	link.SetDeadline(time.Time{})
-	c, err = newConn(link, seg, int(ringSize), l.spin, string(l.addr), true)
-	if err != nil {
-		return nil, true, err
-	}
+	c.start()
 	return c, false, nil
 }
 

@@ -135,5 +135,6 @@ func dialHandshake(ctx context.Context, link *control.Link, path string, ringSiz
 		seg.Close()
 		return nil, err
 	}
+	c.start()
 	return c, nil
 }

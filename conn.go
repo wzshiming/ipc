@@ -73,8 +73,8 @@ var (
 	_ io.WriterTo   = (*Conn)(nil)
 )
 
-// newConn wires the two rings of seg and starts the control reader. On error
-// the caller still owns link and seg.
+// newConn wires the two rings of seg; start then starts the control reader.
+// Until start, and on error, the caller still owns link and seg.
 func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Duration, path string, listener bool) (*Conn, error) {
 	c := &Conn{
 		link:       link,
@@ -114,9 +114,11 @@ func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Durat
 	c.tx.sig, c.tx.bell = make(chan struct{}, 1), doorbell{c.sendDir}
 	c.rx.sig, c.rx.bell = make(chan struct{}, 1), doorbell{recvDir}
 	c.live.Store(2)
-	go c.readLoop()
 	return c, nil
 }
+
+// start starts the control reader; the Conn owns link and seg from then on.
+func (c *Conn) start() { go c.readLoop() }
 
 func corruptErr(dir uint8, err error) error {
 	if err == nil {
