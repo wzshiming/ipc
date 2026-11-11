@@ -6,14 +6,36 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// openFDs counts the descriptors this process has open.
-func openFDs(t *testing.T) int {
+// sentFile is a file nothing else opens; frames carry its descriptor.
+type sentFile struct {
+	fd       int
+	dev, ino uint64
+}
+
+func newSentFile(t *testing.T) sentFile {
+	t.Helper()
+	f, err := os.CreateTemp("", "ipc-fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(f.Name())
+	t.Cleanup(func() { f.Close() })
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		t.Fatal(err)
+	}
+	return sentFile{int(f.Fd()), uint64(st.Dev), uint64(st.Ino)}
+}
+
+// expectOpen fails unless want of the descriptors listed in /dev/fd or
+// /proc/self/fd refer to the file.
+func (s sentFile) expectOpen(t *testing.T, want int) {
 	t.Helper()
 	dir := "/dev/fd"
 	if runtime.GOOS == "linux" {
@@ -23,35 +45,17 @@ func openFDs(t *testing.T) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return len(ents)
-}
-
-// expectOpenFDs fails unless the open descriptor count settles at want; it
-// polls because an earlier test's goroutine may still be closing a socket.
-func expectOpenFDs(t *testing.T, want int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		got := openFDs(t)
-		if got == want {
-			return
+	got := 0
+	for _, e := range ents {
+		fd, err := strconv.Atoi(e.Name())
+		var st unix.Stat_t
+		if err == nil && unix.Fstat(fd, &st) == nil && uint64(st.Dev) == s.dev && uint64(st.Ino) == s.ino {
+			got++
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d descriptors open, want %d", got, want)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-// pipeFD returns a descriptor to attach to frames, open until the test ends.
-func pipeFD(t *testing.T) int {
-	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
+	if got != want {
+		t.Fatalf("%d descriptors refer to the sent file, want %d", got, want)
 	}
-	t.Cleanup(func() { r.Close(); w.Close() })
-	return int(r.Fd())
 }
 
 func repeatFD(fd, n int) []int {
@@ -84,21 +88,20 @@ func sendFrame(t *testing.T, c *net.UnixConn, typ uint8, payload []byte, at int,
 }
 
 func TestRecvHandsFirstByteFDsToTheCallerToClose(t *testing.T) {
-	fd := pipeFD(t)
+	f := newSentFile(t)
 	a, b := pair(t)
-	before := openFDs(t)
-	sendFrame(t, b.c, 7, []byte("fd"), 0, repeatFD(fd, 3))
+	sendFrame(t, b.c, 7, []byte("fd"), 0, repeatFD(f.fd, 3))
 	typ, p, fds, err := a.Recv()
 	if err != nil || typ != 7 || string(p) != "fd" || len(fds) != 3 {
 		t.Fatalf("typ=%d payload=%q fds=%v err=%v", typ, p, fds, err)
 	}
-	expectOpenFDs(t, before+3)
+	f.expectOpen(t, 1+3)
 	CloseFDs(fds)
-	expectOpenFDs(t, before)
+	f.expectOpen(t, 1)
 }
 
 func TestRecvClosesFDsOnOtherBytesAndDeliversTheFrame(t *testing.T) {
-	fd := pipeFD(t)
+	f := newSentFile(t)
 	for _, tc := range []struct {
 		name string
 		at   int
@@ -110,26 +113,24 @@ func TestRecvClosesFDsOnOtherBytesAndDeliversTheFrame(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, b := pair(t)
-			before := openFDs(t)
-			sendFrame(t, b.c, 9, []byte("payload"), tc.at, repeatFD(fd, 4))
+			sendFrame(t, b.c, 9, []byte("payload"), tc.at, repeatFD(f.fd, 4))
 			typ, p, fds, err := a.Recv()
 			if err != nil || typ != 9 || string(p) != "payload" || len(fds) != 0 {
 				t.Fatalf("typ=%d payload=%q fds=%v err=%v", typ, p, fds, err)
 			}
-			expectOpenFDs(t, before)
+			f.expectOpen(t, 1)
 		})
 	}
 }
 
 func TestRecvOfMoreThanMaxFDsOnTheFirstByteFailsWithoutLeak(t *testing.T) {
-	fd := pipeFD(t)
+	f := newSentFile(t)
 	a, b := pair(t)
-	before := openFDs(t)
-	sendFrame(t, b.c, 1, []byte("hello"), 0, repeatFD(fd, 64))
+	sendFrame(t, b.c, 1, []byte("hello"), 0, repeatFD(f.fd, 64))
 	if _, _, fds, err := a.Recv(); err == nil {
 		t.Fatalf("Recv of 64 descriptors succeeded with %d", len(fds))
 	}
-	expectOpenFDs(t, before)
+	f.expectOpen(t, 1)
 }
 
 // rightsLimit finds the most descriptors one message can carry on this OS.
@@ -159,36 +160,33 @@ func rightsLimit(t *testing.T, fd int) int {
 }
 
 func TestRecvOfTheLargestRightsMessageLeavesNoDescriptor(t *testing.T) {
-	fd := pipeFD(t)
-	n := rightsLimit(t, fd)
+	f := newSentFile(t)
+	n := rightsLimit(t, f.fd)
 	t.Logf("one message carries at most %d descriptors on %s", n, runtime.GOOS)
 	t.Run("first byte", func(t *testing.T) {
 		a, b := pair(t)
-		before := openFDs(t)
-		sendFrame(t, b.c, 1, []byte("hello"), 0, repeatFD(fd, n))
+		sendFrame(t, b.c, 1, []byte("hello"), 0, repeatFD(f.fd, n))
 		if _, _, fds, err := a.Recv(); err == nil {
 			t.Fatalf("Recv of %d descriptors succeeded with %d", n, len(fds))
 		}
-		expectOpenFDs(t, before)
+		f.expectOpen(t, 1)
 	})
 	t.Run("second byte", func(t *testing.T) {
 		a, b := pair(t)
-		before := openFDs(t)
-		sendFrame(t, b.c, 1, []byte("hello"), 1, repeatFD(fd, n))
+		sendFrame(t, b.c, 1, []byte("hello"), 1, repeatFD(f.fd, n))
 		typ, p, fds, err := a.Recv()
 		if err != nil || typ != 1 || string(p) != "hello" || len(fds) != 0 {
 			t.Fatalf("typ=%d payload=%q fds=%v err=%v", typ, p, fds, err)
 		}
-		expectOpenFDs(t, before)
+		f.expectOpen(t, 1)
 	})
 }
 
 func TestRecvDeliversFiftyFramesInOrderClosingSecondByteFDs(t *testing.T) {
-	fd := pipeFD(t)
+	f := newSentFile(t)
 	a, b := pair(t)
-	before := openFDs(t)
 	for i := range 50 {
-		sendFrame(t, b.c, 4, []byte{byte(i)}, 1, repeatFD(fd, 8))
+		sendFrame(t, b.c, 4, []byte{byte(i)}, 1, repeatFD(f.fd, 8))
 	}
 	for i := range 50 {
 		typ, p, fds, err := a.Recv()
@@ -196,7 +194,7 @@ func TestRecvDeliversFiftyFramesInOrderClosingSecondByteFDs(t *testing.T) {
 			t.Fatalf("frame %d: typ=%d payload=%v fds=%v err=%v", i, typ, p, fds, err)
 		}
 	}
-	expectOpenFDs(t, before)
+	f.expectOpen(t, 1)
 }
 
 func recvOneFD(t *testing.T, w *os.File) int {
