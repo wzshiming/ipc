@@ -259,6 +259,34 @@ func TestEchoEndsAtPeerClose(t *testing.T) {
 	}
 }
 
+// The -duration window opens when the warm-up ends: a transport whose
+// warm-up alone outlasts the window still has round trips measured.
+func TestLatencyWarmUpOutlastingTheDurationStillYieldsSamples(t *testing.T) {
+	const size, d = 64, time.Millisecond
+	parent, peer := net.Pipe()
+	parent.SetDeadline(time.Now().Add(10 * time.Second))
+	peer.SetDeadline(time.Now().Add(10 * time.Second))
+	go func() {
+		rec := make([]byte, size)
+		if _, err := io.ReadFull(peer, rec); err != nil {
+			return
+		}
+		time.Sleep(10 * d) // the first warm-up round trip outlasts the window
+		if _, err := peer.Write(rec); err != nil {
+			return
+		}
+		echo(peer, size)
+	}()
+	l, err := measureLatency(parent, size, d)
+	parent.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Samples == 0 {
+		t.Fatalf("a warm-up longer than the %v window left %d samples, want at least 1", d, l.Samples)
+	}
+}
+
 // Chunk 5 of 4 KiB starts at stream offset 16384, whose stamp word the
 // flipped first byte damages.
 func TestCorruptChunkExitsWithCodeTwo(t *testing.T) {
