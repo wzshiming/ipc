@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -720,6 +721,186 @@ func TestCloseRacingReadAndWriteToOverAPartlyConsumedRecordAlwaysUnmaps(t *testi
 		}
 		lc.Close()
 	}
+}
+
+// stallReadFrom starts c.ReadFrom over a stallReader and returns once
+// ReadFrom is inside the stalled Read, which returns when the test ends.
+func stallReadFrom(t *testing.T, c *Conn) {
+	t.Helper()
+	src := &stallReader{stalled: make(chan struct{}), resume: make(chan struct{}), rest: strings.NewReader("")}
+	resumeAtCleanup(t, src.resume)
+	go c.ReadFrom(src)
+	<-src.stalled
+}
+
+// stallWriteTo has peer send rec, starts c.WriteTo into a stallWriter taking
+// at most max bytes per Write, and returns the writer's resume once WriteTo
+// is inside its first Write; resume is closed when the test ends at the
+// latest.
+func stallWriteTo(t *testing.T, peer, c *Conn, rec string, max int) chan struct{} {
+	t.Helper()
+	if _, err := peer.Write([]byte(rec)); err != nil {
+		t.Fatal(err)
+	}
+	dst := &stallWriter{stalled: make(chan struct{}), resume: make(chan struct{}), max: max}
+	resumeAtCleanup(t, dst.resume)
+	go c.WriteTo(dst)
+	<-dst.stalled
+	return dst.resume
+}
+
+// goWrite runs c.Write(p) in the background and returns its error's channel.
+func goWrite(c *Conn, p []byte) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		_, err := c.Write(p)
+		ch <- err
+	}()
+	return ch
+}
+
+// readResult is what a Read returned.
+type readResult struct {
+	data string
+	err  error
+}
+
+// goRead runs c.Read into an 8-byte buffer in the background and returns its
+// result's channel.
+func goRead(c *Conn) <-chan readResult {
+	ch := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, 8)
+		n, err := c.Read(buf)
+		ch <- readResult{string(buf[:n]), err}
+	}()
+	return ch
+}
+
+// waitRead fails t unless a Read result arrives on ch within d.
+func waitRead(t *testing.T, ch <-chan readResult, d time.Duration) readResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(d):
+		t.Fatalf("queued Read did not return within %v", d)
+		return readResult{}
+	}
+}
+
+func TestWriteQueuedBehindReadFromInItsSourceFailsAtItsDeadline(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	stallReadFrom(t, dc)
+	ch := goWrite(dc, []byte("x"))
+	time.Sleep(20 * time.Millisecond)
+	dc.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+	if err := waitErr(t, ch, time.Second); err != os.ErrDeadlineExceeded {
+		t.Fatalf("Write queued behind ReadFrom = %v; want os.ErrDeadlineExceeded", err)
+	}
+}
+
+func TestWriteQueuedBehindReadFromInItsSourceFailsWithNetErrClosedOnClose(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	stallReadFrom(t, dc)
+	ch := goWrite(dc, []byte("x"))
+	time.Sleep(20 * time.Millisecond)
+	closeWithin(t, dc, time.Second, "ReadFrom was inside its source's Read")
+	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+		t.Fatalf("Write queued behind ReadFrom = %v; want net.ErrClosed", err)
+	}
+}
+
+func TestWriteQueuedBehindReadFromInItsSourceFailsAtOnceWithErrPeerClosed(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	stallReadFrom(t, dc)
+	ch := goWrite(dc, []byte("x"))
+	time.Sleep(20 * time.Millisecond)
+	lc.Close()
+	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("Write queued behind ReadFrom = %v; want ErrPeerClosed", err)
+	}
+}
+
+func TestReadQueuedBehindWriteToInItsDestinationFailsAtItsDeadline(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	stallWriteTo(t, lc, dc, "record", 1<<30)
+	ch := goRead(dc)
+	time.Sleep(20 * time.Millisecond)
+	dc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if r := waitRead(t, ch, time.Second); r.err != os.ErrDeadlineExceeded {
+		t.Fatalf("Read queued behind WriteTo = %q, %v; want os.ErrDeadlineExceeded", r.data, r.err)
+	}
+}
+
+func TestReadQueuedBehindWriteToInItsDestinationFailsWithNetErrClosedOnClose(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	stallWriteTo(t, lc, dc, "record", 1<<30)
+	ch := goRead(dc)
+	time.Sleep(20 * time.Millisecond)
+	closeWithin(t, dc, time.Second, "WriteTo was inside its destination's Write")
+	if r := waitRead(t, ch, time.Second); r.err != net.ErrClosed {
+		t.Fatalf("Read queued behind WriteTo = %q, %v; want net.ErrClosed", r.data, r.err)
+	}
+}
+
+func TestReadQueuedBehindWriteToKeepsItsPlaceAfterThePeerCloses(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	resume := stallWriteTo(t, lc, dc, "abcdef", 3)
+	ch := goRead(dc)
+	time.Sleep(20 * time.Millisecond)
+	lc.Close()
+	<-dc.Done()
+	select {
+	case r := <-ch:
+		t.Fatalf("Read queued behind WriteTo = %q, %v at the peer's close; want it to wait, as the stream can still be drained", r.data, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(resume)
+	if r := waitRead(t, ch, time.Second); r.err != nil || r.data != "def" {
+		t.Fatalf("Read queued behind WriteTo = %q, %v; want def, the rest WriteTo left", r.data, r.err)
+	}
+}
+
+func TestGateAdmitsOneCallAtATimeWhileWaitersGiveUp(t *testing.T) {
+	g := gate{baton: make(chan struct{}, 1)}
+	var inside, overlaps, taken, gaveUp atomic.Int64
+	// Holds and deadlines of a few microseconds make a waiter's deadline
+	// often pass just as the holder hands the gate over.
+	const workers = 3
+	done := make(chan error, workers)
+	for w := range workers {
+		go func() {
+			rng := rand.New(rand.NewPCG(uint64(w), 1))
+			for range 5000 {
+				var dl deadline
+				dl.set(time.Now().Add(time.Duration(rng.IntN(10)) * time.Microsecond))
+				if !g.lock(nil, &dl) {
+					gaveUp.Add(1)
+					continue
+				}
+				if inside.Add(1) != 1 {
+					overlaps.Add(1)
+				}
+				for until := time.Now().Add(time.Duration(rng.IntN(10)) * time.Microsecond); time.Now().Before(until); {
+				}
+				inside.Add(-1)
+				taken.Add(1)
+				g.unlock()
+			}
+			done <- nil
+		}()
+	}
+	for range workers {
+		waitErr(t, done, 10*time.Second)
+	}
+	if overlaps.Load() > 0 {
+		t.Fatalf("%d times two calls held the gate at once", overlaps.Load())
+	}
+	if n := g.n.Load(); n != 0 || len(g.baton) != 0 {
+		t.Fatalf("gate left with %d calls counted and %d batons; want it free", n, len(g.baton))
+	}
+	t.Logf("%d calls took the gate, %d gave up", taken.Load(), gaveUp.Load())
 }
 
 func TestPeerCrashFailsReadFromAndEndsWriteToWithErrPeerClosed(t *testing.T) {

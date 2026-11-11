@@ -51,18 +51,19 @@ type Conn struct {
 	closeOnce  sync.Once
 	rxOnce     sync.Once
 	done       chan struct{}
-	err        error       // written once before done is closed
-	closed     atomic.Bool // Close was called on this end
-	bye        atomic.Bool // the peer said goodbye
+	rxClosed   chan struct{} // closed when receives end: at Close or a failure, not the peer's close
+	err        error         // written once before done is closed
+	closed     atomic.Bool   // Close was called on this end
+	bye        atomic.Bool   // the peer said goodbye
 	readerDone chan struct{}
 	live       atomic.Int32 // halves that may still touch the segment
 	unmapped   atomic.Bool  // test hook: the segment has been released
 
-	wmu sync.Mutex // serializes Write and ReadFrom
-	tx  half
-	rx  half
-	rmu sync.Mutex // serializes Read and WriteTo
-	rec []byte     // unread rest of the record Read or WriteTo holds
+	wgate gate // serializes Write and ReadFrom
+	tx    half
+	rx    half
+	rgate gate   // serializes Read and WriteTo
+	rec   []byte // unread rest of the record Read or WriteTo holds
 }
 
 var (
@@ -83,7 +84,10 @@ func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Durat
 		addr:       addr(path),
 		sendDir:    dirDialerToListener,
 		done:       make(chan struct{}),
+		rxClosed:   make(chan struct{}),
 		readerDone: make(chan struct{}),
+		wgate:      gate{baton: make(chan struct{}, 1)},
+		rgate:      gate{baton: make(chan struct{}, 1)},
 	}
 	if listener {
 		c.sendDir = dirListenerToDialer
@@ -165,7 +169,10 @@ func (c *Conn) readLoop() {
 // released when no slice is outstanding.
 func (c *Conn) shutdown(err error) {
 	c.peerGone(err)
-	c.rxOnce.Do(func() { c.rx.close(c) })
+	c.rxOnce.Do(func() {
+		c.rx.close(c)
+		close(c.rxClosed)
+	})
 }
 
 // peerGone closes the connection like shutdown but leaves the receive half
@@ -289,9 +296,9 @@ func (c *Conn) Close() error {
 	c.closed.Store(true)
 	c.shutdown(net.ErrClosed)
 	<-c.readerDone
-	if c.rmu.TryLock() {
+	if c.rgate.tryLock() {
 		c.drop()
-		c.rmu.Unlock()
+		c.rgate.unlock()
 	}
 	return nil
 }
