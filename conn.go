@@ -199,13 +199,12 @@ func (c *Conn) halfDone() {
 	}
 }
 
-// ring sends a doorbell for a peer parked on the ring bell names.
-func (c *Conn) ring(bell *doorbell) error {
+// ring sends a doorbell for a peer parked on the ring bell names; a failure
+// closes the connection.
+func (c *Conn) ring(bell *doorbell) {
 	if err := c.link.Send(frameDoorbell, bell[:], nil); err != nil {
 		c.peerGone(peerErr(err))
-		return c.sendErr()
 	}
-	return nil
 }
 
 // sendErr is what sends return once the connection is closed.
