@@ -299,6 +299,64 @@ func TestReadIsEOFAfterTheGracefulPeerCloseDuringContinuousSends(t *testing.T) {
 	}
 }
 
+func TestReadIsEOFWhenADoorbellFailsBeforeTheReaderReadsThePeersGoodbye(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("on %s it is unknown whether a doorbell to a peer that closed fails while its goodbye stays readable", runtime.GOOS)
+	}
+	// With one P the control reader does not run between the peer's close and
+	// this end's doorbell, so the doorbell is what notices the close.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for name, bellUnread := range map[string]bool{"nothing unread": false, "a doorbell unread": true} {
+		t.Run(name, func(t *testing.T) {
+			const ringSize, rounds = 64 << 10, 200
+			bye := []byte{frameBye, 0, 0, 0, 0}
+			failed, wrong := 0, 0
+			for i := range rounds {
+				c, sock, mem := rawPeer(t, ringSize)
+				parked := consumerParked(mem, ringSize, dirListenerToDialer)
+				if bellUnread {
+					atomic.StoreUint32(parked, 1)
+					if _, err := c.Write([]byte("w")); err != nil {
+						t.Fatalf("round %d: Write before the peer's close = %v", i, err)
+					}
+				}
+				// The peer parks, says goodbye and closes its socket at once, as a
+				// process exiting right after Close does.
+				atomic.StoreUint32(parked, 1)
+				if _, err := sock.Write(bye); err != nil {
+					t.Fatal(err)
+				}
+				sock.Close()
+				_, werr := c.Write([]byte("x"))
+				select {
+				case <-c.Done():
+				case <-time.After(time.Minute):
+					t.Fatalf("round %d: the connection still open a minute after the peer's close; Write = %v", i, werr)
+				}
+				if c.unsettled {
+					failed++
+				}
+				c.SetReadDeadline(time.Now().Add(time.Minute))
+				_, rerr := c.Read(make([]byte, 8))
+				_, aerr := c.Write([]byte("y"))
+				if werr != nil && !errors.Is(werr, ErrPeerClosed) || rerr != io.EOF || !errors.Is(aerr, ErrPeerClosed) {
+					if wrong++; wrong <= 3 {
+						t.Errorf("round %d (a failed doorbell noticed the close: %v): Write = %v, Read = %v, Write = %v; want nil or ErrPeerClosed, io.EOF, ErrPeerClosed", i, c.unsettled, werr, rerr, aerr)
+					}
+				}
+				c.Close()
+			}
+			t.Logf("in %d of %d rounds a failed doorbell noticed the close first", failed, rounds)
+			if wrong > 0 {
+				t.Errorf("%d of %d rounds wrong", wrong, rounds)
+			}
+			if failed == 0 {
+				t.Errorf("in none of %d rounds did a failed doorbell notice the close before the goodbye was read", rounds)
+			}
+		})
+	}
+}
+
 // halfClosedPeer returns a Conn whose peer shut only its receiving side, so
 // that a doorbell fails while the link stays open, after such a doorbell.
 // It skips the test where that doorbell does not fail.
@@ -377,6 +435,25 @@ func TestCommitAfterLocalClosePublishesNothing(t *testing.T) {
 	dc.Close()
 	if err := dc.Commit(); err != net.ErrClosed {
 		t.Fatalf("Commit after Close = %v; want net.ErrClosed", err)
+	}
+	<-lc.Done()
+	if rec, err := lc.TryNext(); err != io.EOF {
+		t.Fatalf("the peer's TryNext = %q, %v; want io.EOF, no record", rec, err)
+	}
+}
+
+// closingSource closes c, then returns bytes as if it had read them before.
+type closingSource struct{ c *Conn }
+
+func (s closingSource) Read(p []byte) (int, error) {
+	s.c.Close()
+	return copy(p, "ghost"), nil
+}
+
+func TestReadFromPublishesNoneOfWhatItsSourceReturnsAfterClose(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if n, err := dc.ReadFrom(closingSource{dc}); n != 0 || err != net.ErrClosed {
+		t.Errorf("ReadFrom = %d, %v; want 0, net.ErrClosed", n, err)
 	}
 	<-lc.Done()
 	if rec, err := lc.TryNext(); err != io.EOF {
