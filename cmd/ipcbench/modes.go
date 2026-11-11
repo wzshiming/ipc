@@ -280,17 +280,20 @@ func readMessages(c net.Conn, s *sink, size int) error {
 	}
 }
 
-// measureLatency writes size-byte records on c and times each echo until
-// the run ends, discarding a warm-up.
+// measureLatency writes size-byte records on c and times each echo for d
+// after a warm-up, whose round trips are discarded.
 func measureLatency(c net.Conn, size int, d time.Duration) (*latency, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	const warmup = 1000
 	msg, reply := newTemplate(size), make([]byte, size)
 	samples := make([]time.Duration, 0, 1<<20)
-	start := nowNanos()
+	var start int64
 	for seq := uint64(1); ; seq++ {
 		t0 := nowNanos()
+		if seq == warmup+1 {
+			start = t0 // the window opens when the warm-up ends
+		}
 		if seq > warmup && elapsed(start, t0) >= d {
 			break
 		}
