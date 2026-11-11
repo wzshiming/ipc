@@ -866,7 +866,7 @@ func TestGateAdmitsOneCallAtATimeWhileWaitersGiveUp(t *testing.T) {
 	g := gate{baton: make(chan struct{}, 1)}
 	var inside, overlaps, taken, gaveUp atomic.Int64
 	// Holds and deadlines of a few microseconds make a waiter's deadline
-	// often pass just as the holder hands the gate over.
+	// often pass just as the holder leaving wakes it.
 	const workers = 3
 	done := make(chan error, workers)
 	for w := range workers {
@@ -897,10 +897,108 @@ func TestGateAdmitsOneCallAtATimeWhileWaitersGiveUp(t *testing.T) {
 	if overlaps.Load() > 0 {
 		t.Fatalf("%d times two calls held the gate at once", overlaps.Load())
 	}
-	if n := g.n.Load(); n != 0 || len(g.baton) != 0 {
-		t.Fatalf("gate left with %d calls counted and %d batons; want it free", n, len(g.baton))
+	if !gateIdle(&g) {
+		t.Fatalf("gate left with state %#x and %d wake-ups; want it free", g.state.Load(), len(g.baton))
 	}
 	t.Logf("%d calls took the gate, %d gave up", taken.Load(), gaveUp.Load())
+}
+
+// gateIdle reports whether no call holds or waits for g, with a wake-up left
+// only for a woken call that has yet to contend, as when every waiting call
+// gave up.
+func gateIdle(g *gate) bool {
+	s := g.state.Load()
+	return s&^gateWoken == 0 && int64(len(g.baton)) == s&gateWoken>>1
+}
+
+func TestGateServesEveryWaitingCallOneAtATimeUnderStress(t *testing.T) {
+	g := gate{baton: make(chan struct{}, 1)}
+	var inside, taken, gaveUp atomic.Int64
+	const workers = 8
+	seed := uint64(time.Now().UnixNano())
+	// Every round ends with no call left: a waiting call nobody woke hangs it.
+	rounds := 0
+	for end := time.Now().Add(2 * time.Second); time.Now().Before(end); rounds++ {
+		errs := make(chan error, workers)
+		for w := range workers {
+			rng := rand.New(rand.NewPCG(seed, uint64(rounds*workers+w)))
+			go func() {
+				for range 1 + rng.IntN(64) {
+					var dl deadline
+					if rng.IntN(2) == 0 {
+						dl.set(time.Now().Add(time.Duration(rng.IntN(50)) * time.Microsecond))
+					}
+					if !g.lock(nil, &dl) {
+						if !dl.expired.Load() {
+							errs <- errors.New("a call gave up before its deadline passed")
+							return
+						}
+						gaveUp.Add(1)
+						continue
+					}
+					if inside.Add(1) != 1 {
+						errs <- errors.New("two calls held the gate at once")
+						return
+					}
+					for until := time.Now().Add(time.Duration(rng.IntN(20)) * time.Microsecond); time.Now().Before(until); {
+					}
+					inside.Add(-1)
+					taken.Add(1)
+					g.unlock()
+				}
+				errs <- nil
+			}()
+		}
+		for range workers {
+			if err := waitErr(t, errs, time.Minute); err != nil {
+				t.Fatalf("round %d (seed %d): %v", rounds, seed, err)
+			}
+		}
+		if !gateIdle(&g) {
+			t.Fatalf("round %d (seed %d): gate left with state %#x and %d wake-ups after every call returned", rounds, seed, g.state.Load(), len(g.baton))
+		}
+	}
+	t.Logf("%d rounds: %d calls took the gate, %d gave up", rounds, taken.Load(), gaveUp.Load())
+}
+
+// BenchmarkContendedWrite64B has 1, 2 or 4 goroutines Write 64 B in a tight
+// loop on one connection, b.N Writes in all, while one reader drains it.
+func BenchmarkContendedWrite64B(b *testing.B) {
+	for _, writers := range []int{1, 2, 4} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			lc, dc := pair(b, ListenConfig{}, Dialer{})
+			drained := make(chan error, 1)
+			go func() {
+				_, err := io.Copy(io.Discard, lc)
+				drained <- err
+			}()
+			msg := make([]byte, 64)
+			per := (b.N + writers - 1) / writers
+			errs := make(chan error, writers)
+			b.ResetTimer()
+			for range writers {
+				go func() {
+					for range per {
+						if _, err := dc.Write(msg); err != nil {
+							errs <- err
+							return
+						}
+					}
+					errs <- nil
+				}()
+			}
+			for range writers {
+				if err := <-errs; err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			dc.Close()
+			if err := <-drained; err != nil {
+				b.Fatal(err)
+			}
+		})
+	}
 }
 
 func TestPeerCrashFailsReadFromAndEndsWriteToWithErrPeerClosed(t *testing.T) {
