@@ -17,10 +17,17 @@ import (
 // Listener accepts control links on an AF_UNIX socket path.
 type Listener struct {
 	l *net.UnixListener
+
+	mu   sync.Mutex
+	path string
+	file os.FileInfo // the socket file Listen made at path, until Close
+	lock *pathLock   // held until Close; nil where none is taken
 }
 
-// Listen listens on the AF_UNIX socket at path. A socket file left behind by
-// a dead listener is removed; a live one fails with EADDRINUSE. On Linux a
+// Listen listens on the AF_UNIX socket at path. On darwin, linux and windows
+// it holds the lock file path+".lock" until Close, so that one Listener at a
+// time owns path. A socket file left behind by a dead listener is replaced;
+// another Listener or a live server on path fails with EADDRINUSE. On Linux a
 // path starting with @ is an abstract name, which has no file. ctx bounds
 // the setup, including the probe of an existing socket file.
 func Listen(ctx context.Context, path string) (*Listener, error) {
@@ -35,6 +42,21 @@ func Listen(ctx context.Context, path string) (*Listener, error) {
 		}
 		return &Listener{l: l}, nil
 	}
+	lock, err := lockPath(path)
+	if err != nil {
+		return nil, &net.OpError{Op: "listen", Net: "unix", Addr: addr, Err: err}
+	}
+	l, file, err := bind(ctx, path, addr)
+	if err != nil {
+		lock.unlock()
+		return nil, err
+	}
+	return &Listener{l: l, path: path, file: file, lock: lock}, nil
+}
+
+// bind listens on path, replacing a socket file nobody listens on, and
+// returns the socket file it made. The caller holds the path's lock.
+func bind(ctx context.Context, path string, addr *net.UnixAddr) (*net.UnixListener, os.FileInfo, error) {
 	l, err := net.ListenUnix("unix", addr)
 	if err != nil && isStale(ctx, path) {
 		if rerr := os.Remove(path); rerr == nil || os.IsNotExist(rerr) {
@@ -43,17 +65,23 @@ func Listen(ctx context.Context, path string) (*Listener, error) {
 	}
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
-			return nil, cerr
+			return nil, nil, cerr
 		}
-		return nil, unsupportedErr(err)
+		return nil, nil, unsupportedErr(err)
 	}
 	if runtime.GOOS != "windows" {
-		if err := os.Chmod(path, 0o600); err != nil {
-			l.Close()
-			return nil, err
-		}
+		err = os.Chmod(path, 0o600)
 	}
-	return &Listener{l: l}, nil
+	var file os.FileInfo
+	if err == nil {
+		file, err = os.Lstat(path)
+	}
+	if err != nil {
+		l.Close()
+		return nil, nil, err
+	}
+	keepSocketFile(l)
+	return l, file, nil
 }
 
 // isStale reports whether path is a socket file nobody is listening on.
@@ -80,8 +108,24 @@ func (l *Listener) Accept() (*Link, error) {
 	return newLink(c), nil
 }
 
-// Close stops listening and removes the socket file.
-func (l *Listener) Close() error { return l.l.Close() }
+// Close stops listening and removes the socket file if it is still the one
+// Listen made, then gives path up; the lock file goes too on darwin and
+// linux, and stays on windows.
+func (l *Listener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		// Checked while the socket is open, which keeps its file's inode from reuse.
+		if fi, err := os.Lstat(l.path); err == nil && os.SameFile(fi, l.file) {
+			os.Remove(l.path)
+		}
+		l.file = nil
+	}
+	err := l.l.Close()
+	l.lock.unlock()
+	l.lock = nil
+	return err
+}
 
 // Addr returns the listener's address.
 func (l *Listener) Addr() net.Addr { return l.l.Addr() }
