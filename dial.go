@@ -99,15 +99,15 @@ func dialHandshake(ctx context.Context, link *control.Link, path string, ringSiz
 	switch typ {
 	case frameWelcome:
 	case frameReject:
-		discardFDs(fds)
+		control.CloseFDs(fds)
 		return nil, fmt.Errorf("%w: %q", ErrRejected, p)
 	default:
-		discardFDs(fds)
+		control.CloseFDs(fds)
 		return nil, errProtocol
 	}
 	w, err := decodeWelcome(p)
 	if err != nil {
-		discardFDs(fds)
+		control.CloseFDs(fds)
 		return nil, err
 	}
 	tok, err := shm.DecodeToken(w.token, fds)

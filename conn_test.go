@@ -687,7 +687,7 @@ func rawHello(t *testing.T, path string, payload []byte) (typ uint8, answer []by
 	if err != nil {
 		t.Fatal(err)
 	}
-	discardFDs(fds)
+	control.CloseFDs(fds)
 	if _, _, _, err := link.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("Recv after Reject = %v; want io.EOF (listener closes the link)", err)
 	}
@@ -721,6 +721,45 @@ func TestListenerRefusesVersionOneHelloAsUnsupportedVersion(t *testing.T) {
 	typ, reason := rawHello(t, path, v1)
 	if typ != frameReject || string(reason) != "unsupported protocol version" {
 		t.Fatalf("frame type %d (%q); want Reject %d (%q)", typ, reason, frameReject, "unsupported protocol version")
+	}
+}
+
+func TestListenerClosesTheDescriptorsAHelloCarries(t *testing.T) {
+	if openFDs(t) < 0 {
+		t.Skipf("descriptors cannot be counted on %s", runtime.GOOS)
+	}
+	l, path := listen(t, ListenConfig{})
+	acceptOne(t, l)
+	before := openFDs(t)
+	link, err := control.Dial(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer link.Close()
+	var files []*os.File
+	var fds []int
+	for range 8 {
+		f, err := os.Open(os.DevNull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		files = append(files, f)
+		fds = append(fds, int(f.Fd()))
+	}
+	if err := link.Send(frameHello, hello{version: protoVersion, ringSize: minRingSize}.encode(), fds); err != nil {
+		t.Fatal(err)
+	}
+	link.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, _, _, err := link.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("Recv after a Hello carrying descriptors = %v; want io.EOF (the listener drops the dialer)", err)
+	}
+	link.Close()
+	for _, f := range files {
+		f.Close()
+	}
+	if n := openFDs(t); n > before {
+		t.Fatalf("%d descriptors open once the listener dropped the dialer, %d before; want the %d it received closed", n, before, len(fds))
 	}
 }
 
@@ -762,7 +801,7 @@ func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 		if _, _, fds, err := link.Recv(); err != nil {
 			return
 		} else {
-			discardFDs(fds)
+			control.CloseFDs(fds)
 		}
 		tok, err := seg.Export()
 		if err != nil {

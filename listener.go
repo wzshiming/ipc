@@ -147,7 +147,7 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 	if err != nil {
 		return nil, false, err
 	}
-	discardFDs(fds)
+	control.CloseFDs(fds)
 	if typ != frameHello || len(fds) > 0 {
 		return nil, false, errProtocol
 	}
