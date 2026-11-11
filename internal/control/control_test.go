@@ -1,10 +1,12 @@
 package control
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -180,6 +182,174 @@ func TestSendRejectsOversizePayload(t *testing.T) {
 	err := a.Send(1, make([]byte, MaxPayload+1), nil)
 	if !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("got %v, want ErrPayloadTooLarge", err)
+	}
+}
+
+// readFrames parses n frames from c's raw stream, in large reads so that the
+// reader keeps ahead of any sender.
+func readFrames(c net.Conn, n int, check func(typ uint8, p []byte) error) error {
+	r := bufio.NewReaderSize(c, 64<<10)
+	var h [headerSize]byte
+	p := make([]byte, MaxPayload)
+	for range n {
+		if _, err := io.ReadFull(r, h[:]); err != nil {
+			return err
+		}
+		m, err := length(h[1:])
+		if err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(r, p[:m]); err != nil {
+			return err
+		}
+		if err := check(h[0], p[:m]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestTrySendToAPeerThatNeverReadsIsErrBusyWithinTheBound(t *testing.T) {
+	const bound, slack = 50 * time.Millisecond, 450 * time.Millisecond
+	a, _ := pair(t)
+	payload := make([]byte, 16<<10)
+	for i := range 1 << 12 {
+		start := time.Now()
+		err := a.TrySend(1, payload)
+		d := time.Since(start)
+		if d > bound+slack {
+			t.Fatalf("TrySend %d took %v, want at most %v", i, d, bound+slack)
+		}
+		if errors.Is(err, ErrBusy) {
+			if d < bound {
+				t.Fatalf("TrySend %d gave up after %v, want %v of waiting for room", i, d, bound)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("TrySend %d: %v", i, err)
+		}
+	}
+	t.Fatal("64 MiB went into a socket nobody reads without ErrBusy")
+}
+
+func TestTrySendDelivers100000FramesInOrderToAReadingPeer(t *testing.T) {
+	a, b := pair(t)
+	const n = 100000
+	errc := make(chan error, 1)
+	go func() {
+		var buf [8]byte
+		for i := range n {
+			binary.LittleEndian.PutUint32(buf[:], uint32(i))
+			binary.LittleEndian.PutUint32(buf[4:], ^uint32(i))
+			if err := a.TrySend(uint8(i), buf[:i%9]); err != nil {
+				a.Close()
+				errc <- fmt.Errorf("TrySend %d: %w", i, err)
+				return
+			}
+		}
+		errc <- nil
+	}()
+	var want [8]byte
+	i := 0
+	err := readFrames(b.c, n, func(typ uint8, p []byte) error {
+		binary.LittleEndian.PutUint32(want[:], uint32(i))
+		binary.LittleEndian.PutUint32(want[4:], ^uint32(i))
+		if typ != uint8(i) || !bytes.Equal(p, want[:i%9]) {
+			return fmt.Errorf("frame %d: typ=%d payload=%x", i, typ, p)
+		}
+		i++
+		return nil
+	})
+	if serr := <-errc; err != nil || serr != nil {
+		t.Fatalf("read: %v; send: %v", err, serr)
+	}
+}
+
+func TestTrySendInterleavedWithSendKeepsFramesWholeAndInOrder(t *testing.T) {
+	a, b := pair(t)
+	const senders, perSender = 8, 12500
+	errc := make(chan error, senders)
+	for id := range senders {
+		go func() {
+			buf := make([]byte, 8+64)
+			for seq := range perSender {
+				binary.LittleEndian.PutUint32(buf, uint32(id))
+				binary.LittleEndian.PutUint32(buf[4:], uint32(seq))
+				n := 8 + seq%64
+				for i := 8; i < n; i++ {
+					buf[i] = byte(id)
+				}
+				var err error
+				if id%2 == 0 {
+					err = a.TrySend(uint8(id), buf[:n])
+				} else {
+					err = a.Send(uint8(id), buf[:n], nil)
+				}
+				if err != nil {
+					a.Close()
+					errc <- fmt.Errorf("sender %d frame %d: %w", id, seq, err)
+					return
+				}
+			}
+			errc <- nil
+		}()
+	}
+	var next [senders]int
+	err := readFrames(b.c, senders*perSender, func(typ uint8, p []byte) error {
+		if len(p) < 8 {
+			return fmt.Errorf("short payload %x", p)
+		}
+		id := binary.LittleEndian.Uint32(p)
+		seq := int(binary.LittleEndian.Uint32(p[4:]))
+		if id >= senders || typ != uint8(id) || seq != next[id] || len(p) != 8+seq%64 {
+			return fmt.Errorf("typ=%d id=%d seq=%d len=%d", typ, id, seq, len(p))
+		}
+		for _, c := range p[8:] {
+			if c != byte(id) {
+				return fmt.Errorf("sender %d payload corrupted: %x", id, p)
+			}
+		}
+		next[id]++
+		return nil
+	})
+	for range senders {
+		if serr := <-errc; serr != nil {
+			t.Error(serr)
+		}
+	}
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+}
+
+func TestTrySendAfterCloseIsErrClosed(t *testing.T) {
+	a, _ := pair(t)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.TrySend(1, nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("got %v, want ErrClosed", err)
+	}
+}
+
+func TestTrySendRejectsOversizePayload(t *testing.T) {
+	a, _ := pair(t)
+	if err := a.TrySend(1, make([]byte, MaxPayload+1)); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("got %v, want ErrPayloadTooLarge", err)
+	}
+}
+
+func TestTrySendAllocatesNothing(t *testing.T) {
+	a, _ := pair(t)
+	doorbell := []byte{1}
+	allocs := testing.AllocsPerRun(100, func() {
+		if err := a.TrySend(4, doorbell); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("TrySend allocates %v per call; want 0", allocs)
 	}
 }
 

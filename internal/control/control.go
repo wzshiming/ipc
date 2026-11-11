@@ -97,13 +97,16 @@ type Link struct {
 
 	wmu  sync.Mutex
 	wbuf []byte
+	tx   sender // TrySend's writer, used under wmu
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
 func newLink(c *net.UnixConn) *Link {
-	return &Link{c: c, oob: make([]byte, oobSize)}
+	k := &Link{c: c, oob: make([]byte, oobSize)}
+	k.tx.init(c)
+	return k
 }
 
 // Send writes one frame; fds travel with its first byte.
@@ -133,6 +136,26 @@ func (k *Link) Send(typ uint8, payload []byte, fds []int) error {
 	}
 	_, err := k.c.Write(rest)
 	return closedErr(err)
+}
+
+// trySendWait bounds the time TrySend waits for socket buffer space.
+const trySendWait = 50 * time.Millisecond
+
+// TrySend writes one frame without descriptors, waiting at most 50 ms in all
+// for socket buffer space. ErrBusy means the socket did not take the whole
+// frame, part of which may have gone out: the link is then unusable.
+func (k *Link) TrySend(typ uint8, payload []byte) error {
+	if len(payload) > MaxPayload {
+		return ErrPayloadTooLarge
+	}
+	var h [headerSize]byte
+	h[0] = typ
+	putLength(h[1:], len(payload))
+
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
+	k.wbuf = append(append(k.wbuf[:0], h[:]...), payload...)
+	return closedErr(k.tx.send(k.wbuf))
 }
 
 // Recv blocks for the next frame. It returns io.EOF once the peer has closed.
@@ -200,7 +223,10 @@ func (k *Link) readRest(b []byte) error {
 
 // Close closes the link and wakes a blocked Recv; later calls return nil.
 func (k *Link) Close() error {
-	k.closeOnce.Do(func() { k.closeErr = k.c.Close() })
+	k.closeOnce.Do(func() {
+		k.closeErr = k.c.Close()
+		k.tx.close()
+	})
 	return k.closeErr
 }
 

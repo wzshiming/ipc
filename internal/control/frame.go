@@ -25,6 +25,8 @@ var (
 	ErrPayloadTooLarge = errors.New("control: payload exceeds 64 KiB")
 	// ErrTooManyFDs is returned for more than MaxFDs descriptors.
 	ErrTooManyFDs = errors.New("control: more than 16 fds")
+	// ErrBusy is returned by TrySend when the socket did not take the frame.
+	ErrBusy = errors.New("control: socket did not take the frame in time")
 )
 
 func putLength(b []byte, n int) {
