@@ -199,10 +199,16 @@ func (c *Conn) halfDone() {
 	}
 }
 
-// ring sends a doorbell for a peer parked on the ring bell names; a failure
-// closes the connection.
+// ring sends a doorbell for a peer parked on the ring bell names, waiting no
+// longer than TrySend does. A socket that does not take it means the peer
+// stopped reading, a protocol violation; any failure closes the connection.
 func (c *Conn) ring(bell *doorbell) {
-	if err := c.link.Send(frameDoorbell, bell[:], nil); err != nil {
+	err := c.link.TrySend(frameDoorbell, bell[:])
+	switch {
+	case err == nil:
+	case err == control.ErrBusy:
+		c.shutdown(errProtocol)
+	default:
 		c.peerGone(peerErr(err))
 	}
 }
@@ -308,7 +314,8 @@ func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // Err returns nil while the connection is open, then why it closed:
 // net.ErrClosed after Close, ErrPeerClosed after the peer closed or died,
-// else ErrCorrupt or the link error.
+// else ErrCorrupt, a control protocol violation, as by a peer that stopped
+// reading its socket, or the link error.
 func (c *Conn) Err() error {
 	select {
 	case <-c.done:
