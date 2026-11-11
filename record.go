@@ -202,8 +202,8 @@ func (c *Conn) Abort() {
 // the slice aliases shared memory until Release. It returns ErrWouldBlock
 // when there is no record. After the peer closed it still returns the
 // records the peer committed, then io.EOF if the peer closed gracefully or
-// ErrPeerClosed if it died; after Close it returns net.ErrClosed. It ignores
-// the read deadline.
+// ErrPeerClosed if it died, ErrWouldBlock while that is not yet known; after
+// Close it returns net.ErrClosed. It ignores the read deadline.
 func (c *Conn) TryNext() ([]byte, error) {
 	if c.rx.held {
 		return nil, errOrder
@@ -212,7 +212,7 @@ func (c *Conn) TryNext() ([]byte, error) {
 		return nil, c.recvErr()
 	}
 	p, err := c.cons.TryNext()
-	if err == ring.ErrEmpty && isClosed(c.done) {
+	if err == ring.ErrEmpty && c.settled() {
 		// Recheck: all the peer committed before it left is visible by now.
 		if p, err = c.cons.TryNext(); err == ring.ErrEmpty {
 			c.rx.release(c)
@@ -230,8 +230,9 @@ func (c *Conn) TryNext() ([]byte, error) {
 // Next is like TryNext but blocks until a record arrives, the read deadline
 // passes or the connection closes. Past the deadline it returns
 // os.ErrDeadlineExceeded unless Close was called. After the peer closed it
-// drains without blocking. It spins for the connection's Spin duration before
-// parking until the peer commits.
+// drains without blocking, save for up to a second in which the connection
+// learns whether the peer said goodbye. It spins for the connection's Spin
+// duration before parking until the peer commits.
 func (c *Conn) Next() ([]byte, error) {
 	if c.rx.dl.expired.Load() {
 		return nil, c.timeout()
@@ -272,7 +273,7 @@ func (c *Conn) Next() ([]byte, error) {
 					c.rx.release(c)
 				}
 				return nil, c.timeout()
-			case <-c.done:
+			case <-c.readerDone:
 			}
 		}
 		if p, err = c.TryNext(); err != ErrWouldBlock {
