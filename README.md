@@ -5,7 +5,7 @@ Pure-Go (no cgo) shared-memory IPC between two processes on one machine, for Lin
 ## Example
 
 ```go
-l, _ := ipc.Listen(path) // path: an AF_UNIX socket path, ≤ 104 bytes on macOS
+l, _ := ipc.Listen(path) // path: an AF_UNIX socket path, ≤ 103 bytes on macOS
 defer l.Close()
 go func() {
 	c, _ := l.Accept() // a net.Conn
@@ -37,7 +37,7 @@ fmt.Println(string(reply), err) // hello, stream EOF
 
 ## Platform notes
 
-- Windows needs Windows 10 1803 or later for AF_UNIX sockets. Other GOOS compile, but `Accept` fails with `errors.ErrUnsupported` and `Dial` with `ErrRejected`.
+- Windows needs Windows 10 1803 or later for AF_UNIX sockets. Other GOOS, android and ios aside, compile without shared memory: `Accept` fails with `errors.ErrUnsupported` and `Dial` with `ErrRejected`, unless `Listen` and `Dial` fail first, as on plan9.
 - The socket file is mode 0600 on Linux and macOS.
 - Windows' clock ticks in 0.5–15.6 ms steps, so a spin may last up to one tick.
 
