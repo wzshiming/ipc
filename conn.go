@@ -319,17 +319,17 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 }
 
 // Close tells the peer goodbye, giving up after 50 ms when the peer's socket
-// does not take it, and wakes every blocked call with net.ErrClosed, which
-// later sends and receives return too, even past their deadline; records the
-// peer committed are no longer delivered. It then waits up to 50 ms for the
-// peer to close its side, as a peer does on reading the goodbye, so that the
-// socket is closed when Close returns; a socket the peer keeps open outlives
-// Close by a second at most. It never waits for a stream call in progress,
-// such as a WriteTo inside its destination's Write. Slices still held from
-// Reserve or Next stay readable until they are committed, aborted or
-// released, while a record Read or WriteTo holds partly consumed is released,
-// at once or by the call in progress when it returns; the segment is
-// unmapped once no slice is left.
+// does not take it, and wakes every call waiting on the connection with
+// net.ErrClosed, which later sends and receives return too, even past their
+// deadline; records the peer committed are no longer delivered. It then
+// waits up to 50 ms for the peer to close its side, as a peer does on
+// reading the goodbye, so that the socket is closed when Close returns; a
+// socket the peer keeps open outlives Close by a second at most. It never
+// waits for a stream call in progress, such as a WriteTo inside its
+// destination's Write. Slices still held from Reserve or Next stay readable
+// until they are committed, aborted or released, while a record Read or
+// WriteTo holds partly consumed is released, at once or by the call in
+// progress when it returns; the segment is unmapped once no slice is left.
 func (c *Conn) Close() error { return c.closeWaiting(readerWait) }
 
 // closeWaiting is Close, waiting at most wait for the control reader to end.

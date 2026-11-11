@@ -40,7 +40,8 @@ type ListenConfig struct {
 // so a Dial can complete before Accept is called; the connections then wait
 // for Accept in the order their handshakes completed. At most 16 connections
 // are in their handshake or waiting for Accept at once; further dialers wait
-// in the socket's backlog until Accept takes one.
+// in the socket's backlog until Accept takes one of those or a handshake
+// fails.
 type Listener struct {
 	cl       *control.Listener
 	ringSize int // the largest ring size granted
@@ -268,9 +269,10 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 	return c, false, nil
 }
 
-// Close stops taking dialers, aborts the handshakes in flight, closes the
-// connections waiting for Accept, whose dialers see the connection end, and
-// removes the socket file; a blocked Accept returns net.ErrClosed. It returns
+// Close stops taking dialers, aborts the handshakes in flight and closes the
+// connections waiting for Accept, whose dialers see the connection end; a
+// blocked Accept returns net.ErrClosed. It removes the socket file if it is
+// still the one Listen made, and its lock file except on Windows. It returns
 // once the listener's goroutines have ended. Connections Accept returned
 // stay open.
 func (l *Listener) Close() error {
