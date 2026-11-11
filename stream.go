@@ -106,7 +106,9 @@ const minRun = 4 << 10
 // in place, reserved in the ring's free run up to MaxRecord, and exactly the
 // bytes it returns are committed; with less than 4 KiB free it blocks for
 // room like Reserve. It returns n and nil once r reports io.EOF, else r's
-// error or Write's.
+// error or Write's. When the peer's close stops it, it still asks r for
+// more, as a copy into a socket would: n and nil when r is exhausted, else
+// ErrPeerClosed, with what that Read returned dropped.
 func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -114,6 +116,9 @@ func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
 	for {
 		b, err := c.Reserve(max(c.room(), minRun))
 		if err != nil {
+			if err == ErrPeerClosed && exhausted(r) {
+				return n, nil
+			}
 			return n, err
 		}
 		k, rerr := r.Read(b)
@@ -140,4 +145,17 @@ func (c *Conn) room() int {
 	n := c.prod.Room()
 	c.tx.release(c)
 	return n
+}
+
+// exhausted reports whether r has nothing left: its next Read, into one byte
+// of private memory since the peer's close took the ring away, returns
+// io.EOF alone. A byte read instead is lost, as the rest of r is.
+func exhausted(r io.Reader) bool {
+	var b [1]byte
+	for {
+		k, err := r.Read(b[:])
+		if k > 0 || err != nil {
+			return k == 0 && err == io.EOF
+		}
+	}
 }
