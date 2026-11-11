@@ -595,7 +595,8 @@ func TestLocalCloseWakesBlockedReadFromAndWriteToWithNetErrClosed(t *testing.T) 
 		_, err := dc.WriteTo(io.Discard)
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitSendParked(t, dc)
+	awaitReceiveParked(t, dc)
 	dc.Close()
 	for range 2 {
 		if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
@@ -793,7 +794,7 @@ func TestWriteQueuedBehindReadFromInItsSourceFailsAtItsDeadline(t *testing.T) {
 	_, dc := pair(t, ListenConfig{}, Dialer{})
 	stallReadFrom(t, dc)
 	ch := goWrite(dc, []byte("x"))
-	time.Sleep(20 * time.Millisecond)
+	awaitQueued(t, &dc.wgate)
 	dc.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 	if err := waitErr(t, ch, time.Second); err != os.ErrDeadlineExceeded {
 		t.Fatalf("Write queued behind ReadFrom = %v; want os.ErrDeadlineExceeded", err)
@@ -804,7 +805,7 @@ func TestWriteQueuedBehindReadFromInItsSourceFailsWithNetErrClosedOnClose(t *tes
 	_, dc := pair(t, ListenConfig{}, Dialer{})
 	stallReadFrom(t, dc)
 	ch := goWrite(dc, []byte("x"))
-	time.Sleep(20 * time.Millisecond)
+	awaitQueued(t, &dc.wgate)
 	closeWithin(t, dc, time.Second, "ReadFrom was inside its source's Read")
 	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
 		t.Fatalf("Write queued behind ReadFrom = %v; want net.ErrClosed", err)
@@ -815,7 +816,7 @@ func TestWriteQueuedBehindReadFromInItsSourceFailsAtOnceWithErrPeerClosed(t *tes
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	stallReadFrom(t, dc)
 	ch := goWrite(dc, []byte("x"))
-	time.Sleep(20 * time.Millisecond)
+	awaitQueued(t, &dc.wgate)
 	lc.Close()
 	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("Write queued behind ReadFrom = %v; want ErrPeerClosed", err)
@@ -826,7 +827,7 @@ func TestReadQueuedBehindWriteToInItsDestinationFailsAtItsDeadline(t *testing.T)
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	stallWriteTo(t, lc, dc, "record", 1<<30)
 	ch := goRead(dc)
-	time.Sleep(20 * time.Millisecond)
+	awaitQueued(t, &dc.rgate)
 	dc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	if r := waitRead(t, ch, time.Second); r.err != os.ErrDeadlineExceeded {
 		t.Fatalf("Read queued behind WriteTo = %q, %v; want os.ErrDeadlineExceeded", r.data, r.err)
@@ -837,7 +838,7 @@ func TestReadQueuedBehindWriteToInItsDestinationFailsWithNetErrClosedOnClose(t *
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	stallWriteTo(t, lc, dc, "record", 1<<30)
 	ch := goRead(dc)
-	time.Sleep(20 * time.Millisecond)
+	awaitQueued(t, &dc.rgate)
 	closeWithin(t, dc, time.Second, "WriteTo was inside its destination's Write")
 	if r := waitRead(t, ch, time.Second); r.err != net.ErrClosed {
 		t.Fatalf("Read queued behind WriteTo = %q, %v; want net.ErrClosed", r.data, r.err)
@@ -848,7 +849,7 @@ func TestReadQueuedBehindWriteToKeepsItsPlaceAfterThePeerCloses(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	resume := stallWriteTo(t, lc, dc, "abcdef", 3)
 	ch := goRead(dc)
-	time.Sleep(20 * time.Millisecond)
+	awaitQueued(t, &dc.rgate)
 	lc.Close()
 	<-dc.Done()
 	select {
@@ -1012,7 +1013,7 @@ func TestPeerCrashFailsReadFromAndEndsWriteToWithErrPeerClosed(t *testing.T) {
 		_, err := dc.ReadFrom(fillReader{})
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitSendParked(t, dc)
 	lc.link.Close() // vanish without Bye
 	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("blocked ReadFrom = %v; want ErrPeerClosed", err)

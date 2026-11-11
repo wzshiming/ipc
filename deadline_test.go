@@ -56,7 +56,7 @@ func TestSetReadDeadlineInterruptsBlockedNext(t *testing.T) {
 		_, err := dc.Next()
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitReceiveParked(t, dc)
 	dl := time.Now().Add(30 * time.Millisecond)
 	dc.SetReadDeadline(dl)
 	err := waitErr(t, ch, time.Second)

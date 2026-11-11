@@ -86,6 +86,12 @@ func consumerParked(mem []byte, ringSize int, dir uint8) *uint32 {
 	return (*uint32)(unsafe.Pointer(&mem[int(dir)*ring.Size(ringSize)+384]))
 }
 
+// producerParked returns the word of mem, a connection's segment, in which
+// the producer of ring dir marks itself parked: offset 512 of its header.
+func producerParked(mem []byte, ringSize int, dir uint8) *uint32 {
+	return (*uint32)(unsafe.Pointer(&mem[int(dir)*ring.Size(ringSize)+512]))
+}
+
 // dialPair makes one connection to l with d and returns its two ends, which
 // close when the test ends.
 func dialPair(t *testing.T, l *Listener, path string, d Dialer) (lc, dc *Conn) {
@@ -346,11 +352,17 @@ func TestReceiveWaitsForWhyThePeerLeftNoLongerThanASecondItsDeadlineOrClose(t *t
 	t.Run("Close", func(t *testing.T) {
 		skipUnlessAHalfCloseLeavesTheReceiveWaiting(t)
 		c := halfClosedPeer(t)
+		read := make(chan error, 1)
+		go func() {
+			_, err := c.Read(make([]byte, 8))
+			read <- err
+		}()
+		awaitReceiveParked(t, c)
 		start := time.Now()
-		time.AfterFunc(100*time.Millisecond, func() { c.Close() })
-		_, err := c.Read(make([]byte, 8))
-		if d := time.Since(start); err != net.ErrClosed || d > 100*time.Millisecond+slack {
-			t.Fatalf("Read = %v after %v; want net.ErrClosed at the Close 100ms in", err, d)
+		c.Close()
+		err := waitErr(t, read, time.Minute)
+		if d := time.Since(start); err != net.ErrClosed || d > slack {
+			t.Fatalf("parked Read = %v after %v; want net.ErrClosed at the Close", err, d)
 		}
 	})
 }
@@ -447,26 +459,34 @@ func TestCloseLeavesTheSocketToAPeerThatReadsTheGoodbyeUntilItCloses(t *testing.
 func TestCloseReturnsWithTheSocketClosedOnceAPeerThatReadsTheGoodbyeCloses(t *testing.T) {
 	c, sock, _ := rawPeer(t, 64<<10)
 	fds := openFDs(t)
-	read := make(chan []byte, 1)
+	returned := make(chan struct{})
 	go func() {
-		sock.SetDeadline(time.Now().Add(5 * time.Second))
-		got, _ := io.ReadAll(sock)
-		read <- got
-		// Held open a while, so that a Close that does not wait returns first.
-		time.Sleep(100 * time.Millisecond)
-		sock.CloseWrite()
+		// A bound no load reaches: only the reader's end may let Close return.
+		c.closeWaiting(time.Minute)
+		close(returned)
 	}()
-	// A bound no load reaches: only the reader's end may let Close return.
-	c.closeWaiting(time.Minute)
+	sock.SetDeadline(time.Now().Add(5 * time.Second))
+	got, err := io.ReadAll(sock)
+	if want := []byte{frameBye, 0, 0, 0, 0}; err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("the peer read %x, %v after Close; want the goodbye %x, then the end of the stream", got, err, want)
+	}
+	// Held open until Close waits, so that a Close that does not wait returns first.
+	await(t, "Close to wait for the control reader or return", func() bool {
+		return isClosed(returned) || goroutines("select", "ipc.(*Conn).closeWaiting(") > 0
+	})
+	if isClosed(returned) {
+		t.Fatal("Close returned while the peer kept its side open; want it back once the peer closed its side")
+	}
+	if err := sock.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	<-returned
 	select {
 	case <-c.readerDone:
 	default:
 		t.Fatal("Close returned while the control reader still ran; want it back once the peer closed its side")
 	}
 	expectLinkGone(t, c, fds, time.Second)
-	if got, want := <-read, []byte{frameBye, 0, 0, 0, 0}; !bytes.Equal(got, want) {
-		t.Fatalf("the peer read %x; want the goodbye %x, then the end of the stream", got, want)
-	}
 }
 
 func TestCloseWaitsTheBoundButNoLongerForAPeerThatNeverCloses(t *testing.T) {

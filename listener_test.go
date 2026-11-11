@@ -1,11 +1,9 @@
 package ipc
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"net"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -100,20 +98,13 @@ func waitAccept(t *testing.T, ch <-chan error, d time.Duration, after string) er
 // awaitHandshakes waits until n goroutines are inside a listener's handshake.
 func awaitHandshakes(t *testing.T, n int) {
 	t.Helper()
-	buf := make([]byte, 64<<10)
-	for give := time.Now().Add(time.Minute); ; time.Sleep(time.Millisecond) {
-		k := runtime.Stack(buf, true)
-		if k == len(buf) {
-			buf = make([]byte, 2*len(buf))
-			continue
-		}
-		if bytes.Count(buf[:k], []byte("ipc.(*Listener).handshake(")) >= n {
-			return
-		}
-		if time.Now().After(give) {
-			t.Fatalf("fewer than %d handshakes in flight after a minute", n)
-		}
-	}
+	await(t, "handshakes in flight", func() bool { return goroutines("", "ipc.(*Listener).handshake(") >= n })
+}
+
+// awaitAccept waits until a goroutine waits inside Listener.Accept.
+func awaitAccept(t *testing.T) {
+	t.Helper()
+	await(t, "an Accept to wait", func() bool { return goroutines("select", "ipc.(*Listener).Accept(") > 0 })
 }
 
 func TestSilentClientsDelayNeitherADialNorItsAccept(t *testing.T) {
@@ -238,6 +229,7 @@ func TestCloseWakesAnAcceptWaitingBesideAHandshakeInFlight(t *testing.T) {
 	silentClient(t, path)
 	accepted := acceptErr(l)
 	awaitHandshakes(t, 1)
+	awaitAccept(t)
 	closed := make(chan error, 1)
 	go func() { closed <- l.Close() }()
 	if err := waitAccept(t, accepted, time.Second, "Close"); err != net.ErrClosed {
@@ -253,6 +245,7 @@ func TestAHelloSentAfterCloseYieldsNoConnection(t *testing.T) {
 	link := silentClient(t, path)
 	accepted := acceptErr(l)
 	awaitHandshakes(t, 1)
+	awaitAccept(t)
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -288,6 +281,7 @@ func TestAPastDeadlineWakesAcceptButNotTheHandshakeBesideIt(t *testing.T) {
 	link := silentClient(t, path)
 	accepted := acceptErr(l)
 	awaitHandshakes(t, 1)
+	awaitAccept(t)
 	l.SetDeadline(time.Unix(1, 0))
 	if err := waitAccept(t, accepted, time.Second, "its deadline passed"); !isTimeout(err) {
 		t.Fatalf("Accept beside a handshake in flight = %v once the deadline passed; want os.ErrDeadlineExceeded", err)
