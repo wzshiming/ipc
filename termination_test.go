@@ -356,3 +356,15 @@ func TestCommitAfterLocalClosePublishesNothing(t *testing.T) {
 		t.Fatalf("the peer's TryNext = %q, %v; want io.EOF, no record", rec, err)
 	}
 }
+
+func TestCloseReturnsPromptlyWhenThePeerDoesNotReadItsSocket(t *testing.T) {
+	c, _, _ := rawPeer(t, 64<<10)
+	full := make([]byte, control.MaxPayload)
+	for c.link.TrySend(frameDoorbell, full) == nil {
+	}
+	start := time.Now()
+	c.Close()
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Fatalf("Close took %v with a peer that does not read its socket; want at most 200ms", d)
+	}
+}
