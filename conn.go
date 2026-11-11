@@ -138,7 +138,7 @@ func (c *Conn) readLoop() {
 			return
 		}
 		if len(fds) > 0 {
-			discardFDs(fds)
+			control.CloseFDs(fds)
 			c.shutdown(errProtocol)
 			return
 		}
