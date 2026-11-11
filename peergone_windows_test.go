@@ -7,6 +7,7 @@ import (
 )
 
 var peerGoneErrnos = []error{
-	syscall.ECONNRESET, syscall.EPIPE, syscall.ECONNABORTED,
+	syscall.ECONNRESET, syscall.EPIPE, syscall.ECONNABORTED, syscall.ENOTCONN,
 	windows.WSAECONNRESET, windows.WSAECONNABORTED, windows.WSAENETRESET, windows.WSAESHUTDOWN,
+	windows.WSAENOTCONN,
 }

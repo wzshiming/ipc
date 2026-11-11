@@ -4,4 +4,4 @@ package ipc
 
 import "syscall"
 
-var peerGoneErrnos = []error{syscall.ECONNRESET, syscall.EPIPE, syscall.ECONNABORTED}
+var peerGoneErrnos = []error{syscall.ECONNRESET, syscall.EPIPE, syscall.ECONNABORTED, syscall.ENOTCONN}
