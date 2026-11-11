@@ -6,9 +6,9 @@
 // one per direction, in a single shared-memory segment, so records move
 // without system calls or copies; the socket carries only the handshake,
 // doorbells that wake a parked peer, and goodbye. Conn is a net.Conn: Read
-// and Write copy a byte stream over records, io.Copy moves it through
-// ReadFrom and WriteTo without a copy, and Reserve, Commit, Next and Release
-// work on the records in place.
+// and Write copy a byte stream over records, ReadFrom and WriteTo move it
+// between the ring and another endpoint without a copy, and Reserve, Commit,
+// Next and Release work on the records in place.
 //
 //	l, _ := ipc.Listen("/tmp/app.sock")
 //	c, _ := l.Accept() // a net.Conn; c.(*ipc.Conn) adds the record API
@@ -27,16 +27,16 @@
 // until Commit or Abort, a Next slice until Release. Read and Write copy
 // instead: Write splits its bytes into records of at most MaxRecord and Read
 // returns their bytes in order, continuing a long record over several calls
-// and skipping empty ones. io.Copy into or out of a Conn uses ReadFrom and
-// WriteTo, which move the bytes between the ring and the other endpoint
-// without a copy: ReadFrom lets the source fill each record in place and
-// WriteTo hands each record's slice to the destination. On one direction use
-// either the record methods or the stream methods, Write and ReadFrom on the
-// send side and Read and WriteTo on the receive side; interleaving them while
-// Read or WriteTo holds a partly consumed record is not supported. The stream
-// methods may be called from any goroutine; the record methods of one
-// direction serve one goroutine at a time, one sending while another
-// receives.
+// and skipping empty ones. ReadFrom lets its source fill each record in
+// place and WriteTo hands each record's slice to its destination. io.Copy
+// calls a Conn's WriteTo when copying out of it, and its ReadFrom when
+// copying into it unless the source has a WriteTo of its own, which io.Copy
+// prefers. On one direction use either the record methods or the stream
+// methods, Write and ReadFrom on the send side and Read and WriteTo on the
+// receive side; interleaving them while Read or WriteTo holds a partly
+// consumed record is not supported. The stream methods may be called from
+// any goroutine; the record methods of one direction serve one goroutine at
+// a time, one sending while another receives.
 //
 // Blocking calls busy-spin for the Spin duration without yielding their
 // thread, then park until the peer rings, the deadline passes or the
