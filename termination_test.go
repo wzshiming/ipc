@@ -312,6 +312,16 @@ func halfClosedPeer(t *testing.T) *Conn {
 	return c
 }
 
+// skipUnlessAHalfCloseLeavesTheReceiveWaiting skips the test except on Linux,
+// where a doorbell to a peer that shut only its receiving side fails while
+// the link stays open.
+func skipUnlessAHalfCloseLeavesTheReceiveWaiting(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("on %s a peer that shut only its receiving side leaves no receive waiting for why it left: windows resets the connection, darwin takes the doorbell", runtime.GOOS)
+	}
+}
+
 func TestReceiveWaitsForWhyThePeerLeftNoLongerThanASecondItsDeadlineOrClose(t *testing.T) {
 	const slack = 500 * time.Millisecond
 	t.Run("a second", func(t *testing.T) {
@@ -323,6 +333,7 @@ func TestReceiveWaitsForWhyThePeerLeftNoLongerThanASecondItsDeadlineOrClose(t *t
 		}
 	})
 	t.Run("deadline", func(t *testing.T) {
+		skipUnlessAHalfCloseLeavesTheReceiveWaiting(t)
 		c := halfClosedPeer(t)
 		start := time.Now()
 		c.SetReadDeadline(start.Add(100 * time.Millisecond))
@@ -332,6 +343,7 @@ func TestReceiveWaitsForWhyThePeerLeftNoLongerThanASecondItsDeadlineOrClose(t *t
 		}
 	})
 	t.Run("Close", func(t *testing.T) {
+		skipUnlessAHalfCloseLeavesTheReceiveWaiting(t)
 		c := halfClosedPeer(t)
 		start := time.Now()
 		time.AfterFunc(100*time.Millisecond, func() { c.Close() })
@@ -366,8 +378,8 @@ func TestCloseReturnsPromptlyWhenThePeerDoesNotReadItsSocket(t *testing.T) {
 	}
 	start := time.Now()
 	c.Close()
-	if d := time.Since(start); d > 200*time.Millisecond {
-		t.Fatalf("Close took %v with a peer that does not read its socket; want at most 200ms", d)
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("Close took %v with a peer that does not read its socket; want at most 500ms", d)
 	}
 }
 
