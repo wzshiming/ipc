@@ -4,7 +4,6 @@ package control
 
 import (
 	"errors"
-	"io"
 	"net"
 	"syscall"
 )
@@ -19,9 +18,9 @@ func writeFirst(c *net.UnixConn, b []byte, _ []int) error {
 	return err
 }
 
-func readFirst(c *net.UnixConn, b, _ []byte) ([]int, error) {
-	_, err := io.ReadFull(c, b)
-	return nil, err
+func readMsg(c *net.UnixConn, b, _ []byte) (int, []int, error) {
+	n, err := c.Read(b)
+	return n, nil, err
 }
 
 // CloseFDs does nothing: no descriptor arrives here.

@@ -136,9 +136,11 @@ func (k *Link) Send(typ uint8, payload []byte, fds []int) error {
 }
 
 // Recv blocks for the next frame. It returns io.EOF once the peer has closed.
+// The descriptors that came with the frame's first byte, at most MaxFDs, are
+// the caller's to close; those that came with any other byte are closed.
 func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 	var h [headerSize]byte
-	fds, err = readFirst(k.c, h[:1], k.oob)
+	fds, err = k.readFirst(h[:1])
 	if err != nil {
 		return 0, nil, nil, closedErr(err)
 	}
@@ -149,7 +151,7 @@ func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 			err = closedErr(err)
 		}
 	}()
-	if _, err = io.ReadFull(k.c, h[1:]); err != nil {
+	if err = k.readRest(h[1:]); err != nil {
 		return 0, nil, fds, err
 	}
 	n, err := length(h[1:])
@@ -157,10 +159,43 @@ func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 		return 0, nil, fds, err
 	}
 	payload = make([]byte, n)
-	if _, err = io.ReadFull(k.c, payload); err != nil {
+	if err = k.readRest(payload); err != nil {
 		return 0, nil, fds, err
 	}
 	return h[0], payload, fds, nil
+}
+
+// readFirst reads a frame's first byte and the descriptors that came with it.
+func (k *Link) readFirst(b []byte) ([]int, error) {
+	n, fds, err := readMsg(k.c, b, k.oob)
+	if err == nil && n == 0 {
+		err = io.EOF
+	}
+	if err == nil && len(fds) > MaxFDs {
+		err = ErrTooManyFDs
+	}
+	if err != nil {
+		CloseFDs(fds)
+		return nil, err
+	}
+	return fds, nil
+}
+
+// readRest fills b as io.ReadFull does and closes the descriptors that come
+// with its bytes.
+func (k *Link) readRest(b []byte) error {
+	for i := 0; i < len(b); {
+		n, fds, err := readMsg(k.c, b[i:], k.oob)
+		CloseFDs(fds)
+		if err == io.EOF && i > 0 {
+			err = io.ErrUnexpectedEOF
+		}
+		if err != nil {
+			return err
+		}
+		i += n
+	}
+	return nil
 }
 
 // Close closes the link and wakes a blocked Recv; later calls return nil.
