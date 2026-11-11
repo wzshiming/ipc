@@ -962,6 +962,74 @@ func TestGateServesEveryWaitingCallOneAtATimeUnderStress(t *testing.T) {
 	t.Logf("%d rounds: %d calls took the gate, %d gave up", rounds, taken.Load(), gaveUp.Load())
 }
 
+func TestGateGivesAWaitingCallItsTurnAheadOfACallThatKeepsRetakingIt(t *testing.T) {
+	// On one P the woken call cannot contend until this goroutine yields.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	g := gate{baton: make(chan struct{}, 1)}
+	var dl deadline
+	g.lock(nil, &dl)
+	got := make(chan struct{})
+	go func() {
+		var dl deadline
+		g.lock(nil, &dl)
+		close(got)
+		g.unlock()
+	}()
+	awaitQueued(t, &g)
+	for give := time.Now().Add(10 * time.Second); ; {
+		g.unlock()
+		g.lock(nil, &dl)
+		select {
+		case <-got:
+			g.unlock()
+			if !gateIdle(&g) {
+				t.Fatalf("gate left with state %#x and %d wake-ups; want it free", g.state.Load(), len(g.baton))
+			}
+			return
+		default:
+		}
+		if time.Now().After(give) {
+			g.unlock()
+			<-got
+			t.Fatal("a waiting call passed over for 10 s still had not got the gate ahead of the call retaking it")
+		}
+		await(t, "the woken call to contend", func() bool { return g.state.Load()&gateWoken == 0 })
+	}
+}
+
+func TestWriteWaitingBehindATightLoopOfWritesGetsItsTurn(t *testing.T) {
+	for _, procs := range []int{1, runtime.GOMAXPROCS(0)} {
+		t.Run(fmt.Sprintf("GOMAXPROCS=%d", procs), func(t *testing.T) {
+			defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(procs))
+			lc, dc := pair(t, ListenConfig{}, Dialer{})
+			go io.Copy(io.Discard, lc)
+			var stop atomic.Bool
+			var looped atomic.Int64
+			loop := make(chan error, 1)
+			go func() {
+				msg := make([]byte, 64)
+				for !stop.Load() {
+					if _, err := dc.Write(msg); err != nil {
+						loop <- err
+						return
+					}
+					looped.Add(1)
+				}
+				loop <- nil
+			}()
+			await(t, "the loop to write", func() bool { return looped.Load() >= 1000 })
+			err := waitErr(t, goWrite(dc, []byte("turn")), 30*time.Second)
+			stop.Store(true)
+			if err != nil {
+				t.Fatalf("Write behind the loop = %v; want nil", err)
+			}
+			if err := waitErr(t, loop, 30*time.Second); err != nil {
+				t.Fatalf("Write in the loop = %v; want nil", err)
+			}
+		})
+	}
+}
+
 // BenchmarkContendedWrite64B has 1, 2 or 4 goroutines Write 64 B in a tight
 // loop on one connection, b.N Writes in all, while one reader drains it.
 func BenchmarkContendedWrite64B(b *testing.B) {
