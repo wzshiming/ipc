@@ -79,3 +79,20 @@ func createFD() (int, string, error) {
 	}
 	return -1, "", unix.EEXIST
 }
+
+// sealSize has nothing to do: the kernel refuses to resize a POSIX shm
+// object once ftruncate has sized it.
+func sealSize(int) error { return nil }
+
+// checkSizeSealed fails unless fd is a POSIX shm object, whose size is final
+// once set; fstat reports no file type for that kind of descriptor alone.
+func checkSizeSealed(fd int) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != 0 {
+		return errors.New("shm: segment is not a POSIX shared-memory object")
+	}
+	return nil
+}
