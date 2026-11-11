@@ -26,9 +26,9 @@ func (a addr) String() string { return string(a) }
 // over records, and it offers the records themselves through TryReserve,
 // Reserve, Commit, Abort, TryNext, Next and Release. Their slices alias
 // shared memory: a Reserve slice is valid until Commit or Abort, a Next
-// slice until Release. io.Copy into or out of a Conn uses ReadFrom and
-// WriteTo, which move the bytes between the ring and the other endpoint
-// without a copy.
+// slice until Release. ReadFrom and WriteTo move the bytes between the ring
+// and another endpoint without a copy; io.Copy uses WriteTo out of a Conn,
+// and ReadFrom into one unless the source has its own WriteTo.
 //
 // The stream methods may be called from any goroutine. The record methods of
 // one direction serve one goroutine at a time: one may send while another
