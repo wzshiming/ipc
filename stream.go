@@ -12,7 +12,7 @@ import (
 // deadline it fails without consuming anything.
 func (c *Conn) Read(p []byte) (int, error) {
 	c.rmu.Lock()
-	defer c.rmu.Unlock()
+	defer c.unlockRecv()
 	if c.rx.dl.expired.Load() {
 		return 0, os.ErrDeadlineExceeded
 	}
@@ -46,6 +46,25 @@ func (c *Conn) hold() error {
 	return nil
 }
 
+// drop releases the record held partly consumed, if any.
+func (c *Conn) drop() {
+	if len(c.rec) > 0 {
+		c.rec = nil
+		c.Release()
+	}
+}
+
+// unlockRecv ends a Read or WriteTo. Close leaves the held record to a call
+// in progress, so after a Close the call drops it; checking after the unlock
+// misses no Close that found the lock taken.
+func (c *Conn) unlockRecv() {
+	c.rmu.Unlock()
+	if c.closed.Load() && c.rmu.TryLock() {
+		c.drop()
+		c.rmu.Unlock()
+	}
+}
+
 // WriteTo writes the stream to w without copying: the unread rest of a record
 // Read holds, then every record's slice straight from the ring, each released
 // after w.Write returns. It returns n and nil once the peer's close is
@@ -53,7 +72,7 @@ func (c *Conn) hold() error {
 // unwritten rest of the record for a later Read or WriteTo.
 func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 	c.rmu.Lock()
-	defer c.rmu.Unlock()
+	defer c.unlockRecv()
 	if c.rx.dl.expired.Load() {
 		return 0, os.ErrDeadlineExceeded
 	}

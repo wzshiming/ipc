@@ -266,20 +266,20 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 }
 
 // Close tells the peer goodbye, closes the link and wakes every blocked call
-// with net.ErrClosed; records the peer committed are no longer delivered.
-// Slices still held from Reserve or Next stay readable until they are
-// committed, aborted or released, while a record Read or WriteTo holds
-// partly consumed is released; the segment is unmapped once no slice is left.
+// with net.ErrClosed; records the peer committed are no longer delivered. It
+// does not wait for a stream call in progress, such as a WriteTo inside its
+// destination's Write. Slices still held from Reserve or Next stay readable
+// until they are committed, aborted or released, while a record Read or
+// WriteTo holds partly consumed is released, at once or by the call in
+// progress when it returns; the segment is unmapped once no slice is left.
 func (c *Conn) Close() error {
 	c.closed.Store(true)
 	c.shutdown(net.ErrClosed)
 	<-c.readerDone
-	c.rmu.Lock()
-	if len(c.rec) > 0 {
-		c.rec = nil
-		c.Release()
+	if c.rmu.TryLock() {
+		c.drop()
+		c.rmu.Unlock()
 	}
-	c.rmu.Unlock()
 	return nil
 }
 
