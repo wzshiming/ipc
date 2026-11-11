@@ -20,7 +20,8 @@ func readFirst(c *net.UnixConn, b, _ []byte) ([]int, error) {
 	return nil, err
 }
 
-func closeFDs([]int) {}
+// CloseFDs does nothing: no descriptor arrives here.
+func CloseFDs([]int) {}
 
 // Plan 9's syscall package has no ECONNREFUSED to match.
 func isConnRefused(error) bool { return false }

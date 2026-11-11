@@ -144,7 +144,7 @@ func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 	}
 	defer func() {
 		if err != nil {
-			closeFDs(fds)
+			CloseFDs(fds)
 			fds = nil
 			err = closedErr(err)
 		}

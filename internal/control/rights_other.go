@@ -24,7 +24,8 @@ func readFirst(c *net.UnixConn, b, _ []byte) ([]int, error) {
 	return nil, err
 }
 
-func closeFDs([]int) {}
+// CloseFDs does nothing: no descriptor arrives here.
+func CloseFDs([]int) {}
 
 func isConnRefused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
 
