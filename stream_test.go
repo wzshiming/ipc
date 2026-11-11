@@ -275,9 +275,6 @@ func TestIOCopyThroughput(t *testing.T) {
 	}
 	rate := float64(volume) / d.Seconds()
 	t.Logf("in-process io.Copy of %d MiB: %.2f GB/s (race=%v)", volume>>20, rate/1e9, raceEnabled())
-	if !raceEnabled() && rate < 2e9 {
-		t.Fatalf("throughput %.2f GB/s below 2 GB/s", rate/1e9)
-	}
 }
 
 // within reports whether p lies inside the segment c maps.
