@@ -167,8 +167,21 @@ func TestListenConfigListenWithDoneCtxFails(t *testing.T) {
 	}
 }
 
-func TestDialerTimeoutAbortsDialToListenerThatNeverAccepts(t *testing.T) {
-	_, path := listen(t, ListenConfig{})
+// silentEndpoint listens on a socket but never takes a link from it, so a
+// dialer's Hello gets no answer.
+func silentEndpoint(t *testing.T) string {
+	t.Helper()
+	path := sockPath(t)
+	cl, err := control.Listen(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cl.Close() })
+	return path
+}
+
+func TestDialerTimeoutAbortsDialToAnEndpointThatNeverAnswers(t *testing.T) {
+	path := silentEndpoint(t)
 	start := time.Now()
 	c, err := (&Dialer{Timeout: 50 * time.Millisecond}).Dial(path)
 	if err == nil {
@@ -182,8 +195,8 @@ func TestDialerTimeoutAbortsDialToListenerThatNeverAccepts(t *testing.T) {
 	}
 }
 
-func TestDialContextWithExpiringCtxAbortsDialToListenerThatNeverAccepts(t *testing.T) {
-	_, path := listen(t, ListenConfig{})
+func TestDialContextWithExpiringCtxAbortsDialToAnEndpointThatNeverAnswers(t *testing.T) {
+	path := silentEndpoint(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
@@ -904,36 +917,23 @@ func TestListenerDeadlineTimesOutAccept(t *testing.T) {
 	c.Close()
 }
 
-// serve accepts n connections on l in the background and returns them in
-// dial order: handshakes are serial, so Dial returns before the next starts.
+// serve makes n connections to l, accepting each before dialing the next, so
+// that Accept returns the one just dialed, and returns their ends paired.
 func serve(t *testing.T, l *Listener, path string, n int) (served, dialed []*Conn) {
 	t.Helper()
 	l.SetDeadline(time.Now().Add(10 * time.Second))
-	ch := make(chan net.Conn, n)
-	go func() {
-		for range n {
-			c, err := l.Accept()
-			if err != nil {
-				t.Error("Accept:", err)
-			}
-			ch <- c
-		}
-	}()
 	for range n {
-		c, err := (&Dialer{Timeout: 10 * time.Second}).Dial(path)
+		dc, err := (&Dialer{Timeout: 10 * time.Second}).Dial(path)
 		if err != nil {
 			t.Fatal("Dial:", err)
 		}
-		t.Cleanup(func() { c.Close() })
-		dialed = append(dialed, c)
-	}
-	for range n {
-		c := <-ch
-		if c == nil {
-			t.Fatal("Accept failed")
+		t.Cleanup(func() { dc.Close() })
+		c, err := l.Accept()
+		if err != nil {
+			t.Fatal("Accept:", err)
 		}
 		t.Cleanup(func() { c.Close() })
-		served = append(served, c.(*Conn))
+		served, dialed = append(served, c.(*Conn)), append(dialed, dc)
 	}
 	return served, dialed
 }
@@ -986,7 +986,16 @@ func TestCloseLeaksNoGoroutines(t *testing.T) {
 			c.Close()
 		}
 		<-blocked
+		// Left to Close: clients silent in their handshakes, and connections
+		// waiting for Accept, dialed after them so that those handshakes began.
+		for range 2 {
+			silentClient(t, path)
+		}
+		queued := dialN(t, path, 2)
 		l.Close()
+		for _, c := range queued {
+			c.Close()
+		}
 	}()
 	deadline := time.Now().Add(2 * time.Second)
 	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
