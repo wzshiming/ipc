@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
+	"time"
 )
 
 // Read copies the next bytes of the stream into p: the records the peer
@@ -225,49 +226,115 @@ func exhausted(r io.Reader) bool {
 	}
 }
 
-// gate serializes the stream calls of one direction like a sync.Mutex, except
-// that a call waiting for it can give up.
+// gate serializes the stream calls of one direction like a sync.Mutex: a call
+// takes a free gate ahead of waiting ones, sparing contending calls a
+// goroutine switch each, unless one has waited longer than starveAfter. A
+// waiting call can give up.
 type gate struct {
-	n     atomic.Int32  // calls holding or waiting for the gate
-	baton chan struct{} // hands the gate from its holder to a waiting call
+	state atomic.Int64  // gateLocked | gateWoken | waiting calls | starving calls
+	baton chan struct{} // wakes one waiting call to contend for the gate
 }
 
-// lock takes the gate, waiting for its holder to hand it over unless stop
+const (
+	gateLocked   int64 = 1                  // a call holds the gate
+	gateWoken    int64 = 2                  // a woken waiting call has yet to contend
+	gateWaiter   int64 = 4                  // one waiting call
+	gateWaiters  int64 = 1<<32 - gateWaiter // the waiting calls' count
+	gateStarving int64 = 1 << 32            // one waiting call that starves, counted from here up
+)
+
+// starveAfter is how long a waiting call lets other calls take the gate ahead
+// of it; then it starves, and only woken waiting calls take the gate until it
+// has.
+const starveAfter = time.Millisecond
+
+// lock takes the gate, waiting while another call holds it unless stop
 // closes or dl's deadline passes first, and reports whether it took it.
 func (g *gate) lock(stop <-chan struct{}, dl *deadline) bool {
-	if g.n.Add(1) == 1 {
+	if g.state.CompareAndSwap(0, gateLocked) {
 		return true
 	}
-	return g.wait(stop, dl.done())
+	return g.lockSlow(stop, dl)
 }
 
-// wait is lock's slow path. A call giving up while it is the only one counted
-// takes the gate anyway, as its holder has left and handed it over.
-func (g *gate) wait(stop, expired <-chan struct{}) bool {
-	select {
-	case <-g.baton:
-		return true
-	case <-stop:
-	case <-expired:
-	}
+// lockSlow takes the gate if it is free and no waiting call starves, else
+// waits for it.
+func (g *gate) lockSlow(stop <-chan struct{}, dl *deadline) bool {
 	for {
-		n := g.n.Load()
-		if n == 1 {
-			<-g.baton
-			return true
+		s := g.state.Load()
+		if s&gateLocked == 0 && s < gateStarving {
+			if g.state.CompareAndSwap(s, s|gateLocked) {
+				return true
+			}
+		} else if g.state.CompareAndSwap(s, s+gateWaiter) {
+			return g.wait(stop, dl.done())
 		}
-		if g.n.CompareAndSwap(n, n-1) {
+	}
+}
+
+// wait counts as a waiting call until, woken, it finds the gate free and
+// takes it, or until stop or expired closes and it gives up. Finding the
+// gate taken once it has waited longer than starveAfter, it starves.
+func (g *gate) wait(stop, expired <-chan struct{}) bool {
+	since := time.Now()
+	var starving int64 // gateStarving once this call starves
+	for {
+		select {
+		case <-g.baton:
+		case <-stop:
+			g.state.Add(-gateWaiter - starving)
+			return false
+		case <-expired:
+			g.state.Add(-gateWaiter - starving)
 			return false
 		}
+		for {
+			s := g.state.Load()
+			if s&gateLocked == 0 {
+				if g.state.CompareAndSwap(s, (s|gateLocked)&^gateWoken-gateWaiter-starving) {
+					return true
+				}
+				continue
+			}
+			starve := int64(0)
+			if starving == 0 && time.Since(since) > starveAfter {
+				starve = gateStarving
+			}
+			if g.state.CompareAndSwap(s, s&^gateWoken+starve) {
+				starving += starve
+				break
+			}
+		}
 	}
 }
 
-// tryLock takes the gate if it is free.
-func (g *gate) tryLock() bool { return g.n.CompareAndSwap(0, 1) }
+// tryLock takes the gate if no call holds it, even ahead of waiting calls, as
+// those may give up instead.
+func (g *gate) tryLock() bool {
+	for s := g.state.Load(); s&gateLocked == 0; s = g.state.Load() {
+		if g.state.CompareAndSwap(s, s|gateLocked) {
+			return true
+		}
+	}
+	return false
+}
 
-// unlock frees the gate or hands it to a waiting call.
+// unlock frees the gate and wakes a waiting call to contend for it.
 func (g *gate) unlock() {
-	if g.n.Add(-1) > 0 {
-		g.baton <- struct{}{}
+	if s := g.state.Add(-gateLocked); s != 0 {
+		g.wake(s)
+	}
+}
+
+// wake wakes a waiting call unless the gate is taken again or a woken call
+// has yet to contend; s is the state unlock left.
+func (g *gate) wake(s int64) {
+	for s&(gateLocked|gateWoken) == 0 && s&gateWaiters != 0 {
+		if g.state.CompareAndSwap(s, s|gateWoken) {
+			// No woken call means no wake-up in baton, so this never blocks.
+			g.baton <- struct{}{}
+			return
+		}
+		s = g.state.Load()
 	}
 }

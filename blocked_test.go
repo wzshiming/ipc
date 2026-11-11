@@ -38,7 +38,7 @@ func awaitSendParked(t *testing.T, c *Conn) {
 // awaitQueued waits until a stream call waits for g behind the one holding it.
 func awaitQueued(t *testing.T, g *gate) {
 	t.Helper()
-	await(t, "a stream call to queue", func() bool { return g.n.Load() >= 2 })
+	await(t, "a stream call to queue", func() bool { return g.state.Load()&gateWaiters != 0 })
 }
 
 // goroutines counts the goroutines with frame on their stacks that, unless
