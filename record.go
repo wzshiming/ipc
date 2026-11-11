@@ -71,9 +71,9 @@ func (c *Conn) ringErr(err error) error {
 
 // TryReserve returns an n-byte slice of the send ring to fill and then
 // Commit or Abort, without blocking. It returns ErrWouldBlock when the ring
-// has no room for n bytes, ErrTooLarge when n exceeds MaxRecord, and
-// ErrPeerClosed or net.ErrClosed once the connection is closed. It ignores
-// the write deadline.
+// has no room for n bytes, ErrTooLarge when n exceeds MaxRecord, and the
+// error Err reports once the connection is closed. It ignores the write
+// deadline.
 func (c *Conn) TryReserve(n int) ([]byte, error) {
 	if c.tx.held {
 		return nil, errOrder
@@ -149,7 +149,7 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 // Commit publishes the record reserved by Reserve or TryReserve to the peer
 // and wakes the peer if it is parked. It returns nil exactly when it
 // published the record: once the connection is closed it publishes nothing
-// and returns ErrPeerClosed or net.ErrClosed.
+// and returns the error Err reports.
 func (c *Conn) Commit() error {
 	if !c.tx.held {
 		return errOrder
