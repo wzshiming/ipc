@@ -53,6 +53,7 @@ type Conn struct {
 	done       chan struct{}
 	rxClosed   chan struct{} // closed when receives end: at Close or a failure, not the peer's close
 	err        error         // written once before done is closed
+	unsettled  bool          // written with err: the reader has yet to learn whether the peer said goodbye
 	closed     atomic.Bool   // Close was called on this end
 	bye        atomic.Bool   // the peer said goodbye
 	readerDone chan struct{}
@@ -124,13 +125,15 @@ func corruptErr(dir uint8, err error) error {
 	return fmt.Errorf("%w: ring %d: %w", ErrCorrupt, dir, err)
 }
 
-// readLoop dispatches doorbells to the halves until the link fails.
+// readLoop dispatches doorbells to the halves until the link fails or the
+// peer says goodbye, then closes the link.
 func (c *Conn) readLoop() {
 	defer close(c.readerDone)
+	defer c.link.Close()
 	for {
 		typ, p, fds, err := c.link.Recv()
 		if err != nil {
-			c.peerGone(peerErr(err))
+			c.end(peerErr(err), false)
 			return
 		}
 		if len(fds) > 0 {
@@ -155,7 +158,7 @@ func (c *Conn) readLoop() {
 			}
 		case frameBye:
 			c.bye.Store(true)
-			c.peerGone(ErrPeerClosed)
+			c.end(ErrPeerClosed, false)
 			return
 		default:
 			c.shutdown(errProtocol)
@@ -165,30 +168,30 @@ func (c *Conn) readLoop() {
 }
 
 // shutdown closes the connection with err as the reason unless it is closed
-// already, waking every blocked call and ending receives; the segment is
-// released when no slice is outstanding.
+// already, then the link and receives, waking every blocked call; the
+// segment is released when no slice is outstanding.
 func (c *Conn) shutdown(err error) {
-	c.peerGone(err)
+	c.end(err, false)
+	c.link.Close()
 	c.rxOnce.Do(func() {
 		c.rx.close(c)
 		close(c.rxClosed)
 	})
 }
 
-// peerGone closes the connection like shutdown but leaves the receive half
-// open, so records the peer committed can still be drained until Close.
-func (c *Conn) peerGone(err error) {
+// end closes the connection for sends with err as the reason unless it is
+// closed already, and reports whether it did. Receives still drain what the
+// peer committed until Close; unsettled makes them wait for the reader to
+// learn whether the peer said goodbye before they end.
+func (c *Conn) end(err error, unsettled bool) (ended bool) {
 	c.closeOnce.Do(func() {
-		c.err = err
+		c.err, c.unsettled = err, unsettled
 		// Sends fail before Done closes, so callers seeing Done see them fail.
 		c.tx.close(c)
 		close(c.done)
-		if err == net.ErrClosed {
-			c.link.SetWriteDeadline(time.Now().Add(time.Second))
-			c.link.Send(frameBye, nil, nil)
-		}
-		c.link.Close()
+		ended = true
 	})
+	return ended
 }
 
 // halfDone is called once per half after close, when it holds no slice.
@@ -199,17 +202,28 @@ func (c *Conn) halfDone() {
 	}
 }
 
+// byeWait bounds how long the reader may take to learn whether a peer whose
+// socket refused a doorbell said goodbye first.
+const byeWait = time.Second
+
 // ring sends a doorbell for a peer parked on the ring bell names, waiting no
 // longer than TrySend does. A socket that does not take it means the peer
-// stopped reading, a protocol violation; any failure closes the connection.
+// stopped reading, a protocol violation. A socket the peer closed ends sends
+// at once, while the reader reads on, for at most byeWait, to learn whether
+// the peer said goodbye first.
 func (c *Conn) ring(bell *doorbell) {
 	err := c.link.TrySend(frameDoorbell, bell[:])
 	switch {
 	case err == nil:
 	case err == control.ErrBusy:
 		c.shutdown(errProtocol)
+	case isPeerGone(err):
+		if c.end(ErrPeerClosed, true) {
+			c.link.SetReadDeadline(time.Now().Add(byeWait))
+		}
 	default:
-		c.peerGone(peerErr(err))
+		c.end(err, false)
+		c.link.Close()
 	}
 }
 
@@ -231,6 +245,12 @@ func (c *Conn) recvErr() error {
 		return io.EOF
 	}
 	return c.err
+}
+
+// settled reports whether receives end once the ring is drained: the
+// connection is closed and the reader knows whether the peer said goodbye.
+func (c *Conn) settled() bool {
+	return isClosed(c.done) && (!c.unsettled || isClosed(c.readerDone))
 }
 
 // timeout is what a call past its deadline returns, net.ErrClosed once Close
@@ -299,6 +319,10 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 // progress when it returns; the segment is unmapped once no slice is left.
 func (c *Conn) Close() error {
 	c.closed.Store(true)
+	if c.end(net.ErrClosed, false) {
+		c.link.SetWriteDeadline(time.Now().Add(time.Second))
+		c.link.Send(frameBye, nil, nil)
+	}
 	c.shutdown(net.ErrClosed)
 	<-c.readerDone
 	if c.rgate.tryLock() {
