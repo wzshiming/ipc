@@ -274,6 +274,7 @@ func (c *Conn) Next() ([]byte, error) {
 				}
 				return nil, c.timeout()
 			case <-c.readerDone:
+			case <-c.rxClosed:
 			}
 		}
 		if p, err = c.TryNext(); err != ErrWouldBlock {

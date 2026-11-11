@@ -1,10 +1,12 @@
 package ipc
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -376,5 +378,99 @@ func TestCloseReturnsPromptlyWhenThePeerDoesNotReadItsSocket(t *testing.T) {
 	c.Close()
 	if d := time.Since(start); d > 200*time.Millisecond {
 		t.Fatalf("Close took %v with a peer that does not read its socket; want at most 200ms", d)
+	}
+}
+
+// openFDs returns how many descriptors the process has open, or -1 where
+// they cannot be listed.
+func openFDs(t *testing.T) int {
+	t.Helper()
+	dir := map[string]string{"darwin": "/dev/fd", "linux": "/proc/self/fd"}[runtime.GOOS]
+	if dir == "" {
+		return -1
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(ents)
+}
+
+// expectLinkGone fails unless c's control reader ends within d and leaves the
+// link closed, with fewer than fds descriptors open where they can be counted.
+func expectLinkGone(t *testing.T, c *Conn, fds int, d time.Duration) {
+	t.Helper()
+	select {
+	case <-c.readerDone:
+	case <-time.After(d):
+		t.Fatalf("the control reader still runs %v later", d)
+	}
+	if err := c.link.TrySend(frameDoorbell, nil); !errors.Is(err, control.ErrClosed) {
+		t.Fatalf("TrySend once the reader ended = %v; want control.ErrClosed", err)
+	}
+	if n := openFDs(t); fds >= 0 && n >= fds {
+		t.Fatalf("%d descriptors open once the reader ended, %d before; want the socket's closed", n, fds)
+	}
+}
+
+// peerBell is a doorbell the raw peer writes to the Conn's socket.
+var peerBell = []byte{frameDoorbell, 1, 0, 0, 0, dirListenerToDialer}
+
+func TestCloseLeavesTheSocketToAPeerThatReadsTheGoodbyeUntilItCloses(t *testing.T) {
+	c, sock, _ := rawPeer(t, 64<<10)
+	c.Close()
+	fds := openFDs(t)
+	// Not the linger but only the peer's close may end the reader from here on.
+	c.link.SetReadDeadline(time.Now().Add(time.Minute))
+	sock.SetDeadline(time.Now().Add(5 * time.Second))
+	got, err := io.ReadAll(sock)
+	if want := []byte{frameBye, 0, 0, 0, 0}; err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("the peer read %x, %v after Close; want the goodbye %x, then the end of the stream", got, err, want)
+	}
+	if _, err := sock.Write(peerBell); err != nil {
+		t.Fatalf("the peer's doorbell after the goodbye: %v; want it taken", err)
+	}
+	select {
+	case <-c.readerDone:
+		t.Fatal("the control reader ended while the peer kept its side open")
+	default:
+	}
+	if err := sock.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	expectLinkGone(t, c, fds, 5*time.Second)
+}
+
+func TestCloseLetsGoOfTheSocketOfAPeerThatNeverClosesWithinASecond(t *testing.T) {
+	const slack = time.Second
+	c, sock, _ := rawPeer(t, 64<<10)
+	start := time.Now()
+	c.Close()
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("Close took %v with a peer that never closes; want at most 500ms", d)
+	}
+	fds := openFDs(t)
+	if _, err := sock.Write(peerBell); err != nil {
+		t.Fatalf("the peer's doorbell after Close: %v; want it taken while the socket lingers", err)
+	}
+	expectLinkGone(t, c, fds, time.Until(start.Add(time.Second+slack)))
+}
+
+func TestCloseWakesAParkedReadAtOnceWhileTheSocketLingers(t *testing.T) {
+	const ringSize = 64 << 10
+	c, _, mem := rawPeer(t, ringSize)
+	read := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 8))
+		read <- err
+	}()
+	for atomic.LoadUint32(consumerParked(mem, ringSize, dirDialerToListener)) == 0 {
+		runtime.Gosched()
+	}
+	c.Close()
+	// Not the linger but only the peer's close may end the reader from here on.
+	c.link.SetReadDeadline(time.Now().Add(time.Minute))
+	if err := waitErr(t, read, 5*time.Second); err != net.ErrClosed {
+		t.Fatalf("parked Read = %v after Close; want net.ErrClosed", err)
 	}
 }
