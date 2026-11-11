@@ -319,14 +319,19 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 // Close tells the peer goodbye, giving up after 50 ms when the peer's socket
 // does not take it, and wakes every blocked call with net.ErrClosed, which
 // later sends and receives return too, even past their deadline; records the
-// peer committed are no longer delivered. It waits neither for the peer nor
-// for a stream call in progress, such as a WriteTo inside its destination's
-// Write; the socket outlives it until the peer closes its side, for a second
-// at most. Slices still held from Reserve or Next stay readable until they
-// are committed, aborted or released, while a record Read or WriteTo holds
-// partly consumed is released, at once or by the call in progress when it
-// returns; the segment is unmapped once no slice is left.
-func (c *Conn) Close() error {
+// peer committed are no longer delivered. It then waits up to 50 ms for the
+// peer to close its side, as a peer does on reading the goodbye, so that the
+// socket is closed when Close returns; a socket the peer keeps open outlives
+// Close by a second at most. It never waits for a stream call in progress,
+// such as a WriteTo inside its destination's Write. Slices still held from
+// Reserve or Next stay readable until they are committed, aborted or
+// released, while a record Read or WriteTo holds partly consumed is released,
+// at once or by the call in progress when it returns; the segment is
+// unmapped once no slice is left.
+func (c *Conn) Close() error { return c.closeWaiting(readerWait) }
+
+// closeWaiting is Close, waiting at most wait for the control reader to end.
+func (c *Conn) closeWaiting(wait time.Duration) error {
 	c.closed.Store(true)
 	if c.end(net.ErrClosed, false) {
 		// Closing with doorbells unread resets the socket on Windows, losing the
@@ -340,12 +345,20 @@ func (c *Conn) Close() error {
 		c.drop()
 		c.rgate.unlock()
 	}
+	// Exiting right after Close must not close the socket under an unread goodbye.
+	select {
+	case <-c.readerDone:
+	case <-time.After(wait):
+	}
 	return nil
 }
 
 // lingerWait bounds how long the socket outlives Close for the peer to read
 // the goodbye and close its side.
 const lingerWait = time.Second
+
+// readerWait bounds how long Close waits for the control reader to end.
+const readerWait = 50 * time.Millisecond
 
 // Done is closed once the connection is closed by either end or fails. After
 // the peer's close, receives still drain what it committed until Close.

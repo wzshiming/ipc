@@ -443,6 +443,40 @@ func TestCloseLeavesTheSocketToAPeerThatReadsTheGoodbyeUntilItCloses(t *testing.
 	expectLinkGone(t, c, fds, 5*time.Second)
 }
 
+func TestCloseReturnsWithTheSocketClosedOnceAPeerThatReadsTheGoodbyeCloses(t *testing.T) {
+	c, sock, _ := rawPeer(t, 64<<10)
+	fds := openFDs(t)
+	read := make(chan []byte, 1)
+	go func() {
+		sock.SetDeadline(time.Now().Add(5 * time.Second))
+		got, _ := io.ReadAll(sock)
+		read <- got
+		// Held open a while, so that a Close that does not wait returns first.
+		time.Sleep(100 * time.Millisecond)
+		sock.CloseWrite()
+	}()
+	// A bound no load reaches: only the reader's end may let Close return.
+	c.closeWaiting(time.Minute)
+	select {
+	case <-c.readerDone:
+	default:
+		t.Fatal("Close returned while the control reader still ran; want it back once the peer closed its side")
+	}
+	expectLinkGone(t, c, fds, time.Second)
+	if got, want := <-read, []byte{frameBye, 0, 0, 0, 0}; !bytes.Equal(got, want) {
+		t.Fatalf("the peer read %x; want the goodbye %x, then the end of the stream", got, want)
+	}
+}
+
+func TestCloseWaitsTheBoundButNoLongerForAPeerThatNeverCloses(t *testing.T) {
+	c, _, _ := rawPeer(t, 64<<10)
+	start := time.Now()
+	c.Close()
+	if d := time.Since(start); d < readerWait || d > 500*time.Millisecond {
+		t.Fatalf("Close took %v with a peer that never closes; want the %v bound, at most 500ms", d, readerWait)
+	}
+}
+
 func TestCloseLetsGoOfTheSocketOfAPeerThatNeverClosesWithinASecond(t *testing.T) {
 	const slack = time.Second
 	c, sock, _ := rawPeer(t, 64<<10)
