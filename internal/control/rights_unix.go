@@ -4,7 +4,6 @@ package control
 
 import (
 	"errors"
-	"io"
 	"net"
 	"syscall"
 
@@ -13,7 +12,12 @@ import (
 
 const fdPassing = true
 
-var oobSize = unix.CmsgSpace(MaxFDs * 4)
+// maxRights is the most descriptors one message can carry: 253 on linux
+// (SCM_MAX_FD), 254 on darwin (2 KiB of 8-byte file pointers).
+const maxRights = 254
+
+// oobSize fits the largest control message, so that none is ever cut.
+var oobSize = unix.CmsgSpace(maxRights * 4)
 
 var errTruncatedRights = errors.New("control: fd attachment truncated")
 
@@ -23,7 +27,9 @@ func writeFirst(c *net.UnixConn, b []byte, fds []int) error {
 	return err
 }
 
-func readFirst(c *net.UnixConn, b, oob []byte) ([]int, error) {
+// readMsg reads into b and returns the descriptors that came with the bytes
+// read. Every read asks for them: darwin installs them even when not asked.
+func readMsg(c *net.UnixConn, b, oob []byte) (int, []int, error) {
 	n, oobn, flags, _, err := c.ReadMsgUnix(b, oob)
 	var fds []int
 	if oobn > 0 {
@@ -36,14 +42,7 @@ func readFirst(c *net.UnixConn, b, oob []byte) ([]int, error) {
 	if err == nil && flags&unix.MSG_CTRUNC != 0 {
 		err = errTruncatedRights
 	}
-	if err == nil && n == 0 {
-		err = io.EOF
-	}
-	if err != nil {
-		CloseFDs(fds)
-		return nil, err
-	}
-	return fds, nil
+	return n, fds, err
 }
 
 func parseRights(oob []byte) ([]int, error) {
