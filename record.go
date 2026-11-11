@@ -289,11 +289,7 @@ func (c *Conn) Release() error {
 	}
 	c.rx.held = false
 	wake := c.cons.Release()
-	if c.rx.release(c) {
-		return nil
-	}
-	if wake {
-		// A failed doorbell means the peer is gone; Next reports that once drained.
+	if !c.rx.release(c) && wake {
 		c.ring(&c.rx.bell)
 	}
 	return nil
