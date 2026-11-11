@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"io"
+	"net"
 	"os"
 )
 
@@ -13,6 +14,9 @@ import (
 func (c *Conn) Read(p []byte) (int, error) {
 	c.rmu.Lock()
 	defer c.unlockRecv()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	if c.rx.dl.expired.Load() {
 		return 0, os.ErrDeadlineExceeded
 	}
@@ -79,6 +83,9 @@ func (c *Conn) unlockRecv() {
 func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 	c.rmu.Lock()
 	defer c.unlockRecv()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	if c.rx.dl.expired.Load() {
 		return 0, os.ErrDeadlineExceeded
 	}
@@ -107,6 +114,9 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 func (c *Conn) Write(p []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	n := 0
 	for n < len(p) {
 		k := min(len(p)-n, c.maxRecord)

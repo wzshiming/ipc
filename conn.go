@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -220,6 +221,15 @@ func (c *Conn) recvErr() error {
 	return c.err
 }
 
+// timeout is what a call past its deadline returns, net.ErrClosed once Close
+// was called.
+func (c *Conn) timeout() error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	return os.ErrDeadlineExceeded
+}
+
 // peerErr maps the link errors a vanished peer causes to ErrPeerClosed.
 func peerErr(err error) error {
 	if isPeerGone(err) {
@@ -251,7 +261,8 @@ func (c *Conn) SetDeadline(t time.Time) error {
 // SetReadDeadline sets the deadline for Read, WriteTo and Next, including
 // calls already blocked. Past the deadline they fail with
 // os.ErrDeadlineExceeded, which is a net.Error whose Timeout method reports
-// true; a zero t means no deadline. TryNext ignores it.
+// true, or with net.ErrClosed after Close; a zero t means no deadline.
+// TryNext ignores it.
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.rx.dl.set(t)
 	return nil
@@ -259,14 +270,16 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 
 // SetWriteDeadline sets the deadline for Write, ReadFrom and Reserve,
 // including calls already blocked. Past the deadline they fail with
-// os.ErrDeadlineExceeded; a zero t means no deadline. TryReserve ignores it.
+// os.ErrDeadlineExceeded, or with net.ErrClosed after Close; a zero t means
+// no deadline. TryReserve ignores it.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.tx.dl.set(t)
 	return nil
 }
 
 // Close tells the peer goodbye, closes the link and wakes every blocked call
-// with net.ErrClosed; records the peer committed are no longer delivered. It
+// with net.ErrClosed, which later sends and receives return too, even past
+// their deadline; records the peer committed are no longer delivered. It
 // does not wait for a stream call in progress, such as a WriteTo inside its
 // destination's Write. Slices still held from Reserve or Next stay readable
 // until they are committed, aborted or released, while a record Read or

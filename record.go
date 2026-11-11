@@ -1,7 +1,6 @@
 package ipc
 
 import (
-	"os"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -93,11 +92,11 @@ func (c *Conn) TryReserve(n int) ([]byte, error) {
 
 // Reserve is like TryReserve but blocks until the ring has room, the write
 // deadline passes or the connection closes. Past the deadline it returns
-// os.ErrDeadlineExceeded. It spins for the connection's Spin duration before
-// parking until the peer frees room.
+// os.ErrDeadlineExceeded unless Close was called. It spins for the
+// connection's Spin duration before parking until the peer frees room.
 func (c *Conn) Reserve(n int) ([]byte, error) {
 	if c.tx.dl.expired.Load() {
-		return nil, os.ErrDeadlineExceeded
+		return nil, c.timeout()
 	}
 	p, err := c.TryReserve(n)
 	if err != ErrWouldBlock {
@@ -111,7 +110,7 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 			}
 			if i%spinCheckEvery == 0 {
 				if c.tx.dl.expired.Load() {
-					return nil, os.ErrDeadlineExceeded
+					return nil, c.timeout()
 				}
 				if isClosed(c.done) {
 					return nil, c.sendErr()
@@ -136,7 +135,7 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 					c.prod.Unpark()
 					c.tx.release(c)
 				}
-				return nil, os.ErrDeadlineExceeded
+				return nil, c.timeout()
 			case <-c.done:
 				return nil, c.sendErr()
 			}
@@ -215,12 +214,12 @@ func (c *Conn) TryNext() ([]byte, error) {
 
 // Next is like TryNext but blocks until a record arrives, the read deadline
 // passes or the connection closes. Past the deadline it returns
-// os.ErrDeadlineExceeded. After the peer closed it drains without blocking.
-// It spins for the connection's Spin duration before parking until the peer
-// commits.
+// os.ErrDeadlineExceeded unless Close was called. After the peer closed it
+// drains without blocking. It spins for the connection's Spin duration before
+// parking until the peer commits.
 func (c *Conn) Next() ([]byte, error) {
 	if c.rx.dl.expired.Load() {
-		return nil, os.ErrDeadlineExceeded
+		return nil, c.timeout()
 	}
 	p, err := c.TryNext()
 	if err != ErrWouldBlock {
@@ -235,7 +234,7 @@ func (c *Conn) Next() ([]byte, error) {
 			if i%spinCheckEvery == 0 {
 				// No done check: TryNext reports the close once drained.
 				if c.rx.dl.expired.Load() {
-					return nil, os.ErrDeadlineExceeded
+					return nil, c.timeout()
 				}
 				if !time.Now().Before(deadline) {
 					break
@@ -257,7 +256,7 @@ func (c *Conn) Next() ([]byte, error) {
 					c.cons.Unpark()
 					c.rx.release(c)
 				}
-				return nil, os.ErrDeadlineExceeded
+				return nil, c.timeout()
 			case <-c.done:
 			}
 		}
