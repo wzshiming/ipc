@@ -2,8 +2,10 @@ package ipc
 
 import (
 	"errors"
+	"io"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,5 +133,35 @@ func TestTryCallsIgnoreDeadlines(t *testing.T) {
 	}
 	if _, err := rx.TryNext(); err != nil {
 		t.Fatalf("TryNext with a record past deadline = %v; want the record", err)
+	}
+}
+
+func TestCallsAfterClosePastTheirDeadlineAreNetErrClosed(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	dc.SetDeadline(time.Now().Add(-time.Second))
+	dc.Close()
+	buf := make([]byte, 8)
+	for name, call := range map[string]func() error{
+		"Read":     func() error { _, err := dc.Read(buf); return err },
+		"Write":    func() error { _, err := dc.Write(buf); return err },
+		"ReadFrom": func() error { _, err := dc.ReadFrom(strings.NewReader("x")); return err },
+		"WriteTo":  func() error { _, err := dc.WriteTo(io.Discard); return err },
+		"Next":     func() error { _, err := dc.Next(); return err },
+		"Reserve":  func() error { _, err := dc.Reserve(8); return err },
+	} {
+		if err := call(); err != net.ErrClosed {
+			t.Errorf("%s past its deadline after Close = %v; want net.ErrClosed", name, err)
+		}
+	}
+}
+
+func TestEmptyReadAndWriteAfterCloseAreNetErrClosed(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	dc.Close()
+	if n, err := dc.Read(nil); n != 0 || err != net.ErrClosed {
+		t.Errorf("Read(nil) after Close = %d, %v; want 0, net.ErrClosed", n, err)
+	}
+	if n, err := dc.Write(nil); n != 0 || err != net.ErrClosed {
+		t.Errorf("Write(nil) after Close = %d, %v; want 0, net.ErrClosed", n, err)
 	}
 }
