@@ -3,11 +3,99 @@
 package control
 
 import (
+	"net"
 	"os"
+	"runtime"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// openFDs counts the descriptors this process has open.
+func openFDs(t *testing.T) int {
+	t.Helper()
+	dir := "/dev/fd"
+	if runtime.GOOS == "linux" {
+		dir = "/proc/self/fd"
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(ents)
+}
+
+// expectOpenFDs fails unless the open descriptor count settles at want; it
+// polls because an earlier test's goroutine may still be closing a socket.
+func expectOpenFDs(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := openFDs(t)
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d descriptors open, want %d", got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// pipeFD returns a descriptor to attach to frames, open until the test ends.
+func pipeFD(t *testing.T) int {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close(); w.Close() })
+	return int(r.Fd())
+}
+
+func repeatFD(fd, n int) []int {
+	fds := make([]int, n)
+	for i := range fds {
+		fds[i] = fd
+	}
+	return fds
+}
+
+// sendFrame writes one frame through c by hand, with fds attached to the
+// frame's byte at offset at.
+func sendFrame(t *testing.T, c *net.UnixConn, typ uint8, payload []byte, at int, fds []int) {
+	t.Helper()
+	f := append([]byte{typ, 0, 0, 0, 0}, payload...)
+	putLength(f[1:headerSize], len(payload))
+	if at > 0 {
+		if _, err := c.Write(f[:at]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := c.WriteMsgUnix(f[at:at+1], unix.UnixRights(fds...), nil); err != nil {
+		t.Fatalf("sending %d descriptors: %v", len(fds), err)
+	}
+	if at+1 < len(f) {
+		if _, err := c.Write(f[at+1:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRecvHandsFirstByteFDsToTheCallerToClose(t *testing.T) {
+	fd := pipeFD(t)
+	a, b := pair(t)
+	before := openFDs(t)
+	sendFrame(t, b.c, 7, []byte("fd"), 0, repeatFD(fd, 3))
+	typ, p, fds, err := a.Recv()
+	if err != nil || typ != 7 || string(p) != "fd" || len(fds) != 3 {
+		t.Fatalf("typ=%d payload=%q fds=%v err=%v", typ, p, fds, err)
+	}
+	expectOpenFDs(t, before+3)
+	CloseFDs(fds)
+	expectOpenFDs(t, before)
+}
 
 func recvOneFD(t *testing.T, w *os.File) int {
 	t.Helper()
