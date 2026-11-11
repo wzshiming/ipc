@@ -47,4 +47,31 @@
 // after a graceful close or ErrPeerClosed after a crash, until this end's
 // Close. The segment is unmapped once this end has closed and every
 // outstanding slice has been released.
+//
+// # Costs
+//
+// A connection's segment holds its two rings, each RingSize bytes behind a
+// 4 KiB header, 2 × (RingSize + 4096) bytes in all, and both processes map
+// it. A Listener without ListenConfig.RingSize grants any dialer up to
+// 512 MiB per direction. At most 16 connections are in their handshake or
+// waiting for Accept at once, and those waiting hold their segments. On
+// Linux, macOS and Windows a Listener holds the lock file path+".lock"
+// beside its socket file; its Close removes it, except on Windows, where it
+// stays.
+//
+// # Trust boundary
+//
+// Each end guards itself against its peer. It checks the ring headers and
+// every record the peer publishes, and a violation ends the connection with
+// ErrCorrupt. The peer cannot shrink the segment under this end's mapping.
+// Descriptors it attaches to control frames are closed, save the segment's
+// in the handshake. A doorbell the peer's control socket does not take
+// within 50 ms ends the connection with a control protocol violation rather
+// than holding up the call that rang it. A dialer that stalls or breaks its
+// handshake never reaches Accept and keeps one of the 16 places for at most
+// 5 s. Not guarded are the slices from Next, and those WriteTo hands its
+// destination: they alias memory the peer can rewrite at any time, so copy
+// what must not change before checking it. Nor does either end check who
+// its peer is; the file system decides who may dial, and Listen makes the
+// socket file mode 0600 on Linux and macOS.
 package ipc
