@@ -185,9 +185,20 @@ func TestSendRejectsOversizePayload(t *testing.T) {
 	}
 }
 
-// readFrames parses n frames from c's raw stream, in large reads so that the
-// reader keeps ahead of any sender.
-func readFrames(c net.Conn, n int, check func(typ uint8, p []byte) error) error {
+// newCredits returns 32 credits, one per frame sent ahead of readFrames; 32
+// frames of up to 76 bytes leave darwin's 8 KiB socket buffer far from full.
+func newCredits() chan struct{} {
+	credits := make(chan struct{}, 32)
+	for range cap(credits) {
+		credits <- struct{}{}
+	}
+	return credits
+}
+
+// readFrames parses n frames from c's raw stream, hands each to check and then
+// returns its credit; it closes credits on return, which stops the senders.
+func readFrames(c net.Conn, n int, credits chan<- struct{}, check func(typ uint8, p []byte) error) error {
+	defer close(credits)
 	r := bufio.NewReaderSize(c, 64<<10)
 	var h [headerSize]byte
 	p := make([]byte, MaxPayload)
@@ -205,6 +216,7 @@ func readFrames(c net.Conn, n int, check func(typ uint8, p []byte) error) error 
 		if err := check(h[0], p[:m]); err != nil {
 			return err
 		}
+		credits <- struct{}{}
 	}
 	return nil
 }
@@ -236,10 +248,14 @@ func TestTrySendToAPeerThatNeverReadsIsErrBusyWithinTheBound(t *testing.T) {
 func TestTrySendDelivers100000FramesInOrderToAReadingPeer(t *testing.T) {
 	a, b := pair(t)
 	const n = 100000
+	credits := newCredits()
 	errc := make(chan error, 1)
 	go func() {
 		var buf [8]byte
 		for i := range n {
+			if _, ok := <-credits; !ok {
+				break
+			}
 			binary.LittleEndian.PutUint32(buf[:], uint32(i))
 			binary.LittleEndian.PutUint32(buf[4:], ^uint32(i))
 			if err := a.TrySend(uint8(i), buf[:i%9]); err != nil {
@@ -252,7 +268,7 @@ func TestTrySendDelivers100000FramesInOrderToAReadingPeer(t *testing.T) {
 	}()
 	var want [8]byte
 	i := 0
-	err := readFrames(b.c, n, func(typ uint8, p []byte) error {
+	err := readFrames(b.c, n, credits, func(typ uint8, p []byte) error {
 		binary.LittleEndian.PutUint32(want[:], uint32(i))
 		binary.LittleEndian.PutUint32(want[4:], ^uint32(i))
 		if typ != uint8(i) || !bytes.Equal(p, want[:i%9]) {
@@ -269,11 +285,15 @@ func TestTrySendDelivers100000FramesInOrderToAReadingPeer(t *testing.T) {
 func TestTrySendInterleavedWithSendKeepsFramesWholeAndInOrder(t *testing.T) {
 	a, b := pair(t)
 	const senders, perSender = 8, 12500
+	credits := newCredits()
 	errc := make(chan error, senders)
 	for id := range senders {
 		go func() {
 			buf := make([]byte, 8+64)
 			for seq := range perSender {
+				if _, ok := <-credits; !ok {
+					break
+				}
 				binary.LittleEndian.PutUint32(buf, uint32(id))
 				binary.LittleEndian.PutUint32(buf[4:], uint32(seq))
 				n := 8 + seq%64
@@ -296,7 +316,7 @@ func TestTrySendInterleavedWithSendKeepsFramesWholeAndInOrder(t *testing.T) {
 		}()
 	}
 	var next [senders]int
-	err := readFrames(b.c, senders*perSender, func(typ uint8, p []byte) error {
+	err := readFrames(b.c, senders*perSender, credits, func(typ uint8, p []byte) error {
 		if len(p) < 8 {
 			return fmt.Errorf("short payload %x", p)
 		}
