@@ -17,9 +17,10 @@ type Dialer struct {
 	// it, clamped to its ListenConfig.RingSize, and both ends use the result.
 	RingSize int
 	// Spin is how long a blocking call on the connection busy re-checks its
-	// ring, without yielding its thread, before parking; 0 means 50 µs and
-	// a negative value parks at once. Each spinning call holds a CPU, so
-	// choose Spin small or negative when CPUs are scarce.
+	// ring, without yielding its thread, before parking; 0 means 50 µs, or
+	// none when runtime.NumCPU reports 1, and a negative value parks at
+	// once. Each spinning call holds a CPU, so choose Spin small or negative
+	// when CPUs are scarce.
 	Spin time.Duration
 	// Timeout is the maximum time the dial and handshake may take; 0 means
 	// no limit other than the handshake's own 5 s bound.
