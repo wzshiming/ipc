@@ -147,30 +147,45 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 }
 
 // Commit publishes the record reserved by Reserve or TryReserve to the peer
-// and wakes the peer if it is parked. After the connection closed it returns
-// ErrPeerClosed or net.ErrClosed, as the peer will not read the record.
+// and wakes the peer if it is parked. It returns nil exactly when it
+// published the record: once the connection is closed it publishes nothing
+// and returns ErrPeerClosed or net.ErrClosed.
 func (c *Conn) Commit() error {
 	if !c.tx.held {
 		return errOrder
 	}
-	return c.committed(c.prod.Commit())
+	if err := c.abortIfClosed(); err != nil {
+		return err
+	}
+	c.committed(c.prod.Commit())
+	return nil
 }
 
 // commitN publishes the first n bytes of the reserved record, like Commit.
 func (c *Conn) commitN(n int) error {
-	return c.committed(c.prod.CommitN(n))
+	if err := c.abortIfClosed(); err != nil {
+		return err
+	}
+	c.committed(c.prod.CommitN(n))
+	return nil
+}
+
+// abortIfClosed aborts the reservation once the connection is closed and
+// returns why, so that the peer never sees a record whose Commit failed.
+func (c *Conn) abortIfClosed() error {
+	if c.tx.state.Load()&halfClosed == 0 {
+		return nil
+	}
+	c.Abort()
+	return c.sendErr()
 }
 
 // committed ends the reservation the ring published and rings a parked peer.
-func (c *Conn) committed(wake bool) error {
+func (c *Conn) committed(wake bool) {
 	c.tx.held = false
-	if c.tx.release(c) {
-		return c.sendErr()
+	if !c.tx.release(c) && wake {
+		c.ring(&c.tx.bell)
 	}
-	if wake {
-		return c.ring(&c.tx.bell)
-	}
-	return nil
 }
 
 // Abort discards the record reserved by Reserve or TryReserve, if any.
