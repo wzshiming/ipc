@@ -264,7 +264,7 @@ func TestInterruptedParkedNextKeepsData(t *testing.T) {
 		_, err := dc.Next()
 		ch <- err
 	}()
-	time.Sleep(50 * time.Millisecond)
+	awaitReceiveParked(t, dc)
 	dc.SetReadDeadline(time.Now())
 	if err := waitErr(t, ch, 100*time.Millisecond); err != os.ErrDeadlineExceeded {
 		t.Fatalf("Next after deadline = %v; want os.ErrDeadlineExceeded", err)
@@ -303,7 +303,7 @@ func TestInterruptedParkedReserveKeepsData(t *testing.T) {
 		_, err := tx.Reserve(1000)
 		ch <- err
 	}()
-	time.Sleep(50 * time.Millisecond)
+	awaitSendParked(t, tx)
 	tx.SetWriteDeadline(time.Now())
 	if err := waitErr(t, ch, 100*time.Millisecond); err != os.ErrDeadlineExceeded {
 		t.Fatalf("Reserve after deadline = %v; want os.ErrDeadlineExceeded", err)
@@ -350,7 +350,7 @@ func TestPeerCloseWakesBlockedNextWithEOF(t *testing.T) {
 		_, err := dc.Next()
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitReceiveParked(t, dc)
 	lc.Close()
 	if err := waitErr(t, ch, time.Second); err != io.EOF {
 		t.Fatalf("Next = %v; want io.EOF", err)
@@ -374,7 +374,7 @@ func TestPeerCloseWakesBlockedReserveWithErrPeerClosed(t *testing.T) {
 		_, err := dc.Reserve(4000)
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitSendParked(t, dc)
 	lc.Close()
 	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("Reserve = %v; want ErrPeerClosed", err)
@@ -457,7 +457,7 @@ func TestParkedNextWokenByPeerCloseReturnsRecordCommittedBeforeIt(t *testing.T) 
 		ch <- result{seq: getSeq(rec)}
 		dc.Release()
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitReceiveParked(t, dc)
 	// Commit without ringing, so only the peer's close wakes the parked Next.
 	p, err := lc.prod.TryReserve(8)
 	if err != nil {
@@ -503,7 +503,7 @@ func TestReleaseAfterPeerCloseSucceedsWhenPeerWasParked(t *testing.T) {
 		_, err := lc.Reserve(4000)
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitSendParked(t, lc)
 	lc.Close()
 	waitErr(t, ch, time.Second)
 	<-dc.Done()
@@ -556,7 +556,7 @@ func TestLocalCloseWakesBlockedNextWithNetErrClosed(t *testing.T) {
 		_, err := dc.Next()
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitReceiveParked(t, dc)
 	dc.Close()
 	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
 		t.Fatalf("Next = %v; want net.ErrClosed", err)
@@ -582,7 +582,7 @@ func TestLocalCloseWakesBlockedReserveWithNetErrClosed(t *testing.T) {
 		_, err := dc.Reserve(4000)
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitSendParked(t, dc)
 	dc.Close()
 	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
 		t.Fatalf("Reserve = %v; want net.ErrClosed", err)
@@ -601,7 +601,8 @@ func TestLocalCloseWakesBlockedReadAndWriteWithNetErrClosed(t *testing.T) {
 		_, err := dc.Read(make([]byte, 8))
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitSendParked(t, dc)
+	awaitReceiveParked(t, dc)
 	dc.Close()
 	for range 2 {
 		if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
@@ -890,7 +891,7 @@ func TestAcceptAfterListenerCloseReturnsNilConnAndNetErrClosed(t *testing.T) {
 		_, err := l.Accept()
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitAccept(t)
 	l.Close()
 	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
 		t.Fatalf("Accept = %v; want net.ErrClosed", err)

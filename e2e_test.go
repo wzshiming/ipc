@@ -294,7 +294,7 @@ func TestE2EKilledPeerWakesBlockedNextWithErrPeerClosed(t *testing.T) {
 		_, err := conns[0].Next()
 		ch <- err
 	}()
-	time.Sleep(50 * time.Millisecond)
+	awaitReceiveParked(t, conns[0])
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}

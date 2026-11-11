@@ -117,7 +117,7 @@ func TestBlockedNextIsWokenByDoorbell(t *testing.T) {
 		n, _ := dc.Read(buf)
 		ch <- buf[:n]
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitReceiveParked(t, dc)
 	lc.Write([]byte("ding"))
 	select {
 	case got := <-ch:
@@ -142,7 +142,7 @@ func TestBlockedReserveIsWokenByRelease(t *testing.T) {
 		_, err := tx.Write(make([]byte, 4000))
 		ch <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	awaitSendParked(t, tx)
 	for range 2 {
 		if _, err := rx.TryNext(); err != nil {
 			t.Fatal(err)
