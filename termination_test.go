@@ -75,6 +75,7 @@ func rawPeer(t *testing.T, ringSize int) (c *Conn, sock *net.UnixConn, mem []byt
 		seg.Close()
 		t.Fatal(err)
 	}
+	c.start()
 	t.Cleanup(func() { c.Close() })
 	return c, sock, peerSeg.Bytes()
 }
