@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func listDevShm(t *testing.T) map[string]bool {
@@ -39,5 +41,41 @@ func TestLinuxCreateUsesMemfdWithoutDevShmResidue(t *testing.T) {
 		if !before[name] {
 			t.Fatalf("new /dev/shm entry %q after Create", name)
 		}
+	}
+}
+
+func TestExportedSegmentRefusesNewSeals(t *testing.T) {
+	if _, err := unix.FcntlInt(uintptr(exportedFD(t, MinSize)), unix.F_ADD_SEALS, unix.F_SEAL_FUTURE_WRITE); err == nil {
+		t.Fatal("F_ADD_SEALS succeeded on an exported segment's fd")
+	}
+}
+
+func TestAttachRefusesResizableMemfd(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		flags int
+		seals int
+	}{
+		{"unsealed", unix.MFD_CLOEXEC, 0},
+		{"can shrink", unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING, unix.F_SEAL_GROW},
+		{"can grow", unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING, unix.F_SEAL_SHRINK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fd, err := unix.MemfdCreate("peer", tc.flags)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.Ftruncate(fd, int64(mapLen(MinSize))); err != nil {
+				unix.Close(fd)
+				t.Fatal(err)
+			}
+			if tc.seals != 0 {
+				if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, tc.seals); err != nil {
+					unix.Close(fd)
+					t.Fatal(err)
+				}
+			}
+			assertAttachRefuses(t, fd, MinSize)
+		})
 	}
 }

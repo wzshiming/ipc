@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -75,4 +76,62 @@ func TestDecodeClosesFDsOnWrongCount(t *testing.T) {
 			t.Errorf("fd %d still open after failed decode (err=%v)", fd, err)
 		}
 	}
+}
+
+// exportedFD returns the fd a peer receives for a new segment of size bytes.
+func exportedFD(t *testing.T, size int) int {
+	t.Helper()
+	seg, err := Create(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { seg.Close() })
+	tok, err := seg.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tok.Close() })
+	_, fds := tok.Encode()
+	return fds[0]
+}
+
+// assertAttachRefuses checks that Attach refuses fd as a peer's size-byte
+// segment and closes it.
+func assertAttachRefuses(t *testing.T, fd, size int) {
+	t.Helper()
+	tok, err := DecodeToken(binary.LittleEndian.AppendUint64(nil, uint64(size)), []int{fd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seg, err := Attach(tok); err == nil {
+		seg.Close()
+		t.Fatal("Attach accepted the descriptor")
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != unix.EBADF {
+		t.Errorf("fd %d still open after refused Attach (err=%v)", fd, err)
+	}
+}
+
+func TestExportedSegmentCannotShrink(t *testing.T) {
+	if err := unix.Ftruncate(exportedFD(t, MinSize), 0); err == nil {
+		t.Fatal("ftruncate to 0 succeeded on an exported segment's fd")
+	}
+}
+
+func TestExportedSegmentCannotGrow(t *testing.T) {
+	if err := unix.Ftruncate(exportedFD(t, MinSize), 2*int64(mapLen(MinSize))); err == nil {
+		t.Fatal("ftruncate to twice the size succeeded on an exported segment's fd")
+	}
+}
+
+func TestAttachRefusesRegularFile(t *testing.T) {
+	fd, err := unix.Open(filepath.Join(t.TempDir(), "segment"), unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Ftruncate(fd, int64(mapLen(MinSize))); err != nil {
+		unix.Close(fd)
+		t.Fatal(err)
+	}
+	assertAttachRefuses(t, fd, MinSize)
 }
