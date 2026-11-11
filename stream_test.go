@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -405,6 +406,51 @@ func (w *limitWriter) Write(p []byte) (int, error) {
 	return k, w.err
 }
 
+// writerFunc is an io.Writer that calls itself.
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// stallWriter closes stalled on its first Write and waits for resume, then
+// takes at most max bytes of every slice.
+type stallWriter struct {
+	stalled, resume chan struct{}
+	max             int
+	writes          int
+}
+
+func (w *stallWriter) Write(p []byte) (int, error) {
+	if w.writes++; w.writes == 1 {
+		close(w.stalled)
+		<-w.resume
+	}
+	return min(len(p), w.max), nil
+}
+
+// resumeAtCleanup closes resume when the test ends unless it is closed by
+// then, so that a failing test does not leave its stalled call behind.
+func resumeAtCleanup(t *testing.T, resume chan struct{}) {
+	t.Cleanup(func() {
+		select {
+		case <-resume:
+		default:
+			close(resume)
+		}
+	})
+}
+
+// closeWithin fails t unless c.Close returns within d.
+func closeWithin(t *testing.T, c *Conn, d time.Duration, while string) {
+	t.Helper()
+	ch := make(chan error, 1)
+	go func() { ch <- c.Close() }()
+	select {
+	case <-ch:
+	case <-time.After(d):
+		t.Fatalf("Close did not return within %v while %s", d, while)
+	}
+}
+
 func TestIOCopyRoundTripsEverySizeWithPartialReads(t *testing.T) {
 	const ringSize = 64 << 10
 	maxRecord := ring.MaxRecord(ringSize)
@@ -554,6 +600,125 @@ func TestLocalCloseWakesBlockedReadFromAndWriteToWithNetErrClosed(t *testing.T) 
 		if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
 			t.Fatalf("blocked ReadFrom or WriteTo = %v; want net.ErrClosed", err)
 		}
+	}
+}
+
+func TestCloseReturnsWhileWriteToIsInsideItsDestination(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if _, err := lc.Write([]byte("record")); err != nil {
+		t.Fatal(err)
+	}
+	dst := &stallWriter{stalled: make(chan struct{}), resume: make(chan struct{}), max: 1 << 30}
+	resumeAtCleanup(t, dst.resume)
+	ch := make(chan error, 1)
+	go func() {
+		_, err := dc.WriteTo(dst)
+		ch <- err
+	}()
+	<-dst.stalled
+	closeWithin(t, dc, time.Second, "WriteTo was inside its destination's Write")
+	close(dst.resume)
+	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+		t.Fatalf("WriteTo once its destination returned = %v; want net.ErrClosed", err)
+	}
+	if !dc.unmapped.Load() {
+		t.Fatal("segment still mapped after Close and WriteTo returned")
+	}
+}
+
+func TestCloseReturnsWhileReadFromIsInsideItsSource(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	src := &stallReader{stalled: make(chan struct{}), resume: make(chan struct{}), rest: strings.NewReader("")}
+	resumeAtCleanup(t, src.resume)
+	ch := make(chan error, 1)
+	go func() {
+		_, err := dc.ReadFrom(src)
+		ch <- err
+	}()
+	<-src.stalled
+	closeWithin(t, dc, time.Second, "ReadFrom was inside its source's Read")
+	close(src.resume)
+	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
+		t.Fatalf("ReadFrom once its source returned = %v; want net.ErrClosed", err)
+	}
+	if !dc.unmapped.Load() {
+		t.Fatal("segment still mapped after Close and ReadFrom returned")
+	}
+}
+
+func TestStreamCallInProgressAtCloseReleasesTheRecordItLeavesPartlyConsumed(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if _, err := lc.Write([]byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	dst := &stallWriter{stalled: make(chan struct{}), resume: make(chan struct{}), max: 3}
+	resumeAtCleanup(t, dst.resume)
+	ch := make(chan error, 1)
+	go func() {
+		_, err := dc.WriteTo(dst)
+		ch <- err
+	}()
+	<-dst.stalled
+	closeWithin(t, dc, time.Second, "WriteTo was inside its destination's Write")
+	close(dst.resume)
+	if err := waitErr(t, ch, time.Second); err != io.ErrShortWrite {
+		t.Fatalf("WriteTo = %v; want io.ErrShortWrite, leaving the record partly consumed", err)
+	}
+	if !dc.unmapped.Load() {
+		t.Fatal("segment still mapped after Close and the WriteTo holding a partly consumed record returned")
+	}
+}
+
+func TestCloseRacingReadAndWriteToOverAPartlyConsumedRecordAlwaysUnmaps(t *testing.T) {
+	errStop := errors.New("stop")
+	l, path := listen(t, ListenConfig{RingSize: 64 << 10})
+	for i := range 2000 {
+		served, dialed := serve(t, l, path, 1)
+		lc, dc := served[0], dialed[0]
+		if _, err := lc.Write(make([]byte, 4096)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dc.Read(make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		errs := make(chan error, 2)
+		go func() {
+			buf := make([]byte, 1)
+			for {
+				if _, err := dc.Read(buf); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+		go func() {
+			// Yielding inside Write keeps WriteTo in progress across Close.
+			w := writerFunc(func([]byte) (int, error) {
+				for range i % 4 {
+					runtime.Gosched()
+				}
+				return 1, errStop
+			})
+			for {
+				if _, err := dc.WriteTo(w); err != errStop {
+					errs <- err
+					return
+				}
+			}
+		}()
+		for range i % 32 {
+			runtime.Gosched()
+		}
+		dc.Close()
+		for range 2 {
+			if err := waitErr(t, errs, 5*time.Second); err != net.ErrClosed {
+				t.Fatalf("round %d: Read or WriteTo racing Close = %v; want net.ErrClosed", i, err)
+			}
+		}
+		if !dc.unmapped.Load() {
+			t.Fatalf("round %d: segment still mapped after Close, Read and WriteTo returned", i)
+		}
+		lc.Close()
 	}
 }
 
