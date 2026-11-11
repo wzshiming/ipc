@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,13 +20,21 @@ type Listener struct {
 }
 
 // Listen listens on the AF_UNIX socket at path. A socket file left behind by
-// a dead listener is removed; a live one fails with EADDRINUSE. ctx bounds
+// a dead listener is removed; a live one fails with EADDRINUSE. On Linux a
+// path starting with @ is an abstract name, which has no file. ctx bounds
 // the setup, including the probe of an existing socket file.
 func Listen(ctx context.Context, path string) (*Listener, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	addr := &net.UnixAddr{Name: path, Net: "unix"}
+	if runtime.GOOS == "linux" && strings.HasPrefix(path, "@") {
+		l, err := net.ListenUnix("unix", addr)
+		if err != nil {
+			return nil, err
+		}
+		return &Listener{l: l}, nil
+	}
 	l, err := net.ListenUnix("unix", addr)
 	if err != nil && isStale(ctx, path) {
 		if rerr := os.Remove(path); rerr == nil || os.IsNotExist(rerr) {
