@@ -126,7 +126,8 @@ func corruptErr(dir uint8, err error) error {
 }
 
 // readLoop dispatches doorbells to the halves until the link fails or the
-// peer says goodbye, then closes the link.
+// peer says goodbye, then closes the link. Close leaves it reading until the
+// peer closes its side or lingerWait has passed.
 func (c *Conn) readLoop() {
 	defer close(c.readerDone)
 	defer c.link.Close()
@@ -173,6 +174,12 @@ func (c *Conn) readLoop() {
 func (c *Conn) shutdown(err error) {
 	c.end(err, false)
 	c.link.Close()
+	c.closeRecv()
+}
+
+// closeRecv ends receives, waking a blocked one; the segment is released when
+// no slice is outstanding.
+func (c *Conn) closeRecv() {
 	c.rxOnce.Do(func() {
 		c.rx.close(c)
 		close(c.rxClosed)
@@ -310,27 +317,35 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 }
 
 // Close tells the peer goodbye, giving up after 50 ms when the peer's socket
-// does not take it, closes the link and wakes every blocked call with
-// net.ErrClosed, which later sends and receives return too, even past
-// their deadline; records the peer committed are no longer delivered. It
-// does not wait for a stream call in progress, such as a WriteTo inside its
-// destination's Write. Slices still held from Reserve or Next stay readable
-// until they are committed, aborted or released, while a record Read or
-// WriteTo holds partly consumed is released, at once or by the call in
-// progress when it returns; the segment is unmapped once no slice is left.
+// does not take it, and wakes every blocked call with net.ErrClosed, which
+// later sends and receives return too, even past their deadline; records the
+// peer committed are no longer delivered. It waits neither for the peer nor
+// for a stream call in progress, such as a WriteTo inside its destination's
+// Write; the socket outlives it until the peer closes its side, for a second
+// at most. Slices still held from Reserve or Next stay readable until they
+// are committed, aborted or released, while a record Read or WriteTo holds
+// partly consumed is released, at once or by the call in progress when it
+// returns; the segment is unmapped once no slice is left.
 func (c *Conn) Close() error {
 	c.closed.Store(true)
 	if c.end(net.ErrClosed, false) {
+		// Closing with doorbells unread resets the socket on Windows, losing the
+		// goodbye; the reader closes it once the peer closed its side.
+		c.link.SetReadDeadline(time.Now().Add(lingerWait))
 		c.link.TrySend(frameBye, nil)
+		c.link.CloseWrite()
 	}
-	c.shutdown(net.ErrClosed)
-	<-c.readerDone
+	c.closeRecv()
 	if c.rgate.tryLock() {
 		c.drop()
 		c.rgate.unlock()
 	}
 	return nil
 }
+
+// lingerWait bounds how long the socket outlives Close for the peer to read
+// the goodbye and close its side.
+const lingerWait = time.Second
 
 // Done is closed once the connection is closed by either end or fails. After
 // the peer's close, receives still drain what it committed until Close.

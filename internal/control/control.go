@@ -221,6 +221,10 @@ func (k *Link) readRest(b []byte) error {
 	return nil
 }
 
+// CloseWrite shuts the link's sending side: after the frames already sent the
+// peer reads io.EOF, while Recv goes on.
+func (k *Link) CloseWrite() error { return closedErr(k.c.CloseWrite()) }
+
 // Close closes the link and wakes a blocked Recv; later calls return nil.
 func (k *Link) Close() error {
 	k.closeOnce.Do(func() {
