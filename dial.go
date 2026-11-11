@@ -39,11 +39,13 @@ func (d *Dialer) Dial(path string) (*Conn, error) {
 	return d.DialContext(context.Background(), path)
 }
 
-// DialContext connects to the listener at path and completes the handshake.
-// The dial fails when ctx is done or Timeout elapses, whichever comes first,
-// returning ctx's error or os.ErrDeadlineExceeded; ctx does not affect the
-// returned connection. It returns ErrRejected when the listener refuses the
-// request. A nil d uses the defaults.
+// DialContext connects to the listener at path and completes the handshake,
+// which the listener runs without waiting for Accept, so the dial can return
+// before the listener's Accept does. The dial fails when ctx is done or
+// Timeout elapses, whichever comes first, returning ctx's error or
+// os.ErrDeadlineExceeded; ctx does not affect the returned connection. It
+// returns ErrRejected when the listener refuses the request. A nil d uses
+// the defaults.
 func (d *Dialer) DialContext(ctx context.Context, path string) (*Conn, error) {
 	var cfg Dialer
 	if d != nil {
