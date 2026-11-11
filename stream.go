@@ -23,9 +23,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	n := copy(p, c.rec)
-	if c.rec = c.rec[n:]; len(c.rec) == 0 {
-		c.Release()
-	}
+	c.consume(n)
 	return n, nil
 }
 
@@ -44,6 +42,14 @@ func (c *Conn) hold() error {
 		c.rec = rec
 	}
 	return nil
+}
+
+// consume marks the first n bytes of the held record read, releasing the
+// record once all of it is.
+func (c *Conn) consume(n int) {
+	if c.rec = c.rec[n:]; len(c.rec) == 0 {
+		c.Release()
+	}
 }
 
 // drop releases the record held partly consumed, if any.
@@ -86,9 +92,8 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 		}
 		k, err := w.Write(c.rec)
 		n += int64(k)
-		if c.rec = c.rec[k:]; len(c.rec) == 0 {
-			c.Release()
-		} else if err == nil {
+		c.consume(k)
+		if err == nil && len(c.rec) > 0 {
 			err = io.ErrShortWrite
 		}
 		if err != nil {
