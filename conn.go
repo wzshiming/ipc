@@ -309,8 +309,9 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// Close tells the peer goodbye, closes the link and wakes every blocked call
-// with net.ErrClosed, which later sends and receives return too, even past
+// Close tells the peer goodbye, giving up after 50 ms when the peer's socket
+// does not take it, closes the link and wakes every blocked call with
+// net.ErrClosed, which later sends and receives return too, even past
 // their deadline; records the peer committed are no longer delivered. It
 // does not wait for a stream call in progress, such as a WriteTo inside its
 // destination's Write. Slices still held from Reserve or Next stay readable
@@ -320,8 +321,7 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 func (c *Conn) Close() error {
 	c.closed.Store(true)
 	if c.end(net.ErrClosed, false) {
-		c.link.SetWriteDeadline(time.Now().Add(time.Second))
-		c.link.Send(frameBye, nil, nil)
+		c.link.TrySend(frameBye, nil)
 	}
 	c.shutdown(net.ErrClosed)
 	<-c.readerDone
