@@ -62,9 +62,12 @@
 // it. A Listener without ListenConfig.RingSize grants any dialer up to
 // 512 MiB per direction. A Listener has at most 16 connections in their
 // handshake or waiting for Accept at once, and those waiting hold their
-// segments. On Linux, macOS and Windows a Listener holds the lock file
-// path+".lock" beside its socket file; its Close removes it, except on
-// Windows, where it stays.
+// segments. On Linux and macOS Listen locks the socket's directory for the
+// moment it binds and creates no file besides the socket: a process that
+// keeps that directory locked makes Listen wait, and where the directory
+// cannot be opened for reading Listen goes ahead unlocked, so concurrent
+// Listen calls on one path are then not excluded. On Windows a Listener holds
+// the lock file path+".lock" beside its socket file, which stays after Close.
 //
 // # Trust boundary
 //
@@ -85,7 +88,7 @@
 // # Platforms
 //
 // On Linux a path starting with @ names an abstract socket, which has no
-// socket file and no lock file. On Windows the segment is a named section in
+// socket file and takes no lock. On Windows the segment is a named section in
 // the session's Local\ namespace, so both processes must run in one session,
 // and as the section lives only while a handle to it is open, a connection
 // the listener closes at once can make its dialer's Dial fail. A goodbye can

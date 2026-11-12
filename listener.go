@@ -77,6 +77,7 @@ func Listen(path string) (*Listener, error) {
 // Listen listens on the AF_UNIX socket at path. It fails if lc's RingSize is
 // out of range or another listener is live on path; a socket file left
 // behind by a dead listener is replaced. ctx bounds the setup, including the
+// wait for the lock on the socket's directory on Linux and macOS and the
 // probe of an existing socket file, but not the returned Listener. A nil lc
 // uses the defaults.
 func (lc *ListenConfig) Listen(ctx context.Context, path string) (*Listener, error) {
@@ -272,9 +273,9 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 // Close stops taking dialers, aborts the handshakes in flight and closes the
 // connections waiting for Accept, whose dialers see the connection end; a
 // blocked Accept returns net.ErrClosed. It removes the socket file if it is
-// still the one Listen made, and its lock file except on Windows. It returns
-// once the listener's goroutines have ended. Connections Accept returned
-// stay open.
+// still the one Listen made; on Windows the lock file beside it stays. It
+// returns once the listener's goroutines have ended. Connections Accept
+// returned stay open.
 func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
 		l.cancel()
