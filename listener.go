@@ -39,8 +39,7 @@ type Listener struct {
 	mu       sync.Mutex
 	deadline time.Time
 
-	closeOnce sync.Once
-	closeErr  error
+	close func() error
 }
 
 var _ net.Listener = (*Listener)(nil)
@@ -72,7 +71,7 @@ func (lc *ListenConfig) Listen(ctx context.Context, path string) (*Listener, err
 	if err != nil {
 		return nil, err
 	}
-	return &Listener{cl: cl, ringSize: cfg.RingSize, spin: spinDuration(cfg.Spin), addr: addr(path)}, nil
+	return &Listener{cl: cl, ringSize: cfg.RingSize, spin: spinDuration(cfg.Spin), addr: addr(path), close: sync.OnceValue(cl.Close)}, nil
 }
 
 // Accept waits for a dialer, completes its handshake and returns the
@@ -188,10 +187,7 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 
 // Close stops listening and removes the socket file; a blocked Accept
 // returns net.ErrClosed. Connections already accepted stay open.
-func (l *Listener) Close() error {
-	l.closeOnce.Do(func() { l.closeErr = l.cl.Close() })
-	return l.closeErr
-}
+func (l *Listener) Close() error { return l.close() }
 
 // Addr returns the listener's socket path.
 func (l *Listener) Addr() net.Addr { return l.addr }

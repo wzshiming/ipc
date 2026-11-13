@@ -265,6 +265,40 @@ func TestCloseWakesBlockedRecvAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestLinkCloseConcurrentCallsReturnOneResult(t *testing.T) {
+	a, _ := pair(t)
+	const callers = 16
+	start := make(chan struct{})
+	errc := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			errc <- a.Close()
+		}()
+	}
+	close(start)
+	first := <-errc
+	for range callers - 1 {
+		if err := <-errc; err != first {
+			t.Fatalf("concurrent Close calls returned two different values, %v and %v", first, err)
+		}
+	}
+}
+
+func TestLinkCloseRepeatsTheFirstCallsError(t *testing.T) {
+	a, _ := pair(t)
+	if err := a.c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first := a.Close()
+	if first == nil {
+		t.Fatal("Close over an already closed socket returned nil")
+	}
+	if err := a.Close(); err != first {
+		t.Fatalf("second Close returned %v, a different value from the first call's %v", err, first)
+	}
+}
+
 func TestListenerCloseUnblocksAcceptAndRemovesFile(t *testing.T) {
 	path := sockPath(t)
 	l := listen(t, path)

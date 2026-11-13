@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"context"
 	"os"
 	"sync/atomic"
 	"time"
@@ -17,7 +18,7 @@ const (
 )
 
 // spinCheckEvery is how many failed re-checks a spin makes between reads
-// of the clock, the deadline and the connection's done channel.
+// of the clock, the deadline and the connection's lifetime.
 const spinCheckEvery = 128
 
 // half is one direction of a connection as seen by this end: its ring access
@@ -28,8 +29,47 @@ type half struct {
 	held  bool // a Reserve or Next slice is outstanding
 	sig   chan struct{}
 	bell  doorbell
-	dl    deadline
-	_     [128 - 24 - unsafe.Sizeof(deadline{})]byte
+	dl    atomic.Pointer[deadlineCtx] // nil for no deadline
+	_     [128 - 24 - unsafe.Sizeof(atomic.Pointer[deadlineCtx]{})]byte
+}
+
+// deadlineCtx is a half's deadline: ctx ends once the deadline passes or once
+// a later one replaces it and calls cancel.
+type deadlineCtx struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// setDeadline makes t, zero for none, the half's deadline, waking the calls
+// that wait on the one it replaces.
+func (h *half) setDeadline(t time.Time) {
+	var d *deadlineCtx
+	if !t.IsZero() {
+		d = new(deadlineCtx)
+		d.ctx, d.cancel = context.WithDeadline(context.Background(), t)
+	}
+	if old := h.dl.Swap(d); old != nil {
+		old.cancel()
+	} else if d != nil {
+		// A call parked without a deadline waits on sig alone.
+		select {
+		case h.sig <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// passed reports whether d has passed.
+func (d *deadlineCtx) passed() bool {
+	return d.ctx.Err() == context.DeadlineExceeded
+}
+
+// done returns the channel closed once d passes or is replaced; nil if d is nil.
+func (d *deadlineCtx) done() <-chan struct{} {
+	if d == nil {
+		return nil
+	}
+	return d.ctx.Done()
 }
 
 // acquire admits one ring access; it fails once the connection is closed.
@@ -96,7 +136,7 @@ func (c *Conn) TryReserve(n int) ([]byte, error) {
 // os.ErrDeadlineExceeded. It spins for the connection's Spin duration before
 // parking until the peer frees room.
 func (c *Conn) Reserve(n int) ([]byte, error) {
-	if c.tx.dl.expired.Load() {
+	if dl := c.tx.dl.Load(); dl != nil && dl.passed() {
 		return nil, os.ErrDeadlineExceeded
 	}
 	p, err := c.TryReserve(n)
@@ -110,10 +150,10 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 				return p, err
 			}
 			if i%spinCheckEvery == 0 {
-				if c.tx.dl.expired.Load() {
+				if dl := c.tx.dl.Load(); dl != nil && dl.passed() {
 					return nil, os.ErrDeadlineExceeded
 				}
-				if isClosed(c.done) {
+				if c.life.Err() != nil {
 					return nil, c.sendErr()
 				}
 				if !time.Now().Before(deadline) {
@@ -129,15 +169,19 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 		ready := c.prod.Park(n)
 		c.tx.release(c)
 		if !ready {
+			dl := c.tx.dl.Load()
 			select {
 			case <-c.tx.sig:
-			case <-c.tx.dl.done():
+			case <-dl.done():
+				if !dl.passed() {
+					continue // replaced: wait under the new deadline
+				}
 				if c.tx.acquire(c) {
 					c.prod.Unpark()
 					c.tx.release(c)
 				}
 				return nil, os.ErrDeadlineExceeded
-			case <-c.done:
+			case <-c.life.Done():
 				return nil, c.sendErr()
 			}
 		}
@@ -198,11 +242,14 @@ func (c *Conn) TryNext() ([]byte, error) {
 		return nil, c.recvErr()
 	}
 	p, err := c.cons.TryNext()
-	if err == ring.ErrEmpty && isClosed(c.done) {
-		// Recheck: all the peer committed before it left is visible by now.
-		if p, err = c.cons.TryNext(); err == ring.ErrEmpty {
-			c.rx.release(c)
-			return nil, c.recvErr()
+	if err == ring.ErrEmpty {
+		// Nested rather than &&, which spills p and err even when a record came.
+		if c.life.Err() != nil {
+			// Recheck: all the peer committed before it left is visible by now.
+			if p, err = c.cons.TryNext(); err == ring.ErrEmpty {
+				c.rx.release(c)
+				return nil, c.recvErr()
+			}
 		}
 	}
 	if err != nil {
@@ -219,7 +266,7 @@ func (c *Conn) TryNext() ([]byte, error) {
 // It spins for the connection's Spin duration before parking until the peer
 // commits.
 func (c *Conn) Next() ([]byte, error) {
-	if c.rx.dl.expired.Load() {
+	if dl := c.rx.dl.Load(); dl != nil && dl.passed() {
 		return nil, os.ErrDeadlineExceeded
 	}
 	p, err := c.TryNext()
@@ -234,7 +281,7 @@ func (c *Conn) Next() ([]byte, error) {
 			}
 			if i%spinCheckEvery == 0 {
 				// No done check: TryNext reports the close once drained.
-				if c.rx.dl.expired.Load() {
+				if dl := c.rx.dl.Load(); dl != nil && dl.passed() {
 					return nil, os.ErrDeadlineExceeded
 				}
 				if !time.Now().Before(deadline) {
@@ -250,15 +297,19 @@ func (c *Conn) Next() ([]byte, error) {
 		ready := c.cons.Park()
 		c.rx.release(c)
 		if !ready {
+			dl := c.rx.dl.Load()
 			select {
 			case <-c.rx.sig:
-			case <-c.rx.dl.done():
+			case <-dl.done():
+				if !dl.passed() {
+					continue // replaced: wait under the new deadline
+				}
 				if c.rx.acquire(c) {
 					c.cons.Unpark()
 					c.rx.release(c)
 				}
 				return nil, os.ErrDeadlineExceeded
-			case <-c.done:
+			case <-c.life.Done():
 			}
 		}
 		if p, err = c.TryNext(); err != ErrWouldBlock {

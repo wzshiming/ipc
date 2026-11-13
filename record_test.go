@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func raceEnabled() bool {
@@ -204,6 +205,15 @@ func TestBlockingCallsWithDataOrRoomAllocateNothing(t *testing.T) {
 	}
 }
 
+func TestHalfIs128BytesOn64BitPlatforms(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("half is padded for 64-bit platforms")
+	}
+	if n := unsafe.Sizeof(half{}); n != 128 {
+		t.Fatalf("half is %d bytes; want 128 so the directions share no cache line", n)
+	}
+}
+
 func transfer64KiB(tb testing.TB, lc, dc *Conn, records int) time.Duration {
 	msg := make([]byte, 64<<10)
 	done := make(chan error, 1)
@@ -248,4 +258,37 @@ func BenchmarkWriteRead64KiB(b *testing.B) {
 	b.SetBytes(64 << 10)
 	b.ResetTimer()
 	transfer64KiB(b, lc, dc, b.N)
+}
+
+func BenchmarkReserveCommitNextRelease(b *testing.B) {
+	tx, rx := pair(b, ListenConfig{}, Dialer{})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		p, err := tx.Reserve(64)
+		if err != nil {
+			b.Fatal(err)
+		}
+		p[0] = 1
+		tx.Commit()
+		if _, err := rx.Next(); err != nil {
+			b.Fatal(err)
+		}
+		rx.Release()
+	}
+}
+
+func BenchmarkWriteRead64B(b *testing.B) {
+	tx, rx := pair(b, ListenConfig{}, Dialer{})
+	msg, buf := make([]byte, 64), make([]byte, 64)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := tx.Write(msg); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := rx.Read(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
