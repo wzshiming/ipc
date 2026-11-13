@@ -195,7 +195,7 @@ func recvStream(c *Conn, volume int64) error {
 }
 
 // startPeer listens, starts the child in role and returns the n connections
-// it dials, in dial order.
+// it dials, in the order their handshakes completed.
 func startPeer(t *testing.T, role string, lcfg ListenConfig, n int) ([]*Conn, *exec.Cmd) {
 	t.Helper()
 	l, path := listen(t, lcfg)

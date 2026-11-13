@@ -14,6 +14,13 @@ import (
 	"github.com/wzshiming/ipc/internal/shm"
 )
 
+// backlog is the most connections in their handshake or waiting for Accept
+// at once; further dialers wait in the kernel's listen backlog.
+const backlog = 16
+
+// createSegment is shm.Create, replaced in tests.
+var createSegment = shm.Create
+
 // ListenConfig contains options for listening.
 type ListenConfig struct {
 	// RingSize caps the ring capacity per direction a connection gets: a
@@ -28,18 +35,33 @@ type ListenConfig struct {
 }
 
 // Listener accepts connections on an AF_UNIX socket path, any number of
-// them. It is a net.Listener whose Accept returns a *Conn.
+// them. It is a net.Listener whose Accept returns a *Conn. From Listen on it
+// takes dialers and runs their handshakes in the background, side by side,
+// so a Dial can complete before Accept is called; the connections then wait
+// for Accept in the order their handshakes completed. At most 16 connections
+// are in their handshake or waiting for Accept at once; further dialers wait
+// in the socket's backlog until Accept takes one.
 type Listener struct {
 	cl       *control.Listener
 	ringSize int // the largest ring size granted
 	spin     time.Duration
 	addr     addr
 
-	mu       sync.Mutex
-	deadline time.Time
+	ctx    context.Context // done once Close begins
+	cancel context.CancelFunc
+	slots  chan struct{}  // one per connection in its handshake or waiting for Accept
+	ready  chan outcome   // completed handshakes, in completion order
+	dl     deadline       // Accept's deadline
+	wg     sync.WaitGroup // serve and the handshakes it started
 
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// outcome is a completed handshake: a connection, or a failure of this end.
+type outcome struct {
+	c   *Conn
+	err error
 }
 
 var _ net.Listener = (*Listener)(nil)
@@ -71,66 +93,124 @@ func (lc *ListenConfig) Listen(ctx context.Context, path string) (*Listener, err
 	if err != nil {
 		return nil, err
 	}
-	return &Listener{cl: cl, ringSize: cfg.RingSize, spin: spinDuration(cfg.Spin), addr: addr(path)}, nil
+	l := &Listener{
+		cl:       cl,
+		ringSize: cfg.RingSize,
+		spin:     spinDuration(cfg.Spin),
+		addr:     addr(path),
+		slots:    make(chan struct{}, backlog),
+		ready:    make(chan outcome, backlog),
+	}
+	l.ctx, l.cancel = context.WithCancel(context.Background())
+	l.wg.Add(1)
+	go l.serve()
+	return l, nil
 }
 
-// Accept waits for a dialer, completes its handshake and returns the
-// connection, a *Conn. Dialers that fail the handshake are dropped and
-// Accept keeps waiting. Past the deadline set by SetDeadline it returns
-// os.ErrDeadlineExceeded, and after Close net.ErrClosed.
-func (l *Listener) Accept() (net.Conn, error) {
+// serve takes dialers from the socket and starts their handshakes until
+// Close, holding a slot per dialer until Accept takes its outcome or its
+// handshake is dropped. A failure to take a dialer is this end's and reaches
+// Accept like one of a handshake.
+func (l *Listener) serve() {
+	defer l.wg.Done()
 	for {
+		select {
+		case l.slots <- struct{}{}:
+		case <-l.ctx.Done():
+			return
+		}
 		link, err := l.cl.Accept()
 		if err != nil {
-			return nil, listenerErr(err)
+			if errors.Is(err, control.ErrClosed) {
+				return
+			}
+			l.ready <- outcome{err: err}
+			continue
 		}
-		c, local, err := l.handshake(link)
-		if err == nil {
-			return c, nil
-		}
-		if local {
-			return nil, err
-		}
+		l.wg.Add(1)
+		go l.admit(link)
 	}
 }
 
-// listenerErr maps the control listener's close and timeout errors to the
-// standard ones.
-func listenerErr(err error) error {
-	switch {
-	case errors.Is(err, control.ErrClosed):
-		return net.ErrClosed
-	case errors.Is(err, os.ErrDeadlineExceeded):
-		return os.ErrDeadlineExceeded
+// admit runs link's handshake within the handshake limit and queues its
+// outcome for Accept, dropping a failure the dialer caused together with its
+// slot. Close aborts the handshake with a past deadline, which one that
+// completed meanwhile survives, its connection then closed by Close.
+func (l *Listener) admit(link *control.Link) {
+	defer l.wg.Done()
+	link.SetDeadline(time.Now().Add(handshakeTimeout))
+	aborted := make(chan struct{})
+	stop := context.AfterFunc(l.ctx, func() {
+		link.SetDeadline(time.Unix(1, 0))
+		close(aborted)
+	})
+	c, local, err := l.handshake(link)
+	if !stop() {
+		<-aborted
 	}
-	return err
+	switch {
+	case err == nil:
+		link.SetDeadline(time.Time{})
+		c.start()
+		l.ready <- outcome{c: c}
+	case local:
+		l.ready <- outcome{err: err}
+	default:
+		<-l.slots
+	}
+}
+
+// Accept waits for the next connection whose handshake completed and returns
+// it, a *Conn; connections wait in the order their handshakes completed.
+// Dialers that fail the handshake never reach Accept, while a failure of
+// this end, such as one to create a segment, is returned in place of a
+// connection and the Listener serves on. Past the deadline set by
+// SetDeadline it returns os.ErrDeadlineExceeded, and after Close
+// net.ErrClosed.
+func (l *Listener) Accept() (net.Conn, error) {
+	if l.ctx.Err() != nil {
+		return nil, net.ErrClosed
+	}
+	if l.dl.expired.Load() {
+		return nil, os.ErrDeadlineExceeded
+	}
+	select {
+	case o, ok := <-l.ready:
+		if !ok {
+			return nil, net.ErrClosed
+		}
+		<-l.slots
+		if l.ctx.Err() != nil { // Close began: it hands out no connection
+			if o.c != nil {
+				o.c.Close()
+			}
+			return nil, net.ErrClosed
+		}
+		if o.err != nil {
+			return nil, o.err
+		}
+		return o.c, nil
+	case <-l.ctx.Done():
+		return nil, net.ErrClosed
+	case <-l.dl.done():
+		return nil, os.ErrDeadlineExceeded
+	}
 }
 
 // SetDeadline sets the deadline for Accept, including a call already
-// blocked, and for the handshakes it performs; a zero t means no deadline.
+// blocked; a zero t means no deadline. It does not bound the handshakes,
+// which run in the background, each within its own 5 s limit.
 func (l *Listener) SetDeadline(t time.Time) error {
-	l.mu.Lock()
-	l.deadline = t
-	l.mu.Unlock()
-	if err := l.cl.SetDeadline(t); err != nil {
-		return listenerErr(err)
+	if l.ctx.Err() != nil {
+		return net.ErrClosed
 	}
+	l.dl.set(t)
 	return nil
 }
 
-// handshakeDeadline is when a handshake begun now must have finished.
-func (l *Listener) handshakeDeadline() time.Time {
-	t := time.Now().Add(handshakeTimeout)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if !l.deadline.IsZero() && l.deadline.Before(t) {
-		return l.deadline
-	}
-	return t
-}
-
-// handshake answers the dialer's Hello. local reports a failure on this end
-// rather than the dialer's. The link is closed on failure.
+// handshake answers the dialer's Hello and returns the connection, its
+// control reader not yet started. local reports a failure of this end rather
+// than the dialer's. The link is closed on failure.
 func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error) {
 	var seg *shm.Segment
 	defer func() {
@@ -141,7 +221,6 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 			}
 		}
 	}()
-	link.SetDeadline(l.handshakeDeadline())
 	typ, p, fds, err := link.Recv()
 	if err != nil {
 		return nil, false, err
@@ -160,7 +239,7 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 		return nil, false, ErrRejected
 	}
 	ringSize := min(h.ringSize, uint64(l.ringSize))
-	seg, err = shm.Create(int(segmentSize(ringSize)))
+	seg, err = createSegment(int(segmentSize(ringSize)))
 	if err != nil {
 		link.Send(frameReject, []byte("cannot create segment"), nil)
 		return nil, true, err
@@ -186,15 +265,29 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 	if err != nil {
 		return nil, false, err
 	}
-	link.SetDeadline(time.Time{})
-	c.start()
 	return c, false, nil
 }
 
-// Close stops listening and removes the socket file; a blocked Accept
-// returns net.ErrClosed. Connections already accepted stay open.
+// Close stops taking dialers, aborts the handshakes in flight, closes the
+// connections waiting for Accept, whose dialers see the connection end, and
+// removes the socket file; a blocked Accept returns net.ErrClosed. It returns
+// once the listener's goroutines have ended. Connections Accept returned
+// stay open.
 func (l *Listener) Close() error {
-	l.closeOnce.Do(func() { l.closeErr = l.cl.Close() })
+	l.closeOnce.Do(func() {
+		l.cancel()
+		l.closeErr = l.cl.Close()
+		l.wg.Wait()
+		close(l.ready)
+		// Side by side, as each may wait up to readerWait for its dialer.
+		var closing sync.WaitGroup
+		for o := range l.ready {
+			if o.c != nil {
+				closing.Go(func() { o.c.Close() })
+			}
+		}
+		closing.Wait()
+	})
 	return l.closeErr
 }
 
