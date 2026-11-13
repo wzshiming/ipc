@@ -245,8 +245,8 @@ func (c *Conn) RemoteAddr() net.Addr { return c.addr }
 // SetDeadline sets both the read and the write deadline, as
 // SetReadDeadline and SetWriteDeadline do.
 func (c *Conn) SetDeadline(t time.Time) error {
-	c.rx.dl.set(t)
-	c.tx.dl.set(t)
+	c.rx.setDeadline(t)
+	c.tx.setDeadline(t)
 	return nil
 }
 
@@ -255,7 +255,7 @@ func (c *Conn) SetDeadline(t time.Time) error {
 // os.ErrDeadlineExceeded, which is a net.Error whose Timeout method reports
 // true; a zero t means no deadline. TryNext ignores it.
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	c.rx.dl.set(t)
+	c.rx.setDeadline(t)
 	return nil
 }
 
@@ -263,7 +263,7 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 // including calls already blocked. Past the deadline they fail with
 // os.ErrDeadlineExceeded; a zero t means no deadline. TryReserve ignores it.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	c.tx.dl.set(t)
+	c.tx.setDeadline(t)
 	return nil
 }
 
