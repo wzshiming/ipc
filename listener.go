@@ -65,7 +65,7 @@ func (lc *ListenConfig) Listen(ctx context.Context, path string) (*Listener, err
 	if cfg.RingSize == 0 {
 		cfg.RingSize = maxRingSize
 	}
-	if !validRingSize(uint64(cfg.RingSize)) {
+	if !validRingSize(cfg.RingSize) {
 		return nil, fmt.Errorf("ipc: RingSize %d is not a power of two in [64 KiB, 512 MiB]", cfg.RingSize)
 	}
 	cl, err := control.Listen(ctx, path)
@@ -153,22 +153,18 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 	}
 	h, err := decodeHello(p)
 	if err != nil {
-		link.Send(frameReject, []byte("malformed hello"), nil)
+		link.Send(frameReject, []byte(err.Error()), nil)
 		return nil, false, err
 	}
-	if reason := h.reject(); reason != "" {
-		link.Send(frameReject, []byte(reason), nil)
-		return nil, false, ErrRejected
-	}
-	ringSize := min(h.ringSize, uint64(l.ringSize))
-	seg, err = shm.Create(int(segmentSize(ringSize)))
+	ringSize := min(h.ringSize, l.ringSize)
+	seg, err = shm.Create(segmentSize(ringSize))
 	if err != nil {
 		link.Send(frameReject, []byte("cannot create segment"), nil)
 		return nil, true, err
 	}
-	mem, rs := seg.Bytes(), ring.Size(int(ringSize))
+	mem, rs := seg.Bytes(), ring.Size(ringSize)
 	for k := range 2 {
-		if err := ring.Format(mem[k*rs:(k+1)*rs], int(ringSize)); err != nil {
+		if err := ring.Format(mem[k*rs:(k+1)*rs], ringSize); err != nil {
 			return nil, true, err
 		}
 	}
@@ -183,7 +179,7 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 		return nil, false, err
 	}
 	link.SetDeadline(time.Time{})
-	c, err = newConn(link, seg, int(ringSize), l.spin, string(l.addr), true)
+	c, err = newConn(link, seg, ringSize, l.spin, string(l.addr), true)
 	if err != nil {
 		return nil, true, err
 	}

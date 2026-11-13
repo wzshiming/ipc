@@ -1,18 +1,19 @@
 package ipc
 
 import (
-	"encoding/binary"
+	"errors"
+	"math/bits"
 	"time"
 
 	"github.com/wzshiming/ipc/internal/shm"
 )
 
-// Control protocol, version 2. The dialer sends Hello; the listener answers
-// Welcome (with the segment token) or Reject (with a reason) and closes.
-// Afterwards only Doorbell and Bye frames flow, in both directions.
+// Control protocol. The dialer sends Hello; the listener answers Welcome
+// (with the segment token) or Reject (with a reason) and closes.
+// Afterwards only Doorbell and Bye frames flow, in both directions. Hello
+// opens with two magic bytes, and Hello and Welcome carry ring sizes as
+// base-2 exponents.
 const (
-	protoVersion = 2
-
 	frameHello    uint8 = 1
 	frameWelcome  uint8 = 2
 	frameReject   uint8 = 3
@@ -28,71 +29,72 @@ const (
 	dirDialerToListener uint8 = 1
 )
 
-// hello is version u32 | ringSize u64, little-endian. Every version starts
-// with the version word; the rest belongs to that version.
-type hello struct {
-	version  uint32
-	ringSize uint64
+// encodeRingSize is the exponent e of ring size n = 2^e, or 0, which no peer
+// accepts, when n is not a power of two.
+func encodeRingSize(n int) uint8 {
+	if n <= 0 || n&(n-1) != 0 {
+		return 0
+	}
+	return uint8(bits.TrailingZeros(uint(n)))
 }
 
-const helloSize = 12
+// decodeRingSize is the ring size 2^e, or false when e is out of range.
+func decodeRingSize(e uint8) (int, bool) {
+	if e < encodeRingSize(minRingSize) || e > encodeRingSize(maxRingSize) {
+		return 0, false
+	}
+	return 1 << e, true
+}
+
+const helloMagic = "\xa5\x5a"
+
+// hello is helloMagic | e u8: the dialer asks for rings of 2^e bytes.
+type hello struct {
+	ringSize int
+}
+
+const helloSize = len(helloMagic) + 1
 
 func (h hello) encode() []byte {
-	b := binary.LittleEndian.AppendUint32(make([]byte, 0, helloSize), h.version)
-	return binary.LittleEndian.AppendUint64(b, h.ringSize)
+	return append([]byte(helloMagic), encodeRingSize(h.ringSize))
 }
 
-// decodeHello reads a hello of our version; of another version it reads only
-// the version word, so that reject can name it.
+// decodeHello's errors, whose text is the listener's Reject reason.
+var (
+	errMalformedHello = errors.New("malformed hello")
+	errRingSize       = errors.New("ring size not a power of two in [64 KiB, 512 MiB]")
+)
+
 func decodeHello(p []byte) (hello, error) {
-	if len(p) < 4 {
-		return hello{}, errProtocol
+	if len(p) != helloSize || string(p[:len(helloMagic)]) != helloMagic {
+		return hello{}, errMalformedHello
 	}
-	h := hello{version: binary.LittleEndian.Uint32(p)}
-	if h.version != protoVersion {
-		return h, nil
+	n, ok := decodeRingSize(p[len(helloMagic)])
+	if !ok {
+		return hello{}, errRingSize
 	}
-	if len(p) != helloSize {
-		return hello{}, errProtocol
-	}
-	h.ringSize = binary.LittleEndian.Uint64(p[4:])
-	return h, nil
+	return hello{ringSize: n}, nil
 }
 
-// reject returns why the listener refuses h, or "" to accept it.
-func (h hello) reject() string {
-	switch {
-	case h.version != protoVersion:
-		return "unsupported protocol version"
-	case !validRingSize(h.ringSize):
-		return "ring size not a power of two in [64 KiB, 512 MiB]"
-	}
-	return ""
-}
-
-// welcome is ringSize u64 | shm token payload.
+// welcome is e u8 | shm token payload: the listener grants rings of 2^e bytes.
 type welcome struct {
-	ringSize uint64
+	ringSize int
 	token    []byte
 }
 
 func (w welcome) encode() []byte {
-	b := binary.LittleEndian.AppendUint64(make([]byte, 0, 8+len(w.token)), w.ringSize)
-	return append(b, w.token...)
+	return append([]byte{encodeRingSize(w.ringSize)}, w.token...)
 }
 
 func decodeWelcome(p []byte) (welcome, error) {
-	if len(p) < 8 {
+	if len(p) == 0 {
 		return welcome{}, errProtocol
 	}
-	w := welcome{
-		ringSize: binary.LittleEndian.Uint64(p),
-		token:    p[8:],
-	}
-	if !validRingSize(w.ringSize) {
+	n, ok := decodeRingSize(p[0])
+	if !ok {
 		return welcome{}, errProtocol
 	}
-	return w, nil
+	return welcome{ringSize: n, token: p[1:]}, nil
 }
 
 // doorbell is dir u8: the ring whose parked peer it wakes.

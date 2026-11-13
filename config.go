@@ -17,13 +17,13 @@ const (
 	maxRingSize = (shm.MaxSize - 2*ring.HeaderSize) / 2
 )
 
-func validRingSize(n uint64) bool {
+func validRingSize(n int) bool {
 	return n >= minRingSize && n <= maxRingSize && n&(n-1) == 0
 }
 
 // segmentSize is the size of a segment holding a connection's two rings.
-func segmentSize(ringSize uint64) uint64 {
-	return 2 * uint64(ring.Size(int(ringSize)))
+func segmentSize(ringSize int) int {
+	return 2 * ring.Size(ringSize)
 }
 
 // numCPU is runtime.NumCPU, replaced in tests.

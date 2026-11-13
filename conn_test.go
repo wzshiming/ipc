@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -694,33 +695,95 @@ func rawHello(t *testing.T, path string, payload []byte) (typ uint8, answer []by
 	return typ, answer
 }
 
-func TestListenerRejectsInvalidHello(t *testing.T) {
-	l, path := listen(t, ListenConfig{})
-	acceptOne(t, l)
-	for name, h := range map[string]hello{
-		"version":        {version: protoVersion + 1, ringSize: 64 << 10},
-		"ring too small": {version: protoVersion, ringSize: 32 << 10},
-		"ring not pow2":  {version: protoVersion, ringSize: 100000},
-		"ring too big":   {version: protoVersion, ringSize: 1 << 30},
+// sentHello returns the Hello payload that d's Dial sends to a listener that
+// rejects it.
+func sentHello(t *testing.T, d Dialer) []byte {
+	t.Helper()
+	path := sockPath(t)
+	cl, err := control.Listen(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan []byte, 1)
+	go func() {
+		defer close(ch)
+		link, err := cl.Accept()
+		if err != nil {
+			return
+		}
+		defer link.Close()
+		_, p, fds, err := link.Recv()
+		if err != nil {
+			return
+		}
+		discardFDs(fds)
+		ch <- p
+		link.Send(frameReject, nil, nil)
+	}()
+	if c, err := d.Dial(path); err == nil {
+		c.Close()
+	}
+	cl.Close()
+	return <-ch
+}
+
+func TestDialSendsMagicThenRingSizeExponent(t *testing.T) {
+	for rs, want := range map[int][]byte{
+		4 << 20:   {0xa5, 0x5a, 0x16},
+		64 << 10:  {0xa5, 0x5a, 0x10},
+		512 << 20: {0xa5, 0x5a, 0x1d},
 	} {
-		t.Run(name, func(t *testing.T) {
-			if typ, reason := rawHello(t, path, h.encode()); typ != frameReject {
-				t.Fatalf("frame type %d (%q); want Reject %d", typ, reason, frameReject)
-			}
-		})
+		if got := sentHello(t, Dialer{RingSize: rs}); !bytes.Equal(got, want) {
+			t.Errorf("hello for RingSize %d = % x; want % x", rs, got, want)
+		}
 	}
 }
 
-func TestListenerRefusesVersionOneHelloAsUnsupportedVersion(t *testing.T) {
+func TestDialSendsExponentZeroForRingSizeNotPowerOfTwo(t *testing.T) {
+	want := []byte{0xa5, 0x5a, 0}
+	for _, rs := range []int{100000, -1} {
+		if got := sentHello(t, Dialer{RingSize: rs}); !bytes.Equal(got, want) {
+			t.Errorf("hello for RingSize %d = % x; want % x", rs, got, want)
+		}
+	}
+}
+
+// ringSizeReason is the listener's Reject reason for a ring size out of range.
+const ringSizeReason = "ring size not a power of two in [64 KiB, 512 MiB]"
+
+func TestListenerRejectsOutOfRangeExponentWithRingSizeReason(t *testing.T) {
 	l, path := listen(t, ListenConfig{})
 	acceptOne(t, l)
-	// Version 1's hello was 20 bytes: version u32 followed by two u64 fields.
-	v1 := binary.LittleEndian.AppendUint32(nil, 1)
-	v1 = binary.LittleEndian.AppendUint64(v1, 1)
-	v1 = binary.LittleEndian.AppendUint64(v1, 4<<20)
-	typ, reason := rawHello(t, path, v1)
-	if typ != frameReject || string(reason) != "unsupported protocol version" {
-		t.Fatalf("frame type %d (%q); want Reject %d (%q)", typ, reason, frameReject, "unsupported protocol version")
+	for _, e := range []byte{0, 15, 30, 31, 32, 63, 64, 255} {
+		if typ, reason := rawHello(t, path, []byte{0xa5, 0x5a, e}); typ != frameReject || string(reason) != ringSizeReason {
+			t.Errorf("exponent %d: frame type %d (%q); want Reject %d (%q)", e, typ, reason, frameReject, ringSizeReason)
+		}
+	}
+}
+
+func TestListenerRejectsMalformedHello(t *testing.T) {
+	l, path := listen(t, ListenConfig{})
+	acceptOne(t, l)
+	// Former layouts: u32 2 | u64 ring size, and the 20 bytes u32 1 | u64 | u64.
+	former12 := binary.LittleEndian.AppendUint64(binary.LittleEndian.AppendUint32(nil, 2), 4<<20)
+	former20 := binary.LittleEndian.AppendUint64(binary.LittleEndian.AppendUint32(nil, 1), 1)
+	former20 = binary.LittleEndian.AppendUint64(former20, 4<<20)
+	for name, p := range map[string][]byte{
+		"first magic byte wrong":  {0xa4, 0x5a, 0x16},
+		"second magic byte wrong": {0xa5, 0x5b, 0x16},
+		"magic bytes swapped":     {0x5a, 0xa5, 0x16},
+		"0 bytes":                 {},
+		"1 byte":                  {0xa5},
+		"2 bytes":                 {0xa5, 0x5a},
+		"4 bytes":                 {0xa5, 0x5a, 0x16, 0},
+		"former 12 bytes":         former12,
+		"former 20 bytes":         former20,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if typ, reason := rawHello(t, path, p); typ != frameReject || string(reason) != "malformed hello" {
+				t.Fatalf("frame type %d (%q); want Reject %d (%q)", typ, reason, frameReject, "malformed hello")
+			}
+		})
 	}
 }
 
@@ -736,6 +799,20 @@ func TestDialReturnsErrRejected(t *testing.T) {
 	}
 }
 
+func TestDialOfOutOfRangeRingSizeIsRejectedWithRingSizeReason(t *testing.T) {
+	l, path := listen(t, ListenConfig{})
+	acceptOne(t, l)
+	for _, rs := range []int{32 << 10, 1 << 30, -1} {
+		c, err := (&Dialer{RingSize: rs}).Dial(path)
+		if !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), ringSizeReason) {
+			if c != nil {
+				c.Close()
+			}
+			t.Errorf("Dial with RingSize %d = %v; want ErrRejected for the ring size", rs, err)
+		}
+	}
+}
+
 func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 	path := sockPath(t)
 	cl, err := control.Listen(t.Context(), path)
@@ -744,7 +821,7 @@ func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 	}
 	defer cl.Close()
 	const rs = 64 << 10
-	seg, err := shm.Create(int(segmentSize(rs)))
+	seg, err := shm.Create(segmentSize(rs))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,15 +987,43 @@ func TestCloseLeaksNoGoroutines(t *testing.T) {
 	}
 }
 
-func TestHelloRoundTrip(t *testing.T) {
-	h := hello{version: protoVersion, ringSize: 1 << 20}
-	got, err := decodeHello(h.encode())
-	if err != nil || got != h {
-		t.Fatalf("decodeHello = %+v, %v; want %+v", got, err, h)
+func TestHelloRoundTripsEveryAcceptedExponent(t *testing.T) {
+	for e := range 256 {
+		p := []byte{0xa5, 0x5a, byte(e)}
+		h, err := decodeHello(p)
+		if e >= 16 && e <= 29 && (err != nil || h.ringSize != 1<<e) {
+			t.Errorf("decodeHello(% x) = %+v, %v; want ring size %d", p, h, err, 1<<e)
+		}
+		if err == nil && !bytes.Equal(h.encode(), p) {
+			t.Errorf("decodeHello(% x) = %+v, which encodes as % x", p, h, h.encode())
+		}
 	}
-	w := welcome{ringSize: 64 << 10, token: []byte("tok")}
-	gw, err := decodeWelcome(w.encode())
-	if err != nil || gw.ringSize != w.ringSize || !bytes.Equal(gw.token, w.token) {
-		t.Fatalf("decodeWelcome = %+v, %v; want %+v", gw, err, w)
+}
+
+func TestWelcomeIsRingSizeExponentThenToken(t *testing.T) {
+	got := welcome{ringSize: 64 << 10, token: []byte("token")}.encode()
+	if want := []byte("\x10token"); !bytes.Equal(got, want) {
+		t.Fatalf("welcome = % x; want % x", got, want)
+	}
+}
+
+func TestWelcomeRoundTripsEveryAcceptedExponent(t *testing.T) {
+	for e := range 256 {
+		p := []byte{byte(e), 't', 'o', 'k'}
+		w, err := decodeWelcome(p)
+		if e >= 16 && e <= 29 && (err != nil || w.ringSize != 1<<e || string(w.token) != "tok") {
+			t.Errorf("decodeWelcome(% x) = %+v, %v; want ring size %d, token \"tok\"", p, w, err, 1<<e)
+		}
+		if err == nil && !bytes.Equal(w.encode(), p) {
+			t.Errorf("decodeWelcome(% x) = %+v, which encodes as % x", p, w, w.encode())
+		}
+	}
+}
+
+func TestDecodeWelcomeRejectsEmptyPayloadAndOutOfRangeExponent(t *testing.T) {
+	for _, p := range [][]byte{{}, []byte("\x00tok"), []byte("\x0ftok"), []byte("\x1etok"), []byte("\xfftok")} {
+		if w, err := decodeWelcome(p); !errors.Is(err, errProtocol) {
+			t.Errorf("decodeWelcome(% x) = %+v, %v; want errProtocol", p, w, err)
+		}
 	}
 }

@@ -88,7 +88,7 @@ func dialHandshake(ctx context.Context, link *control.Link, path string, ringSiz
 	stop := context.AfterFunc(ctx, func() { link.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
 	link.SetDeadline(time.Now().Add(handshakeTimeout))
-	h := hello{version: protoVersion, ringSize: uint64(ringSize)}
+	h := hello{ringSize: ringSize}
 	if err := link.Send(frameHello, h.encode(), nil); err != nil {
 		return nil, err
 	}
@@ -114,7 +114,7 @@ func dialHandshake(ctx context.Context, link *control.Link, path string, ringSiz
 	if err != nil {
 		return nil, err
 	}
-	if uint64(tok.Size) != segmentSize(w.ringSize) {
+	if tok.Size != segmentSize(w.ringSize) {
 		tok.Close()
 		return nil, errProtocol
 	}
@@ -127,7 +127,7 @@ func dialHandshake(ctx context.Context, link *control.Link, path string, ringSiz
 		return nil, ctx.Err()
 	}
 	link.SetDeadline(time.Time{})
-	c, err := newConn(link, seg, int(w.ringSize), spin, path, false)
+	c, err := newConn(link, seg, w.ringSize, spin, path, false)
 	if err != nil {
 		seg.Close()
 		return nil, err
