@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -180,12 +181,9 @@ type connStats struct {
 }
 
 // consume runs one locked consumer per connection until each connection's
-// stream ends, then fills the report. The first failure closes all to stop all.
-func (r *report) consume(conns []net.Conn, o options) error {
-	var (
-		once  sync.Once
-		first error
-	)
+// stream ends, then fills the report. The first failure cancels ctx, which
+// closes all to stop all, and is returned as its cause.
+func (r *report) consume(ctx context.Context, end context.CancelCauseFunc, conns []net.Conn, o options) error {
 	stats := make([]connStats, len(conns))
 	var wg sync.WaitGroup
 	for i, c := range conns {
@@ -193,16 +191,13 @@ func (r *report) consume(conns []net.Conn, o options) error {
 			var err error
 			stats[i], err = consume(c, i, o)
 			if err != nil {
-				once.Do(func() {
-					first = err
-					closeAll(conns)
-				})
+				end(err)
 			}
 		})
 	}
 	wg.Wait()
-	if first != nil {
-		return first
+	if err := context.Cause(ctx); err != nil {
+		return err
 	}
 	r.addThroughput(stats)
 	return nil
