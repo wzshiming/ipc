@@ -1,6 +1,7 @@
 package ring
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"math/rand/v2"
@@ -719,6 +720,18 @@ func TestFormatThenVerifyReturnsCapacity(t *testing.T) {
 	}
 }
 
+func TestFormatWritesMagicAndU32Capacity(t *testing.T) {
+	for _, c := range []int{testCap, 4 << 20} {
+		region := newRegion(t, c)
+		want := make([]byte, 128)
+		copy(want, "RING")
+		binary.LittleEndian.PutUint32(want[4:], uint32(c))
+		if got := region[:128]; !bytes.Equal(got, want) {
+			t.Errorf("capacity %d: header bytes 0-127 = % x; want % x", c, got, want)
+		}
+	}
+}
+
 func TestFormatRejectsBadCapacityAndShortRegion(t *testing.T) {
 	for _, c := range []int{0, -testCap, 32 << 10, 64<<10 + 8, 3 << 16} {
 		if err := Format(make([]byte, HeaderSize+64<<10), c); err == nil {
@@ -734,20 +747,20 @@ func TestVerifyRejectsTamperedHeader(t *testing.T) {
 	cases := []struct {
 		name   string
 		tamper func(r []byte)
+		want   error
 	}{
-		{"magic", func(r []byte) { r[offMeta] ^= 0xff }},
-		{"version", func(r []byte) { binary.LittleEndian.PutUint32(r[offMeta+4:], 99) }},
-		{"capacity not power of two", func(r []byte) { binary.LittleEndian.PutUint64(r[offMeta+8:], testCap+8) }},
-		{"capacity too small", func(r []byte) { binary.LittleEndian.PutUint64(r[offMeta+8:], 32<<10) }},
-		{"capacity too large", func(r []byte) { binary.LittleEndian.PutUint64(r[offMeta+8:], 1<<40) }},
-		{"capacity beyond region", func(r []byte) { binary.LittleEndian.PutUint64(r[offMeta+8:], 2*testCap) }},
+		{"magic", func(r []byte) { r[offMeta] ^= 0xff }, ErrBadMagic},
+		{"capacity not power of two", func(r []byte) { binary.LittleEndian.PutUint32(r[offMeta+4:], testCap+8) }, ErrBadCapacity},
+		{"capacity too small", func(r []byte) { binary.LittleEndian.PutUint32(r[offMeta+4:], 32<<10) }, ErrBadCapacity},
+		{"capacity too large", func(r []byte) { binary.LittleEndian.PutUint32(r[offMeta+4:], 1<<31) }, ErrBadCapacity},
+		{"capacity beyond region", func(r []byte) { binary.LittleEndian.PutUint32(r[offMeta+4:], 2*testCap) }, ErrShortRegion},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			region := newRegion(t, testCap)
 			tc.tamper(region)
-			if c, err := Verify(region); err == nil {
-				t.Fatalf("Verify accepted tampered header (capacity %d)", c)
+			if c, err := Verify(region); !errors.Is(err, tc.want) {
+				t.Fatalf("Verify = %d, %v; want %v", c, err, tc.want)
 			}
 		})
 	}
