@@ -36,6 +36,10 @@ func Create(size int) (*Segment, error) {
 		unix.Close(fd)
 		return nil, err
 	}
+	if err := sealSize(fd); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
 	return mapFD(fd, name, size, n)
 }
 
@@ -92,13 +96,19 @@ func decodeSys(size int, rest []byte, fds []int) (Token, error) {
 }
 
 // Attach maps the peer's segment. It takes ownership of tok's fd, closing it
-// on failure and with the returned Segment otherwise.
+// on failure and with the returned Segment otherwise. It refuses a segment
+// whose size could still change.
 func Attach(tok Token) (*Segment, error) {
 	if !tok.hasFD {
 		return nil, errors.New("shm: token holds no fd")
 	}
 	fd := tok.fd
 	if err := checkSize(tok.Size); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	// Seals first, so the size fstat reads below is final.
+	if err := checkSizeSealed(fd); err != nil {
 		unix.Close(fd)
 		return nil, err
 	}
