@@ -65,7 +65,7 @@ func TestDecodeRejectsWrongFDCount(t *testing.T) {
 }
 
 func TestDecodeClosesFDsOnWrongCount(t *testing.T) {
-	payload := binary.LittleEndian.AppendUint64(nil, MinSize)
+	payload := binary.LittleEndian.AppendUint32(nil, MinSize)
 	fds := transferFDs(t, []int{0, 0})
 	if got, err := DecodeToken(payload, fds); err == nil {
 		got.Close()
@@ -75,6 +75,29 @@ func TestDecodeClosesFDsOnWrongCount(t *testing.T) {
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != unix.EBADF {
 			t.Errorf("fd %d still open after failed decode (err=%v)", fd, err)
 		}
+	}
+}
+
+func TestDecodeRejectsBadSizePrefixAndClosesFDs(t *testing.T) {
+	check := func(payload []byte, want string) {
+		t.Helper()
+		fds := transferFDs(t, []int{0})
+		got, err := DecodeToken(payload, fds)
+		if err == nil {
+			got.Close()
+		}
+		if err == nil || err.Error() != want {
+			t.Errorf("DecodeToken(% x) = %v, want %s", payload, err, want)
+		}
+		if _, err := unix.FcntlInt(uintptr(fds[0]), unix.F_GETFD, 0); err != unix.EBADF {
+			t.Errorf("fd %d still open after DecodeToken(% x) (err=%v)", fds[0], payload, err)
+		}
+	}
+	for _, size := range []uint32{0, MinSize - 1, MaxSize + 1, 1 << 31, ^uint32(0)} {
+		check(binary.LittleEndian.AppendUint32(nil, size), errSize.Error())
+	}
+	for _, payload := range [][]byte{nil, {0x00}, {0x00, 0x10}, {0x00, 0x10, 0x00}} {
+		check(payload, "shm: short token payload")
 	}
 }
 
@@ -99,7 +122,7 @@ func exportedFD(t *testing.T, size int) int {
 // segment and closes it.
 func assertAttachRefuses(t *testing.T, fd, size int) {
 	t.Helper()
-	tok, err := DecodeToken(binary.LittleEndian.AppendUint64(nil, uint64(size)), []int{fd})
+	tok, err := DecodeToken(binary.LittleEndian.AppendUint32(nil, uint32(size)), []int{fd})
 	if err != nil {
 		t.Fatal(err)
 	}

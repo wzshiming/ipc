@@ -114,6 +114,13 @@ func TestAttachSharesWritesBothWays(t *testing.T) {
 	}
 }
 
+func TestEncodeWritesSizeAsU32ThenName(t *testing.T) {
+	payload, _ := Token{Size: 4096, name: "name"}.Encode()
+	if want := []byte("\x00\x10\x00\x00name"); !bytes.Equal(payload, want) {
+		t.Fatalf("Encode() payload = % x, want % x", payload, want)
+	}
+}
+
 func TestDecodeRejectsSizeOutOfRange(t *testing.T) {
 	seg, err := Create(MinSize)
 	if err != nil {
@@ -127,9 +134,9 @@ func TestDecodeRejectsSizeOutOfRange(t *testing.T) {
 	defer tok.Close()
 	payload, fds := tok.Encode()
 
-	for _, size := range []uint64{0, MinSize - 1, MaxSize + 1, 1 << 63, ^uint64(0)} {
+	for _, size := range []uint32{0, MinSize - 1, MaxSize + 1, 1 << 31, ^uint32(0)} {
 		p := bytes.Clone(payload)
-		binary.LittleEndian.PutUint64(p, size)
+		binary.LittleEndian.PutUint32(p, size)
 		if got, err := DecodeToken(p, transferFDs(t, fds)); err == nil {
 			got.Close()
 			t.Errorf("DecodeToken accepted Size %d", size)

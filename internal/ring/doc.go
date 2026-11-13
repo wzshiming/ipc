@@ -6,7 +6,7 @@
 //
 // The region is a HeaderSize (4096-byte) header followed by a data area of
 // capacity bytes, a power of two in [64 KiB, 1 GiB]. In the header,
-// magic/version/capacity, the producer cursor head, the consumer cursor tail,
+// magic/capacity, the producer cursor head, the consumer cursor tail,
 // consumerParked and producerParked each own a 128-byte-aligned cache line.
 // Cursors are monotonically increasing uint64 positions; the data offset of a
 // position is pos & (capacity-1).
