@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/wzshiming/ipc/internal/ring"
@@ -25,13 +26,17 @@ func segmentSize(ringSize uint64) uint64 {
 	return 2 * uint64(ring.Size(int(ringSize)))
 }
 
+// numCPU is runtime.NumCPU, replaced in tests.
+var numCPU = runtime.NumCPU
+
 // spinDuration maps a Spin option to how long blocking calls spin: 0 means
-// the default, a negative value none.
+// the default, or none on a single CPU where spinning only delays the peer,
+// and a negative value none.
 func spinDuration(spin time.Duration) time.Duration {
 	switch {
-	case spin == 0:
+	case spin == 0 && numCPU() > 1:
 		return defaultSpin
-	case spin < 0:
+	case spin <= 0:
 		return 0
 	}
 	return spin

@@ -22,8 +22,9 @@ type ListenConfig struct {
 	RingSize int
 	// Spin is how long a blocking call on an accepted connection busy
 	// re-checks its ring, without yielding its thread, before parking; 0
-	// means 50 µs and a negative value parks at once. Each spinning call
-	// holds a CPU, so choose Spin small or negative when CPUs are scarce.
+	// means 50 µs, or none when runtime.NumCPU reports 1, and a negative
+	// value parks at once. Each spinning call holds a CPU, so choose Spin
+	// small or negative when CPUs are scarce.
 	Spin time.Duration
 }
 
