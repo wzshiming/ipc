@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -49,8 +50,8 @@ type Conn struct {
 
 	closeOnce  sync.Once
 	rxOnce     sync.Once
-	done       chan struct{}
-	err        error       // written once before done is closed
+	life       context.Context // done when the connection ends, with why as its cause
+	end        context.CancelCauseFunc
 	closed     atomic.Bool // Close was called on this end
 	bye        atomic.Bool // the peer said goodbye
 	readerDone chan struct{}
@@ -81,9 +82,9 @@ func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Durat
 		spin:       spin,
 		addr:       addr(path),
 		sendDir:    dirDialerToListener,
-		done:       make(chan struct{}),
 		readerDone: make(chan struct{}),
 	}
+	c.life, c.end = context.WithCancelCause(context.Background())
 	if listener {
 		c.sendDir = dirListenerToDialer
 	}
@@ -171,10 +172,9 @@ func (c *Conn) shutdown(err error) {
 // open, so records the peer committed can still be drained until Close.
 func (c *Conn) peerGone(err error) {
 	c.closeOnce.Do(func() {
-		c.err = err
 		// Sends fail before Done closes, so callers seeing Done see them fail.
 		c.tx.close(c)
-		close(c.done)
+		c.end(err)
 		if err == net.ErrClosed {
 			c.link.SetWriteDeadline(time.Now().Add(time.Second))
 			c.link.Send(frameBye, nil, nil)
@@ -205,7 +205,8 @@ func (c *Conn) sendErr() error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	return c.err
+	<-c.life.Done() // sends fail a moment before the cause is recorded
+	return context.Cause(c.life)
 }
 
 // recvErr is what receives return once the connection is closed and the
@@ -214,10 +215,11 @@ func (c *Conn) recvErr() error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	if c.err == ErrPeerClosed && c.bye.Load() {
+	err := context.Cause(c.life)
+	if err == ErrPeerClosed && c.bye.Load() {
 		return io.EOF
 	}
-	return c.err
+	return err
 }
 
 // peerErr maps the link errors a vanished peer causes to ErrPeerClosed.
@@ -285,16 +287,14 @@ func (c *Conn) Close() error {
 
 // Done is closed once the connection is closed by either end or fails. After
 // the peer's close, receives still drain what it committed until Close.
-func (c *Conn) Done() <-chan struct{} { return c.done }
+func (c *Conn) Done() <-chan struct{} { return c.life.Done() }
 
 // Err returns nil while the connection is open, then why it closed:
 // net.ErrClosed after Close, ErrPeerClosed after the peer closed or died,
 // else ErrCorrupt or the link error.
 func (c *Conn) Err() error {
-	select {
-	case <-c.done:
-		return c.sendErr()
-	default:
+	if c.life.Err() == nil {
 		return nil
 	}
+	return c.sendErr()
 }

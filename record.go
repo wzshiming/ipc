@@ -17,7 +17,7 @@ const (
 )
 
 // spinCheckEvery is how many failed re-checks a spin makes between reads
-// of the clock, the deadline and the connection's done channel.
+// of the clock, the deadline and the connection's lifetime.
 const spinCheckEvery = 128
 
 // half is one direction of a connection as seen by this end: its ring access
@@ -113,7 +113,7 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 				if c.tx.dl.expired.Load() {
 					return nil, os.ErrDeadlineExceeded
 				}
-				if isClosed(c.done) {
+				if c.life.Err() != nil {
 					return nil, c.sendErr()
 				}
 				if !time.Now().Before(deadline) {
@@ -137,7 +137,7 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 					c.tx.release(c)
 				}
 				return nil, os.ErrDeadlineExceeded
-			case <-c.done:
+			case <-c.life.Done():
 				return nil, c.sendErr()
 			}
 		}
@@ -198,11 +198,14 @@ func (c *Conn) TryNext() ([]byte, error) {
 		return nil, c.recvErr()
 	}
 	p, err := c.cons.TryNext()
-	if err == ring.ErrEmpty && isClosed(c.done) {
-		// Recheck: all the peer committed before it left is visible by now.
-		if p, err = c.cons.TryNext(); err == ring.ErrEmpty {
-			c.rx.release(c)
-			return nil, c.recvErr()
+	if err == ring.ErrEmpty {
+		// Nested rather than &&, which spills p and err even when a record came.
+		if c.life.Err() != nil {
+			// Recheck: all the peer committed before it left is visible by now.
+			if p, err = c.cons.TryNext(); err == ring.ErrEmpty {
+				c.rx.release(c)
+				return nil, c.recvErr()
+			}
 		}
 	}
 	if err != nil {
@@ -258,7 +261,7 @@ func (c *Conn) Next() ([]byte, error) {
 					c.rx.release(c)
 				}
 				return nil, os.ErrDeadlineExceeded
-			case <-c.done:
+			case <-c.life.Done():
 			}
 		}
 		if p, err = c.TryNext(); err != ErrWouldBlock {
