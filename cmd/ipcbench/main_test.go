@@ -224,7 +224,9 @@ func TestProduceEndsWithClose(t *testing.T) {
 	consumer.SetDeadline(time.Now().Add(10 * time.Second))
 	var stop atomic.Bool
 	errc := make(chan error, 1)
-	go func() { errc <- produce(producer, 0, options{mode: "throughput", size: size}, &stop) }()
+	go func() {
+		errc <- produce(producer, 0, options{size: size}, &source{size: size, payload: true, stop: &stop})
+	}()
 	rec := make([]byte, size)
 	for range 3 {
 		if _, err := io.ReadFull(consumer, rec); err != nil {
@@ -266,7 +268,8 @@ func TestEchoEndsAtPeerClose(t *testing.T) {
 // Chunk 5 of 4 KiB starts at stream offset 16384, whose stamp word the
 // flipped first byte damages.
 func TestCorruptChunkExitsWithCodeTwo(t *testing.T) {
-	_, stderr, code := runBench(t, "-mode", "throughput", "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
+	t.Setenv("IPCBENCH_TEST_PEER", "corrupt 5")
+	_, stderr, code := runBench(t, "-mode", "throughput", "-size", "4KiB", "-duration", "300ms")
 	if code != 2 {
 		t.Fatalf("exit code %d, want 2; stderr:\n%s", code, stderr)
 	}
@@ -342,9 +345,11 @@ func TestThroughputTextReportsRates(t *testing.T) {
 }
 
 func TestRemovedFlagIsUnknown(t *testing.T) {
-	_, err := parseFlags([]string{"-lanes", "2"}, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "not defined") {
-		t.Fatalf("parseFlags(-lanes 2) = %v, want a flag-not-defined error", err)
+	for _, args := range [][]string{{"-lanes", "2"}, {"-corrupt", "5"}} {
+		_, err := parseFlags(args, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "not defined") {
+			t.Errorf("parseFlags(%s) = %v, want a flag-not-defined error", strings.Join(args, " "), err)
+		}
 	}
 }
 
@@ -444,16 +449,39 @@ func TestLatencyRunsOnKernelTransports(t *testing.T) {
 	}
 }
 
-// Once the parent quits on an integrity failure, the peer's next Write
-// fails with the socket's reset; that ends the run and is not a peer error.
-func TestPeerExitsQuietlyWhenParentClosesKernelTransportFirst(t *testing.T) {
+func TestCorruptChunkOnKernelTransportsExitsWithCodeTwo(t *testing.T) {
+	t.Setenv("IPCBENCH_TEST_PEER", "corrupt 5")
 	for _, network := range []string{"unix", "tcp"} {
-		_, stderr, code := runBench(t, "-mode", "throughput", "-net", network, "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
-		if code != 2 || !strings.Contains(stderr, "offset 16384") {
-			t.Fatalf("-net %s: exit code %d, want 2 naming offset 16384; stderr:\n%s", network, code, stderr)
+		_, stderr, code := runBench(t, "-mode", "throughput", "-net", network, "-size", "4KiB", "-duration", "300ms")
+		if code != 2 || !strings.Contains(stderr, "connection 0") || !strings.Contains(stderr, "offset 16384") {
+			t.Fatalf("-net %s: exit code %d, want 2 naming connection 0 and offset 16384; stderr:\n%s", network, code, stderr)
 		}
-		if strings.Contains(stderr, "ipcbench peer:") {
-			t.Fatalf("-net %s: the peer reported an error after the parent closed:\n%s", network, stderr)
+	}
+}
+
+// Once the parent's run bound closes a kernel socket, the peer's next Write
+// fails with the socket's reset; that ends the peer's run and is not an error.
+func TestPeerExitsQuietlyWhenParentClosesKernelTransportFirst(t *testing.T) {
+	t.Setenv("IPCBENCH_AS_MAIN", "1")
+	setBound(t, &safetyMargin, -29*time.Second) // the parent's bound closes 1s into the peer's 30s
+	setBound(t, &peerGrace, 30*time.Second)
+	networks := []string{"unix", "tcp"}
+	if runtime.GOOS == "darwin" {
+		// darwin may fail the peer's unix Write with ENOTCONN, which peerGone does not list.
+		networks = []string{"tcp"}
+	}
+	for _, network := range networks {
+		var stderr bytes.Buffer
+		start := time.Now()
+		_, err := runParent(parsed(t, "-net", network, "-size", "4KiB", "-duration", "30s"), &stderr)
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("-net %s: runParent = %v, want its bound to close the connections first; stderr:\n%s", network, err, &stderr)
+		}
+		if d := time.Since(start); d > 15*time.Second {
+			t.Fatalf("-net %s: runParent returned after %v, want the peer gone by itself, not killed after the %v grace", network, d, peerGrace)
+		}
+		if strings.Contains(stderr.String(), "ipcbench peer:") {
+			t.Fatalf("-net %s: the peer reported an error after the parent closed:\n%s", network, &stderr)
 		}
 	}
 }
@@ -517,7 +545,8 @@ func TestConsumeWithReadWriteIORejectsAShortLastMessage(t *testing.T) {
 
 // With -io rw the peer flips the first byte of message 5, stream offset 16384.
 func TestCorruptMessageWithReadWriteIOExitsWithCodeTwo(t *testing.T) {
-	_, stderr, code := runBench(t, "-mode", "throughput", "-io", "rw", "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
+	t.Setenv("IPCBENCH_TEST_PEER", "corrupt 5")
+	_, stderr, code := runBench(t, "-mode", "throughput", "-io", "rw", "-size", "4KiB", "-duration", "300ms")
 	if code != 2 {
 		t.Fatalf("exit code %d, want 2; stderr:\n%s", code, stderr)
 	}

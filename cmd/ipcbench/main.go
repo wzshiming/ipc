@@ -48,7 +48,6 @@ type options struct {
 	json     bool
 	path     string
 	peer     bool
-	corrupt  uint64
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -149,7 +148,6 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.BoolVar(&o.json, "json", false, "print the report as JSON")
 	fs.StringVar(&o.path, "path", "", "socket path of -net ipc and unix (default: b.sock in a new temporary directory)")
 	fs.BoolVar(&o.peer, "peer", false, "internal: run as the dialing, producing peer")
-	fs.Uint64Var(&o.corrupt, "corrupt", 0, "internal, for tests: the peer flips the first byte of chunk `N` of connection 0")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -241,7 +239,6 @@ func (o options) peerArgs(addr string) []string {
 		"-duration=" + o.duration.String(),
 		"-spin=" + o.spin.String(),
 		"-path=" + addr,
-		"-corrupt=" + strconv.FormatUint(o.corrupt, 10),
 	}
 }
 

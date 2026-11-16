@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,9 +21,10 @@ import (
 const lingerFor = 30 * time.Second
 
 // misbehave runs a peer the way IPCBENCH_TEST_PEER says: "exit N" exits with
-// status N before dialing, "stall" dials and then sends nothing, and
-// "linger ADDR" runs as usual, then holds a connection to ADDR instead of
-// exiting.
+// status N before dialing, "stall" dials and then sends nothing, "corrupt N"
+// produces as usual but flips the first byte of read N of connection 0's
+// source, and "linger ADDR" runs as usual, then holds a connection to ADDR
+// instead of exiting.
 func misbehave(behavior string, args []string) int {
 	verb, arg, _ := strings.Cut(behavior, " ")
 	switch verb {
@@ -30,21 +33,37 @@ func misbehave(behavior string, args []string) int {
 			return code
 		}
 	case "stall":
-		o, err := parseFlags(args, os.Stderr)
+		_, conns, err := dialAll(args)
 		if err != nil {
+			fmt.Fprintln(os.Stderr, "stall:", err)
 			return exitError
 		}
-		var conns []net.Conn
-		defer func() { closeAll(conns) }() // kept reachable, so no finalizer closes them
-		for range o.conns {
-			c, err := dial(o)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "stall:", err)
-				return exitError
-			}
-			conns = append(conns, c)
-		}
+		defer closeAll(conns) // kept reachable, so no finalizer closes them
 		time.Sleep(lingerFor)
+		return 0
+	case "corrupt":
+		at, err := strconv.ParseUint(arg, 10, 64)
+		if err != nil {
+			break
+		}
+		o, conns, err := dialAll(args)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "corrupt:", err)
+			return exitError
+		}
+		defer closeAll(conns)
+		var stop atomic.Bool
+		t := time.AfterFunc(o.duration, func() { stop.Store(true) })
+		defer t.Stop()
+		var wg sync.WaitGroup
+		for i, c := range conns {
+			var src io.Reader = &source{size: o.size, payload: o.mode == "throughput", stop: &stop}
+			if i == 0 {
+				src = &corrupter{r: src, at: at}
+			}
+			wg.Go(func() { produce(c, i, o, src) })
+		}
+		wg.Wait()
 		return 0
 	case "linger":
 		code := run(args, os.Stdout, os.Stderr)
@@ -57,8 +76,40 @@ func misbehave(behavior string, args []string) int {
 		time.Sleep(lingerFor)
 		return code
 	}
-	fmt.Fprintf(os.Stderr, "IPCBENCH_TEST_PEER %q: want exit N, stall or linger ADDR\n", behavior)
+	fmt.Fprintf(os.Stderr, "IPCBENCH_TEST_PEER %q: want exit N, stall, corrupt N or linger ADDR\n", behavior)
 	return exitError
+}
+
+// dialAll parses the peer's args and dials its connections as runPeer does.
+func dialAll(args []string) (options, []net.Conn, error) {
+	o, err := parseFlags(args, io.Discard)
+	if err != nil {
+		return o, nil, err
+	}
+	var conns []net.Conn
+	for range o.conns {
+		c, err := dial(o)
+		if err != nil {
+			closeAll(conns)
+			return o, nil, err
+		}
+		conns = append(conns, c)
+	}
+	return o, conns, nil
+}
+
+// corrupter flips the first byte of r's read number at, counting from 1.
+type corrupter struct {
+	r         io.Reader
+	at, reads uint64
+}
+
+func (c *corrupter) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if c.reads++; c.reads == c.at && n > 0 {
+		p[0] ^= 0xff
+	}
+	return n, err
 }
 
 // setBound sets the bound *v to d until the test ends.
@@ -104,10 +155,11 @@ func TestPeerExitingBeforeConnectingFailsTheRunAtOnce(t *testing.T) {
 // connections closed in its wake.
 func TestFirstFailingConnectionEndsTheRunAndIsReported(t *testing.T) {
 	t.Setenv("IPCBENCH_AS_MAIN", "1")
+	t.Setenv("IPCBENCH_TEST_PEER", "corrupt 5")
 	setBound(t, &peerGrace, time.Minute) // past the window, so killing the peer cannot end the run early
 	var stderr bytes.Buffer
 	start := time.Now()
-	_, err := runParent(parsed(t, "-conns", "4", "-size", "4KiB", "-duration", "30s", "-corrupt", "5"), &stderr)
+	_, err := runParent(parsed(t, "-conns", "4", "-size", "4KiB", "-duration", "30s"), &stderr)
 	if d := time.Since(start); d > 15*time.Second {
 		t.Fatalf("the run ended %v into its 30s window, want at once; stderr:\n%s", d, &stderr)
 	}

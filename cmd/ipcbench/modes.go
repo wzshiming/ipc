@@ -92,8 +92,9 @@ func produceAll(conns []net.Conn, o options) error {
 	errs := make([]error, len(conns))
 	var wg sync.WaitGroup
 	for i, c := range conns {
+		src := &source{size: o.size, payload: o.mode == "throughput", stop: &stop}
 		wg.Go(func() {
-			errs[i] = produce(c, i, o, &stop)
+			errs[i] = produce(c, i, o, src)
 		})
 	}
 	wg.Wait()
@@ -107,15 +108,12 @@ func produceAll(conns []net.Conn, o options) error {
 
 // source is the producer's io.Reader: each Read takes at most size bytes of
 // the slice, filled with the stream's bytes when payload is set, and
-// reports io.EOF once stop is set. Read number corrupt gets its first byte
-// flipped.
+// reports io.EOF once stop is set.
 type source struct {
 	size    int
 	payload bool
-	corrupt uint64
 	stop    *atomic.Bool
 	off     uint64 // stream offset of the next byte
-	reads   uint64
 }
 
 func (s *source) Read(p []byte) (int, error) {
@@ -123,32 +121,23 @@ func (s *source) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	n := min(len(p), s.size)
-	s.reads++
 	if s.payload && n > 0 {
 		fill(p[:n], s.off)
-		if s.reads == s.corrupt {
-			p[0] ^= 0xff
-		}
 	}
 	s.off += uint64(n)
 	return n, nil
 }
 
-// produce sends a source of o.size-byte chunks on connection index until
-// stop is set, then closes it, which ends the consumer's stream. With -io
-// copy, io.Copy has the source fill each ring record in place; with rw each
-// chunk is written from one buffer. Throughput chunks hold the stream's
-// pattern, and chunk o.corrupt of connection 0 gets a damaged first byte.
-func produce(c net.Conn, index int, o options, stop *atomic.Bool) error {
+// produce sends src's chunks on connection index until src reports io.EOF,
+// then closes it, which ends the consumer's stream. With -io copy, io.Copy
+// has src fill each ring record in place; with rw each chunk is written from
+// one buffer.
+func produce(c net.Conn, index int, o options, src io.Reader) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	src := &source{size: o.size, payload: o.mode == "throughput", stop: stop}
-	if index == 0 {
-		src.corrupt = o.corrupt
-	}
 	var err error
 	if o.io == "rw" {
-		err = writeMessages(c, src)
+		err = writeMessages(c, src, o.size)
 	} else {
 		// ReadFrom has src.Read fill each ring record in place; nothing is copied.
 		_, err = io.Copy(c, src)
@@ -160,8 +149,8 @@ func produce(c net.Conn, index int, o options, stop *atomic.Bool) error {
 }
 
 // writeMessages writes src's chunks on c from one buffer until io.EOF.
-func writeMessages(c net.Conn, src *source) error {
-	buf := make([]byte, src.size)
+func writeMessages(c net.Conn, src io.Reader, size int) error {
+	buf := make([]byte, size)
 	for {
 		n, err := src.Read(buf)
 		if err == io.EOF {
