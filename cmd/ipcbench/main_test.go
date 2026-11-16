@@ -338,21 +338,37 @@ func TestThroughputTextReportsRates(t *testing.T) {
 	}
 }
 
-func TestRemovedFlagIsUnknown(t *testing.T) {
-	for _, args := range [][]string{{"-lanes", "2"}, {"-corrupt", "5"}, {"-path", "b.sock"}, {"-spin", "1ms"}, {"-json"}} {
-		_, err := parseFlags(args, &bytes.Buffer{})
-		if err == nil || !strings.Contains(err.Error(), "not defined") {
-			t.Errorf("parseFlags(%s) = %v, want a flag-not-defined error", strings.Join(args, " "), err)
+func TestParseFlagsRejectsBadArguments(t *testing.T) {
+	for _, tc := range []struct {
+		args     []string
+		accepted bool
+		want     []string
+	}{
+		{args: []string{"-lanes", "2"}, want: []string{"not defined"}},
+		{args: []string{"-corrupt", "5"}, want: []string{"not defined"}},
+		{args: []string{"-path", "b.sock"}, want: []string{"not defined"}},
+		{args: []string{"-spin", "1ms"}, want: []string{"not defined"}},
+		{args: []string{"-json"}, want: []string{"not defined"}},
+		{args: []string{"-mode", "latency", "-conns", "2"}},
+		{args: []string{"-mode", "latency", "-conns", "1"}, accepted: true},
+		{args: []string{"-net", "udp"}, want: []string{"want ipc, unix or tcp"}},
+		{args: []string{"-io", "splice"}, want: []string{"want copy or rw"}},
+		{args: []string{"-mode", "compare", "-conns", "1"}, want: []string{"compare", "-conns"}},
+		{args: []string{"-mode", "compare", "-size", "64KiB"}, want: []string{"compare", "-size"}},
+		{args: []string{"-mode", "compare", "-net", "ipc"}, want: []string{"compare", "-net"}},
+		{args: []string{"-mode", "compare", "-io", "copy"}, want: []string{"compare", "-io"}},
+		{args: []string{"-mode", "compare", "-duration", "1s"}, accepted: true},
+	} {
+		_, err := parseFlags(tc.args, &bytes.Buffer{})
+		if tc.accepted {
+			if err != nil {
+				t.Errorf("parseFlags(%s) = %v, want it accepted", strings.Join(tc.args, " "), err)
+			}
+			continue
 		}
-	}
-}
-
-func TestLatencyModeRequiresOneConnection(t *testing.T) {
-	if _, err := parseFlags([]string{"-mode", "latency", "-conns", "2"}, &bytes.Buffer{}); err == nil {
-		t.Fatal("-mode latency -conns 2 was accepted")
-	}
-	if _, err := parseFlags([]string{"-mode", "latency", "-conns", "1"}, &bytes.Buffer{}); err != nil {
-		t.Fatalf("-mode latency -conns 1 was rejected: %v", err)
+		if err == nil || slices.ContainsFunc(tc.want, func(w string) bool { return !strings.Contains(err.Error(), w) }) {
+			t.Errorf("parseFlags(%s) = %v, want an error naming %q", strings.Join(tc.args, " "), err, tc.want)
+		}
 	}
 }
 
@@ -380,17 +396,6 @@ func TestDefaultRingFitsLargeRecords(t *testing.T) {
 	}
 	if o.size > o.ring/2-8 {
 		t.Fatalf("default ring %d cannot carry %d-byte records", o.ring, o.size)
-	}
-}
-
-func TestUnknownTransportAndIOAreRejected(t *testing.T) {
-	_, err := parseFlags([]string{"-net", "udp"}, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "want ipc, unix or tcp") {
-		t.Errorf("-net udp = %v, want an error listing the transports", err)
-	}
-	_, err = parseFlags([]string{"-io", "splice"}, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "want copy or rw") {
-		t.Errorf("-io splice = %v, want an error listing the I/O paths", err)
 	}
 }
 
@@ -484,18 +489,6 @@ func TestCorruptMessageWithReadWriteIOExitsWithCodeTwo(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "connection 0") || !strings.Contains(stderr, "offset 16384") {
 		t.Fatalf("stderr does not name connection 0 and offset 16384:\n%s", stderr)
-	}
-}
-
-func TestCompareRejectsSingleConfigurationFlags(t *testing.T) {
-	for _, args := range [][]string{{"-conns", "1"}, {"-size", "64KiB"}, {"-net", "ipc"}, {"-io", "copy"}} {
-		_, err := parseFlags(append([]string{"-mode", "compare"}, args...), &bytes.Buffer{})
-		if err == nil || !strings.Contains(err.Error(), "compare") || !strings.Contains(err.Error(), args[0]) {
-			t.Errorf("-mode compare %s = %v, want an error naming %s and compare", strings.Join(args, " "), err, args[0])
-		}
-	}
-	if _, err := parseFlags([]string{"-mode", "compare", "-duration", "1s"}, &bytes.Buffer{}); err != nil {
-		t.Fatalf("-mode compare -duration 1s was rejected: %v", err)
 	}
 }
 
