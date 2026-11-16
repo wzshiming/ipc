@@ -63,105 +63,150 @@ func produce(t testing.TB, p *Producer, n int, seq uint64) {
 	p.Commit()
 }
 
+// commitLen draws how many of n reserved bytes to commit, favouring 0 and n.
+func commitLen(rng *rand.Rand, n int) int {
+	switch rng.IntN(4) {
+	case 0:
+		return 0
+	case 1:
+		return n
+	}
+	return rng.IntN(n + 1)
+}
+
+// commitModes publish a reservation whole with Commit, a drawn prefix of it with CommitN, or mix both on one producer.
+var commitModes = []struct {
+	name    string
+	length  func(rng *rand.Rand, n int) int
+	publish func(p *Producer, n, m int) bool
+}{
+	{"Commit", func(_ *rand.Rand, n int) int { return n }, func(p *Producer, _, _ int) bool { return p.Commit() }},
+	{"CommitN", commitLen, func(p *Producer, _, m int) bool { return p.CommitN(m) }},
+	{"Commit and CommitN", commitLen, func(p *Producer, n, m int) bool {
+		if m < n || n%2 == 1 {
+			return p.CommitN(m)
+		}
+		return p.Commit()
+	}},
+}
+
 func TestPropertyMatchesReferenceFIFO(t *testing.T) {
-	const total = 1_000_000
-	region := newRegion(t, testCap)
-	p, c := newPair(t, region)
-	maxRec := MaxRecord(testCap)
-	rng := rand.New(rand.NewPCG(1, 2))
+	for _, mode := range commitModes {
+		t.Run(mode.name, func(t *testing.T) {
+			const total = 1_000_000
+			region := newRegion(t, testCap)
+			p, c := newPair(t, region)
+			maxRec := MaxRecord(testCap)
+			rng := rand.New(rand.NewPCG(1, 2))
 
-	var fifo []int // sizes of committed, unconsumed records; fifo[i] has seq consumed+i
-	var produced, consumed uint64
-	var fulls, wraps, exactFills, maxes, zeros int
+			var fifo []int // committed lengths of unconsumed records; fifo[i] has seq consumed+i
+			var produced, consumed uint64
+			var fulls, wraps, exactFills, maxes, zeros, shortened, aborts int
 
-	consume := func() {
-		buf, err := c.TryNext()
-		if len(fifo) == 0 {
-			if !errors.Is(err, ErrEmpty) {
-				t.Fatalf("TryNext on empty reference = %v, want ErrEmpty", err)
+			consume := func() {
+				buf, err := c.TryNext()
+				if len(fifo) == 0 {
+					if !errors.Is(err, ErrEmpty) {
+						t.Fatalf("TryNext on empty reference = %v, want ErrEmpty", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("record %d: TryNext = %v, want %d bytes", consumed, err, fifo[0])
+				}
+				if len(buf) != fifo[0] || !check(buf, consumed) {
+					t.Fatalf("record %d: got %d bytes (payload ok=%v), want %d", consumed, len(buf), check(buf, consumed), fifo[0])
+				}
+				c.Release()
+				fifo = fifo[1:]
+				consumed++
 			}
-			return
-		}
-		if err != nil {
-			t.Fatalf("record %d: TryNext = %v, want %d bytes", consumed, err, fifo[0])
-		}
-		if len(buf) != fifo[0] || !check(buf, consumed) {
-			t.Fatalf("record %d: got %d bytes (payload ok=%v), want %d", consumed, len(buf), check(buf, consumed), fifo[0])
-		}
-		c.Release()
-		fifo = fifo[1:]
-		consumed++
-	}
 
-	for consumed < total {
-		if rng.IntN(2) == 0 {
-			consume()
-			continue
-		}
-		off := int(p.head & uint64(testCap-1))
-		rem := testCap - off
-		free := testCap - int(p.head-c.tail)
-		n := rng.IntN(129)
-		exact := false
-		switch rng.IntN(500) {
-		case 0:
-			n = 0
-		case 1:
-			n = maxRec
-		case 2:
-			if free <= rem && free >= 8 && free-8 <= maxRec {
-				n, exact = free-8, true
+			retry := false // set after an Abort so that aborts do not drain the ring
+			for consumed < total {
+				if !retry && rng.IntN(2) == 0 {
+					consume()
+					continue
+				}
+				retry = false
+				off := int(p.head & uint64(testCap-1))
+				rem := testCap - off
+				free := testCap - int(p.head-c.tail)
+				n := rng.IntN(129)
+				exact := false
+				switch rng.IntN(500) {
+				case 0:
+					n = 0
+				case 1:
+					n = maxRec
+				case 2:
+					if free <= rem && free >= 8 && free-8 <= maxRec {
+						n, exact = free-8, true
+					}
+				case 3:
+					if s := rem - 8 + 1 + rng.IntN(64); s <= maxRec {
+						n = s
+					}
+				}
+				need := 8 + align8(n)
+				if need > rem {
+					need += rem
+				}
+				buf, err := p.TryReserve(n)
+				if need > free {
+					if !errors.Is(err, ErrFull) {
+						t.Fatalf("TryReserve(%d) with %d free (need %d) = %v, want ErrFull", n, free, need, err)
+					}
+					fulls++
+					consume()
+					continue
+				}
+				if err != nil {
+					t.Fatalf("TryReserve(%d) with %d free (need %d) = %v", n, free, need, err)
+				}
+				if len(buf) != n || cap(buf) != n {
+					t.Fatalf("TryReserve(%d) returned len %d cap %d", n, len(buf), cap(buf))
+				}
+				fill(buf, produced)
+				if rng.IntN(3) == 0 {
+					p.Abort()
+					aborts++
+					retry = true
+					continue
+				}
+				m := mode.length(rng, n)
+				mode.publish(p, n, m)
+				fifo = append(fifo, m)
+				produced++
+				if need > 8+align8(n) {
+					wraps++
+				}
+				if m < n {
+					shortened++
+				}
+				switch {
+				case m == 0:
+					zeros++
+				case m == maxRec:
+					maxes++
+				}
+				if exact && m == n {
+					exactFills++
+					if _, err := p.TryReserve(0); !errors.Is(err, ErrFull) {
+						t.Fatalf("TryReserve(0) after exact fill = %v, want ErrFull", err)
+					}
+				}
 			}
-		case 3:
-			if s := rem - 8 + 1 + rng.IntN(64); s <= maxRec {
-				n = s
+			if _, err := p.TryReserve(maxRec + 1); !errors.Is(err, ErrTooLarge) {
+				t.Fatalf("TryReserve(MaxRecord+1) = %v, want ErrTooLarge", err)
 			}
-		}
-		need := 8 + align8(n)
-		if need > rem {
-			need += rem
-		}
-		buf, err := p.TryReserve(n)
-		if need > free {
-			if !errors.Is(err, ErrFull) {
-				t.Fatalf("TryReserve(%d) with %d free (need %d) = %v, want ErrFull", n, free, need, err)
+			t.Logf("records=%d fulls=%d wraps=%d exactFills=%d max=%d zero=%d shortened=%d aborts=%d",
+				consumed, fulls, wraps, exactFills, maxes, zeros, shortened, aborts)
+			if wraps == 0 || exactFills == 0 || maxes == 0 || zeros == 0 || fulls == 0 || aborts == 0 ||
+				mode.name != "Commit" && shortened == 0 {
+				t.Fatal("property test did not cover every edge case")
 			}
-			fulls++
-			consume()
-			continue
-		}
-		if err != nil {
-			t.Fatalf("TryReserve(%d) with %d free (need %d) = %v", n, free, need, err)
-		}
-		if len(buf) != n || cap(buf) != n {
-			t.Fatalf("TryReserve(%d) returned len %d cap %d", n, len(buf), cap(buf))
-		}
-		fill(buf, produced)
-		p.Commit()
-		fifo = append(fifo, n)
-		produced++
-		if need > 8+align8(n) {
-			wraps++
-		}
-		switch {
-		case n == 0:
-			zeros++
-		case n == maxRec:
-			maxes++
-		}
-		if exact {
-			exactFills++
-			if _, err := p.TryReserve(0); !errors.Is(err, ErrFull) {
-				t.Fatalf("TryReserve(0) after exact fill = %v, want ErrFull", err)
-			}
-		}
-	}
-	if _, err := p.TryReserve(maxRec + 1); !errors.Is(err, ErrTooLarge) {
-		t.Fatalf("TryReserve(MaxRecord+1) = %v, want ErrTooLarge", err)
-	}
-	t.Logf("records=%d fulls=%d wraps=%d exactFills=%d max=%d zero=%d", consumed, fulls, wraps, exactFills, maxes, zeros)
-	if wraps == 0 || exactFills == 0 || maxes == 0 || zeros == 0 || fulls == 0 {
-		t.Fatal("property test did not cover every edge case")
+		})
 	}
 }
 
@@ -203,50 +248,82 @@ func TestAbortDiscardsReservation(t *testing.T) {
 	}
 }
 
+func TestCommitNZeroLeavesEmptyRecord(t *testing.T) {
+	p, c := newPair(t, newRegion(t, testCap))
+	if _, err := p.TryReserve(100); err != nil {
+		t.Fatal(err)
+	}
+	p.CommitN(0)
+	if p.head != 8 {
+		t.Fatalf("head after CommitN(0) = %d, want 8", p.head)
+	}
+	produce(t, p, 5, 1)
+	if buf, err := c.TryNext(); err != nil || len(buf) != 0 {
+		t.Fatalf("first record = %d bytes, %v; want the empty record", len(buf), err)
+	}
+	c.Release()
+	if buf, err := c.TryNext(); err != nil || len(buf) != 5 || !check(buf, 1) {
+		t.Fatalf("second record = %d bytes, %v; want the 5-byte record", len(buf), err)
+	}
+}
+
 func TestConcurrentProducerConsumer(t *testing.T) {
 	const total = 200_000
-	region := newRegion(t, testCap)
-	p, c := newPair(t, region)
 	maxRec := MaxRecord(testCap)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		rng := rand.New(rand.NewPCG(3, 4))
-		for seq := uint64(0); seq < total; {
-			n := rng.IntN(512)
-			if rng.IntN(1000) == 0 {
-				n = maxRec
+	for _, mode := range commitModes {
+		t.Run(mode.name, func(t *testing.T) {
+			region := newRegion(t, testCap)
+			p, c := newPair(t, region)
+			// Both sides draw the same (n, m) sequence so the consumer knows each length.
+			draw := func(rng *rand.Rand) (n, m int) {
+				n = rng.IntN(512)
+				if rng.IntN(1000) == 0 {
+					n = maxRec
+				}
+				return n, mode.length(rng, n)
 			}
-			buf, err := p.TryReserve(n)
-			if errors.Is(err, ErrFull) {
-				runtime.Gosched()
-				continue
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				rng := rand.New(rand.NewPCG(3, 4))
+				for seq := uint64(0); seq < total; seq++ {
+					n, m := draw(rng)
+					for {
+						buf, err := p.TryReserve(n)
+						if errors.Is(err, ErrFull) {
+							runtime.Gosched()
+							continue
+						}
+						if err != nil {
+							t.Errorf("TryReserve: %v", err)
+							return
+						}
+						fill(buf, seq)
+						break
+					}
+					mode.publish(p, n, m)
+				}
+			}()
+			rng := rand.New(rand.NewPCG(3, 4))
+			for seq := uint64(0); seq < total; {
+				buf, err := c.TryNext()
+				if errors.Is(err, ErrEmpty) {
+					runtime.Gosched()
+					continue
+				}
+				if err != nil {
+					t.Fatalf("TryNext: %v", err)
+				}
+				_, m := draw(rng)
+				if len(buf) != m || !check(buf, seq) {
+					t.Fatalf("record %d: got %d bytes (payload ok=%v), want %d", seq, len(buf), check(buf, seq), m)
+				}
+				c.Release()
+				seq++
 			}
-			if err != nil {
-				t.Errorf("TryReserve: %v", err)
-				return
-			}
-			fill(buf, seq)
-			p.Commit()
-			seq++
-		}
-	}()
-	for seq := uint64(0); seq < total; {
-		buf, err := c.TryNext()
-		if errors.Is(err, ErrEmpty) {
-			runtime.Gosched()
-			continue
-		}
-		if err != nil {
-			t.Fatalf("TryNext: %v", err)
-		}
-		if !check(buf, seq) {
-			t.Fatalf("record %d payload mismatch", seq)
-		}
-		c.Release()
-		seq++
+			<-done
+		})
 	}
-	<-done
 }
 
 func TestSteadyStateZeroAllocs(t *testing.T) {
@@ -357,18 +434,34 @@ func mustConsume(t *testing.T, c *Consumer) {
 	c.Release()
 }
 
-func TestSecondReservePanics(t *testing.T) {
-	region := newRegion(t, testCap)
-	p, _ := newPair(t, region)
-	if _, err := p.TryReserve(8); err != nil {
-		t.Fatal(err)
+func TestProducerMisusePanics(t *testing.T) {
+	cases := []struct {
+		name    string
+		reserve bool
+		misuse  func(p *Producer)
+	}{
+		{"TryReserve with an outstanding reservation", true, func(p *Producer) { p.TryReserve(8) }},
+		{"Commit without a reservation", false, func(p *Producer) { p.Commit() }},
+		{"CommitN without a reservation", false, func(p *Producer) { p.CommitN(0) }},
+		{"CommitN above the reserved length", true, func(p *Producer) { p.CommitN(11) }},
+		{"CommitN of a negative length", true, func(p *Producer) { p.CommitN(-1) }},
 	}
-	defer func() {
-		if recover() == nil {
-			t.Fatal("second TryReserve without Commit/Abort did not panic")
-		}
-	}()
-	p.TryReserve(8)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := newPair(t, newRegion(t, testCap))
+			if tc.reserve {
+				if _, err := p.TryReserve(10); err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("%s did not panic", tc.name)
+				}
+			}()
+			tc.misuse(p)
+		})
+	}
 }
 
 // commit writes one n-byte record and returns Commit's wake result.
