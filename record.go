@@ -18,7 +18,7 @@ const (
 )
 
 // spinCheckEvery is how many failed re-checks a spin makes between reads
-// of the clock, the deadline and the connection's lifetime.
+// of the clock and the deadline.
 const spinCheckEvery = 128
 
 // half is one direction of a connection as seen by this end: its ring access
@@ -143,52 +143,7 @@ func (c *Conn) Reserve(n int) ([]byte, error) {
 	if err != ErrWouldBlock {
 		return p, err
 	}
-	if c.spin > 0 {
-		deadline := time.Now().Add(c.spin)
-		for i := 1; ; i++ {
-			if p, err = c.TryReserve(n); err != ErrWouldBlock {
-				return p, err
-			}
-			if i%spinCheckEvery == 0 {
-				if dl := c.tx.dl.Load(); dl != nil && dl.passed() {
-					return nil, os.ErrDeadlineExceeded
-				}
-				if c.life.Err() != nil {
-					return nil, c.sendErr()
-				}
-				if !time.Now().Before(deadline) {
-					break
-				}
-			}
-		}
-	}
-	for {
-		if !c.tx.acquire(c) {
-			return nil, c.sendErr()
-		}
-		ready := c.prod.Park(n)
-		c.tx.release(c)
-		if !ready {
-			dl := c.tx.dl.Load()
-			select {
-			case <-c.tx.sig:
-			case <-dl.done():
-				if !dl.passed() {
-					continue // replaced: wait under the new deadline
-				}
-				if c.tx.acquire(c) {
-					c.prod.Unpark()
-					c.tx.release(c)
-				}
-				return nil, os.ErrDeadlineExceeded
-			case <-c.life.Done():
-				return nil, c.sendErr()
-			}
-		}
-		if p, err = c.TryReserve(n); err != ErrWouldBlock {
-			return p, err
-		}
-	}
+	return c.wait(&c.tx, n)
 }
 
 // Commit publishes the record reserved by Reserve or TryReserve to the peer
@@ -273,15 +228,26 @@ func (c *Conn) Next() ([]byte, error) {
 	if err != ErrWouldBlock {
 		return p, err
 	}
+	return c.wait(&c.rx, 0)
+}
+
+// wait blocks for Reserve(n) when h is the send half, else for Next.
+func (c *Conn) wait(h *half, n int) (p []byte, err error) {
+	send := h == &c.tx
 	if c.spin > 0 {
 		deadline := time.Now().Add(c.spin)
 		for i := 1; ; i++ {
-			if p, err = c.TryNext(); err != ErrWouldBlock {
+			if send {
+				p, err = c.TryReserve(n)
+			} else {
+				p, err = c.TryNext()
+			}
+			if err != ErrWouldBlock {
 				return p, err
 			}
 			if i%spinCheckEvery == 0 {
-				// No done check: TryNext reports the close once drained.
-				if dl := c.rx.dl.Load(); dl != nil && dl.passed() {
+				// No done check: the try call reports the close, TryNext once drained.
+				if dl := h.dl.Load(); dl != nil && dl.passed() {
 					return nil, os.ErrDeadlineExceeded
 				}
 				if !time.Now().Before(deadline) {
@@ -291,28 +257,45 @@ func (c *Conn) Next() ([]byte, error) {
 		}
 	}
 	for {
-		if !c.rx.acquire(c) {
+		if !h.acquire(c) {
+			if send {
+				return nil, c.sendErr()
+			}
 			return nil, c.recvErr()
 		}
-		ready := c.cons.Park()
-		c.rx.release(c)
+		var ready bool
+		if send {
+			ready = c.prod.Park(n)
+		} else {
+			ready = c.cons.Park()
+		}
+		h.release(c)
 		if !ready {
-			dl := c.rx.dl.Load()
+			dl := h.dl.Load()
 			select {
-			case <-c.rx.sig:
+			case <-h.sig:
 			case <-dl.done():
 				if !dl.passed() {
 					continue // replaced: wait under the new deadline
 				}
-				if c.rx.acquire(c) {
-					c.cons.Unpark()
-					c.rx.release(c)
+				if h.acquire(c) {
+					if send {
+						c.prod.Unpark()
+					} else {
+						c.cons.Unpark()
+					}
+					h.release(c)
 				}
 				return nil, os.ErrDeadlineExceeded
 			case <-c.life.Done():
 			}
 		}
-		if p, err = c.TryNext(); err != ErrWouldBlock {
+		if send {
+			p, err = c.TryReserve(n)
+		} else {
+			p, err = c.TryNext()
+		}
+		if err != ErrWouldBlock {
 			return p, err
 		}
 	}
