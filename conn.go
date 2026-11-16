@@ -49,14 +49,12 @@ type Conn struct {
 	sendDir   uint8
 
 	closeOnce  sync.Once
-	rxOnce     sync.Once
 	life       context.Context // done when the connection ends, with why as its cause
 	end        context.CancelCauseFunc
 	closed     atomic.Bool // Close was called on this end
 	bye        atomic.Bool // the peer said goodbye
 	readerDone chan struct{}
 	live       atomic.Int32 // halves that may still touch the segment
-	unmapped   atomic.Bool  // test hook: the segment has been released
 
 	wmu sync.Mutex // serializes Write and ReadFrom
 	tx  half
@@ -165,7 +163,7 @@ func (c *Conn) readLoop() {
 // released when no slice is outstanding.
 func (c *Conn) shutdown(err error) {
 	c.peerGone(err)
-	c.rxOnce.Do(func() { c.rx.close(c) })
+	c.rx.close(c)
 }
 
 // peerGone closes the connection like shutdown but leaves the receive half
@@ -187,7 +185,6 @@ func (c *Conn) peerGone(err error) {
 func (c *Conn) halfDone() {
 	if c.live.Add(-1) == 0 {
 		c.seg.Close()
-		c.unmapped.Store(true)
 	}
 }
 

@@ -180,11 +180,11 @@ func TestReadDrainsThenEOFAfterPeerClose(t *testing.T) {
 	if n, err := dc.Read(make([]byte, 8)); n != 0 || err != io.EOF {
 		t.Fatalf("Read after drain = %d, %v; want 0, io.EOF", n, err)
 	}
-	if dc.unmapped.Load() {
-		t.Fatal("segment unmapped before local Close")
+	if dc.live.Load() == 0 {
+		t.Fatal("segment released before local Close")
 	}
 	dc.Close()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after local Close")
 	}
 }

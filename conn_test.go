@@ -609,11 +609,11 @@ func TestLocalCloseAfterPeerCloseUnmapsAndStopsDraining(t *testing.T) {
 	commitSeq(t, lc, 10, 100)
 	lc.Close()
 	<-dc.readerDone // the peer-close shutdown has finished
-	if dc.unmapped.Load() {
-		t.Fatal("segment unmapped by peer close; draining needs it until local Close")
+	if dc.live.Load() == 0 {
+		t.Fatal("segment released by peer close; draining needs it until local Close")
 	}
 	dc.Close()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after local Close")
 	}
 	if _, err := dc.TryNext(); err != net.ErrClosed {
@@ -709,14 +709,14 @@ func TestCloseDefersUnmapUntilInflightNextReleased(t *testing.T) {
 		t.Fatal(err)
 	}
 	dc.Close()
-	if dc.unmapped.Load() {
-		t.Fatal("segment unmapped while a Next slice is outstanding")
+	if dc.live.Load() == 0 {
+		t.Fatal("segment released while a Next slice is outstanding")
 	}
 	if string(rec) != "hello" {
 		t.Fatalf("in-flight slice reads %q after Close", rec)
 	}
 	dc.Release()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after the last slice was released")
 	}
 }
@@ -728,12 +728,12 @@ func TestCloseDefersUnmapUntilInflightReserveAborted(t *testing.T) {
 		t.Fatal(err)
 	}
 	dc.Close()
-	if dc.unmapped.Load() {
-		t.Fatal("segment unmapped while a Reserve slice is outstanding")
+	if dc.live.Load() == 0 {
+		t.Fatal("segment released while a Reserve slice is outstanding")
 	}
 	clear(p)
 	dc.Abort()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after the reservation was aborted")
 	}
 }
@@ -741,7 +741,7 @@ func TestCloseDefersUnmapUntilInflightReserveAborted(t *testing.T) {
 func TestCloseUnmapsAtOnceWithoutInflightSlices(t *testing.T) {
 	lc, _ := pair(t, ListenConfig{}, Dialer{})
 	lc.Close()
-	if !lc.unmapped.Load() {
+	if lc.live.Load() != 0 {
 		t.Fatal("segment still mapped after Close with nothing outstanding")
 	}
 }
@@ -755,8 +755,24 @@ func TestCloseReleasesRecordReadHoldsPartlyConsumed(t *testing.T) {
 		t.Fatal(err)
 	}
 	dc.Close()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after Close while Read held a partly consumed record")
+	}
+}
+
+func TestHalfClosedTwiceStaysClosedAndReleasesSegmentOnce(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	dc.rx.close(dc)
+	dc.rx.close(dc)
+	if dc.rx.acquire(dc) {
+		t.Fatal("acquire succeeded on a half closed twice")
+	}
+	if n := dc.live.Load(); n != 1 {
+		t.Fatalf("live = %d after closing one half twice; want 1", n)
+	}
+	dc.Close()
+	if n := dc.live.Load(); n != 0 {
+		t.Fatalf("live = %d after Close; want 0", n)
 	}
 }
 

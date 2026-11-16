@@ -92,7 +92,7 @@ func (h *half) release(c *Conn) (closed bool) {
 }
 
 func (h *half) close(c *Conn) {
-	if h.state.Add(halfClosed) == halfClosed && h.state.CompareAndSwap(halfClosed, halfClosed|halfDone) {
+	if h.state.Or(halfClosed) == 0 && h.state.CompareAndSwap(halfClosed, halfClosed|halfDone) {
 		c.halfDone()
 	}
 }
