@@ -38,9 +38,6 @@ type Listener struct {
 
 	mu       sync.Mutex
 	deadline time.Time
-
-	closeOnce sync.Once
-	closeErr  error
 }
 
 var _ net.Listener = (*Listener)(nil)
@@ -188,10 +185,7 @@ func (l *Listener) handshake(link *control.Link) (c *Conn, local bool, err error
 
 // Close stops listening and removes the socket file; a blocked Accept
 // returns net.ErrClosed. Connections already accepted stay open.
-func (l *Listener) Close() error {
-	l.closeOnce.Do(func() { l.closeErr = l.cl.Close() })
-	return l.closeErr
-}
+func (l *Listener) Close() error { return l.cl.Close() }
 
 // Addr returns the listener's socket path.
 func (l *Listener) Addr() net.Addr { return l.addr }

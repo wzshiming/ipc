@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,9 @@ import (
 // from the test binary.
 func TestMain(m *testing.M) {
 	if os.Getenv("IPCBENCH_AS_MAIN") == "1" {
+		if behavior := os.Getenv("IPCBENCH_TEST_PEER"); behavior != "" && slices.Contains(os.Args[1:], "-peer") {
+			os.Exit(misbehave(behavior, os.Args[1:]))
+		}
 		os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 	}
 	os.Exit(m.Run())

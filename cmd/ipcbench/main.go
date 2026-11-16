@@ -245,38 +245,38 @@ func (o options) peerArgs(addr string) []string {
 	}
 }
 
-// peer is the re-executed producing process.
-type peer struct {
-	cmd  *exec.Cmd
-	done chan struct{}
-	err  error
-}
+// Bounds of a run's end; tests set their own.
+var (
+	safetyMargin = time.Minute     // past -duration, a run's connections are closed
+	peerGrace    = 5 * time.Second // after a run, the peer's time to exit before it is killed
+)
 
-func startPeer(o options, addr string, stderr io.Writer) (*peer, error) {
+// startPeer starts the peer, which has peerGrace to exit once ctx is done
+// before it is killed. The context returned is done once the peer has been
+// reaped, with Wait's error as the cause.
+func startPeer(ctx context.Context, o options, addr string, stderr io.Writer) (context.Context, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
-	p := &peer{cmd: exec.Command(exe, o.peerArgs(addr)...), done: make(chan struct{})}
-	p.cmd.Stdout, p.cmd.Stderr = stderr, stderr
-	if err := p.cmd.Start(); err != nil {
+	cmd := exec.CommandContext(ctx, exe, o.peerArgs(addr)...)
+	cmd.Cancel = nil // the run's end leaves the peer to exit by itself
+	cmd.WaitDelay = peerGrace
+	cmd.Stdout, cmd.Stderr = stderr, stderr
+	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	go func() {
-		p.err = p.cmd.Wait()
-		close(p.done)
-	}()
-	return p, nil
+	exited, exit := context.WithCancelCause(context.Background())
+	go func() { exit(cmd.Wait()) }()
+	return exited, nil
 }
 
-// stop waits briefly for the peer to exit, then kills it.
-func (p *peer) stop() {
-	select {
-	case <-p.done:
-	case <-time.After(5 * time.Second):
-		p.cmd.Process.Kill()
-		<-p.done
+// waitErr is the peer's Wait error, exited's cause, which records nil as context.Canceled.
+func waitErr(exited context.Context) error {
+	if err := context.Cause(exited); err != context.Canceled {
+		return err
 	}
+	return nil
 }
 
 // runParent listens, starts the peer, consumes and reports.
@@ -295,23 +295,30 @@ func runParent(o options, stderr io.Writer) (*report, error) {
 		return nil, err
 	}
 	defer ln.Close()
-	p, err := startPeer(o, ln.Addr().String(), stderr)
+	ctx, end := context.WithCancelCause(context.Background())
+	exited, err := startPeer(ctx, o, ln.Addr().String(), stderr)
 	if err != nil {
+		end(nil)
 		return nil, err
 	}
-	defer p.stop()
-	conns, err := accept(ln, o.conns, p)
+	defer func() {
+		end(nil)
+		<-exited.Done()
+	}()
+	conns, err := accept(ln, o.conns, exited)
 	if err != nil {
 		return nil, err
 	}
 	defer closeAll(conns)
-	stop := time.AfterFunc(o.duration+time.Minute, func() { closeAll(conns) })
-	defer stop.Stop()
+	bounded, stop := context.WithTimeout(ctx, o.duration+safetyMargin)
+	defer stop()
+	stopClosing := context.AfterFunc(bounded, func() { closeAll(conns) })
+	defer stopClosing()
 	r := newReport(o, runtime.GOMAXPROCS(0))
 	if o.mode == "latency" {
 		r.Latency, err = measureLatency(conns[0], o.size, o.duration)
 	} else {
-		err = r.consume(conns, o)
+		err = r.consume(ctx, end, conns, o)
 	}
 	if err != nil {
 		return nil, err
@@ -339,25 +346,18 @@ func listen(o options, path string) (listener, error) {
 }
 
 // accept takes n connections from ln, giving up once the peer has exited.
-func accept(ln listener, n int, p *peer) ([]net.Conn, error) {
+func accept(ln listener, n int, exited context.Context) ([]net.Conn, error) {
 	ln.SetDeadline(time.Now().Add(30 * time.Second))
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-p.done:
-			ln.SetDeadline(time.Unix(1, 0))
-		case <-done:
-		}
-	}()
+	stop := context.AfterFunc(exited, func() { ln.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
 	conns := make([]net.Conn, 0, n)
 	for len(conns) < n {
 		c, err := ln.Accept()
 		if err != nil {
 			closeAll(conns)
 			select {
-			case <-p.done:
-				return nil, fmt.Errorf("peer exited before connecting: %v", p.err)
+			case <-exited.Done():
+				return nil, fmt.Errorf("peer exited before connecting: %v", waitErr(exited))
 			default:
 				return nil, err
 			}
@@ -394,8 +394,10 @@ func runPeer(o options) error {
 		}
 		conns = append(conns, c)
 	}
-	stop := time.AfterFunc(o.duration+time.Minute, func() { closeAll(conns) })
-	defer stop.Stop()
+	ctx, stop := context.WithTimeout(context.Background(), o.duration+safetyMargin)
+	defer stop()
+	stopClosing := context.AfterFunc(ctx, func() { closeAll(conns) })
+	defer stopClosing()
 	var err error
 	if o.mode == "latency" {
 		err = echo(conns[0], o.size)

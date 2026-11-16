@@ -13,7 +13,7 @@ import (
 func (c *Conn) Read(p []byte) (int, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
-	if c.rx.dl.expired.Load() {
+	if dl := c.rx.dl.Load(); dl != nil && dl.passed() {
 		return 0, os.ErrDeadlineExceeded
 	}
 	if len(p) == 0 {
@@ -54,7 +54,7 @@ func (c *Conn) hold() error {
 func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
-	if c.rx.dl.expired.Load() {
+	if dl := c.rx.dl.Load(); dl != nil && dl.passed() {
 		return 0, os.ErrDeadlineExceeded
 	}
 	var n int64

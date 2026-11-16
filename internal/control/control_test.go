@@ -235,7 +235,7 @@ func TestSendWriteDeadlineInPastIsTimeout(t *testing.T) {
 	}
 }
 
-func TestCloseWakesBlockedRecvAndIsIdempotent(t *testing.T) {
+func TestCloseWakesBlockedRecv(t *testing.T) {
 	_, b := pair(t)
 	errc := make(chan error, 1)
 	go func() {
@@ -254,14 +254,21 @@ func TestCloseWakesBlockedRecvAndIsIdempotent(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did not wake Recv")
 	}
-	if err := b.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
-	}
 	if err := b.Send(1, nil, nil); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Send after Close: got %v, want ErrClosed", err)
 	}
 	if _, _, _, err := b.Recv(); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Recv after Close: got %v, want ErrClosed", err)
+	}
+}
+
+func TestLinkSecondCloseReturnsNetErrClosed(t *testing.T) {
+	a, _ := pair(t)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("second Close: got %v, want net.ErrClosed", err)
 	}
 }
 

@@ -514,6 +514,96 @@ func TestPeerCloseFailsReserveTryReserveAndWriteAtOnce(t *testing.T) {
 	}
 }
 
+func TestOpenConnHasOpenDoneAndNilErr(t *testing.T) {
+	lc, dc := pair(t, ListenConfig{}, Dialer{})
+	if _, err := lc.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dc.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []*Conn{lc, dc} {
+		select {
+		case <-c.Done():
+			t.Fatalf("Done closed on an open connection, Err = %v", c.Err())
+		default:
+		}
+		if err := c.Err(); err != nil {
+			t.Fatalf("Err on an open connection = %v; want nil", err)
+		}
+	}
+}
+
+func TestLocalCloseClosesDoneWithErrNetErrClosed(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	dc.Close()
+	select {
+	case <-dc.Done():
+	default:
+		t.Fatal("Done still open after Close")
+	}
+	if err := dc.Err(); err != net.ErrClosed {
+		t.Fatalf("Err after Close = %v; want net.ErrClosed", err)
+	}
+}
+
+func TestSendFailingAsConnEndsNeverReturnsNilError(t *testing.T) {
+	const rounds = 100
+	for _, end := range []struct {
+		name string
+		f    func(peer *Conn)
+	}{
+		{"peer close", func(peer *Conn) { peer.Close() }},
+		{"link break", func(peer *Conn) { peer.link.Close() }},
+	} {
+		t.Run(end.name, func(t *testing.T) {
+			l, path := listen(t, ListenConfig{RingSize: 64 << 10})
+			l.SetDeadline(time.Now().Add(time.Minute))
+			for i := range rounds {
+				raceSendWithConnEnd(t, l, path, i, end.f)
+			}
+		})
+	}
+}
+
+// raceSendWithConnEnd connects once more to l and spins TryReserve on the
+// dialer's end while end ends the connection from the listener's.
+func raceSendWithConnEnd(t *testing.T, l *Listener, path string, round int, end func(peer *Conn)) {
+	ch := make(chan net.Conn, 1)
+	go func() {
+		c, _ := l.Accept()
+		ch <- c
+	}()
+	dc, err := (&Dialer{RingSize: 64 << 10, Timeout: 10 * time.Second}).Dial(path)
+	if err != nil {
+		t.Fatal("Dial:", err)
+	}
+	defer dc.Close()
+	c := <-ch
+	if c == nil {
+		t.Fatal("Accept failed")
+	}
+	lc := c.(*Conn)
+	defer lc.Close()
+	ended := make(chan struct{})
+	go func() {
+		end(lc)
+		close(ended)
+	}()
+	defer func() { <-ended }()
+	for err == nil {
+		var p []byte
+		if p, err = dc.TryReserve(8); p != nil {
+			dc.Abort()
+		} else if err == nil {
+			t.Fatalf("round %d: TryReserve failed with a nil error", round)
+		}
+	}
+	if !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("round %d: TryReserve = %v; want ErrPeerClosed", round, err)
+	}
+}
+
 func TestLocalCloseAfterPeerCloseUnmapsAndStopsDraining(t *testing.T) {
 	lc, dc := pair(t, ListenConfig{}, Dialer{})
 	commitSeq(t, lc, 10, 100)
