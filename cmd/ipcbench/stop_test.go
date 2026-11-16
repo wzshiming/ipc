@@ -254,7 +254,7 @@ func TestPeerPastItsSafetyBoundClosesItsConnections(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "b.sock")
-	o := parsed(t, "-mode", "latency", "-duration", "0s", "-path", path)
+	o := parsed(t, "-mode", "latency", "-duration", "0s", "-peer", path)
 	ln, err := listen(o, path)
 	if err != nil {
 		t.Fatal(err)

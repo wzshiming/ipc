@@ -17,7 +17,6 @@ type report struct {
 	Size       int     `json:"size"`
 	Ring       int     `json:"ring"`
 	DurationS  float64 `json:"duration_s"`
-	SpinNS     int64   `json:"spin_ns"`
 	GOMAXPROCS int     `json:"gomaxprocs"`
 
 	Aggregate *rate    `json:"aggregate,omitempty"`
@@ -56,7 +55,6 @@ func newReport(o options, gomaxprocs int) *report {
 		Size:       o.size,
 		Ring:       o.ring,
 		DurationS:  o.duration.Seconds(),
-		SpinNS:     int64(o.spin),
 		GOMAXPROCS: gomaxprocs,
 	}
 }
@@ -109,8 +107,8 @@ func (r *report) writeJSON(w io.Writer) error {
 }
 
 func (r *report) writeText(w io.Writer) error {
-	fmt.Fprintf(w, "mode=%s net=%s io=%s conns=%d size=%d ring=%d duration=%gs spin=%v gomaxprocs=%d\n",
-		r.Mode, r.Net, r.IO, r.Conns, r.Size, r.Ring, r.DurationS, time.Duration(r.SpinNS), r.GOMAXPROCS)
+	fmt.Fprintf(w, "mode=%s net=%s io=%s conns=%d size=%d ring=%d duration=%gs gomaxprocs=%d\n",
+		r.Mode, r.Net, r.IO, r.Conns, r.Size, r.Ring, r.DurationS, r.GOMAXPROCS)
 	if l := r.Latency; l != nil {
 		_, err := fmt.Fprintf(w, "round trip: samples=%d p50=%.2fus p99=%.2fus p999=%.2fus min=%.2fus mean=%.2fus max=%.2fus\n",
 			l.Samples, l.P50, l.P99, l.P999, l.Min, l.Mean, l.Max)

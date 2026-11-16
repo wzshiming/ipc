@@ -21,7 +21,8 @@ import (
 // from the test binary.
 func TestMain(m *testing.M) {
 	if os.Getenv("IPCBENCH_AS_MAIN") == "1" {
-		if behavior := os.Getenv("IPCBENCH_TEST_PEER"); behavior != "" && slices.Contains(os.Args[1:], "-peer") {
+		peer := slices.ContainsFunc(os.Args[1:], func(a string) bool { return strings.HasPrefix(a, "-peer=") })
+		if behavior := os.Getenv("IPCBENCH_TEST_PEER"); behavior != "" && peer {
 			os.Exit(misbehave(behavior, os.Args[1:]))
 		}
 		os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -345,7 +346,7 @@ func TestThroughputTextReportsRates(t *testing.T) {
 }
 
 func TestRemovedFlagIsUnknown(t *testing.T) {
-	for _, args := range [][]string{{"-lanes", "2"}, {"-corrupt", "5"}} {
+	for _, args := range [][]string{{"-lanes", "2"}, {"-corrupt", "5"}, {"-path", "b.sock"}, {"-spin", "1ms"}} {
 		_, err := parseFlags(args, &bytes.Buffer{})
 		if err == nil || !strings.Contains(err.Error(), "not defined") {
 			t.Errorf("parseFlags(%s) = %v, want a flag-not-defined error", strings.Join(args, " "), err)
@@ -511,8 +512,8 @@ func TestReportNamesTransportAndIO(t *testing.T) {
 	if err := r.writeText(&text); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text.String(), "mode=throughput net=tcp io=rw ") {
-		t.Fatalf("text header lacks net and io:\n%s", text.String())
+	if want := "mode=throughput net=tcp io=rw conns=1 size=64 ring=0 duration=0s gomaxprocs=4\n"; !strings.HasPrefix(text.String(), want) {
+		t.Fatalf("text header is not %q:\n%s", want, text.String())
 	}
 	if err := r.writeJSON(&js); err != nil {
 		t.Fatal(err)

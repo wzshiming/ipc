@@ -44,10 +44,8 @@ type options struct {
 	size     int
 	ring     int
 	duration time.Duration
-	spin     time.Duration
 	json     bool
-	path     string
-	peer     bool
+	peer     string // the parent's address; set only in the peer
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -70,7 +68,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	runtime.GOMAXPROCS(max(procs, o.conns+2))
-	if o.peer {
+	if o.peer != "" {
 		if err := runPeer(o); err != nil {
 			fmt.Fprintln(stderr, "ipcbench peer:", err)
 			return exitError
@@ -144,10 +142,8 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.Var((*sizeValue)(&o.size), "size", "record size: what the producer offers per Read, or writes per message with -io rw; B/KiB/MiB/GiB suffixes allowed (default 1MiB for throughput, 64B otherwise)")
 	fs.Var((*sizeValue)(&o.ring), "ring", "ring size per direction of -net ipc (default 4MiB, or the power of two holding 4 records)")
 	fs.DurationVar(&o.duration, "duration", 5*time.Second, "how long the peer produces")
-	fs.DurationVar(&o.spin, "spin", 0, "poll time before parking of -net ipc (0: library default, negative: park at once)")
 	fs.BoolVar(&o.json, "json", false, "print the report as JSON")
-	fs.StringVar(&o.path, "path", "", "socket path of -net ipc and unix (default: b.sock in a new temporary directory)")
-	fs.BoolVar(&o.peer, "peer", false, "internal: run as the dialing, producing peer")
+	fs.StringVar(&o.peer, "peer", "", "internal: run as the peer that dials the parent at `address` and produces")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -229,7 +225,7 @@ func (o *options) normalize() error {
 // peerArgs is the command line of the peer that dials addr.
 func (o options) peerArgs(addr string) []string {
 	return []string{
-		"-peer",
+		"-peer=" + addr,
 		"-mode=" + o.mode,
 		"-net=" + o.net,
 		"-io=" + o.io,
@@ -237,8 +233,6 @@ func (o options) peerArgs(addr string) []string {
 		"-size=" + strconv.Itoa(o.size),
 		"-ring=" + strconv.Itoa(o.ring),
 		"-duration=" + o.duration.String(),
-		"-spin=" + o.spin.String(),
-		"-path=" + addr,
 	}
 }
 
@@ -278,16 +272,12 @@ func waitErr(exited context.Context) error {
 
 // runParent listens, starts the peer, consumes and reports.
 func runParent(o options, stderr io.Writer) (*report, error) {
-	path := o.path
-	if path == "" {
-		dir, err := os.MkdirTemp("", "ipc")
-		if err != nil {
-			return nil, err
-		}
-		defer os.RemoveAll(dir)
-		path = filepath.Join(dir, "b.sock")
+	dir, err := os.MkdirTemp("", "ipc")
+	if err != nil {
+		return nil, err
 	}
-	ln, err := listen(o, path)
+	defer os.RemoveAll(dir)
+	ln, err := listen(o, filepath.Join(dir, "b.sock"))
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +328,7 @@ func listen(o options, path string) (listener, error) {
 	case "tcp":
 		return net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	}
-	lc := ipc.ListenConfig{RingSize: o.ring, Spin: o.spin}
+	lc := ipc.ListenConfig{RingSize: o.ring}
 	return lc.Listen(context.Background(), path)
 }
 
@@ -370,14 +360,14 @@ func closeAll(conns []net.Conn) {
 	}
 }
 
-// dial connects the peer to the parent's listener at o.path over -net.
+// dial connects the peer to the parent's listener at o.peer over -net.
 func dial(o options) (net.Conn, error) {
 	switch o.net {
 	case "unix", "tcp":
-		return net.Dial(o.net, o.path)
+		return net.Dial(o.net, o.peer)
 	}
-	d := ipc.Dialer{RingSize: o.ring, Spin: o.spin, Timeout: time.Minute}
-	return d.Dial(o.path)
+	d := ipc.Dialer{RingSize: o.ring, Timeout: time.Minute}
+	return d.Dial(o.peer)
 }
 
 // runPeer dials, then produces or echoes until the run ends.
