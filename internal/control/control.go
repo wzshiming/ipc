@@ -74,9 +74,6 @@ func (l *Listener) Accept() (*Link, error) {
 // Close stops listening and removes the socket file.
 func (l *Listener) Close() error { return l.l.Close() }
 
-// Addr returns the listener's address.
-func (l *Listener) Addr() net.Addr { return l.l.Addr() }
-
 // SetDeadline sets the deadline for Accept; a zero value disables it.
 func (l *Listener) SetDeadline(t time.Time) error { return closedErr(l.l.SetDeadline(t)) }
 
@@ -163,15 +160,12 @@ func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 // Close closes the link and wakes a blocked Recv.
 func (k *Link) Close() error { return k.c.Close() }
 
-// SetDeadline sets the read and write deadlines.
+// SetDeadline sets the read and write deadlines. A deadline that expires
+// mid-frame leaves the stream misaligned; the link must then be closed.
 func (k *Link) SetDeadline(t time.Time) error { return k.c.SetDeadline(t) }
 
-// SetReadDeadline sets the deadline for Recv. A deadline that expires
-// mid-frame leaves the stream misaligned; the link must then be closed.
-func (k *Link) SetReadDeadline(t time.Time) error { return k.c.SetReadDeadline(t) }
-
 // SetWriteDeadline sets the deadline for Send, with the same caveat as
-// SetReadDeadline for a frame partly written.
+// SetDeadline for a frame partly written.
 func (k *Link) SetWriteDeadline(t time.Time) error { return k.c.SetWriteDeadline(t) }
 
 // closedErr maps use of a closed connection to ErrClosed and passes other

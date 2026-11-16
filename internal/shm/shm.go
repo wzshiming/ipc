@@ -41,7 +41,7 @@ type Segment struct {
 	sys  segSys
 }
 
-// Bytes returns the mapped memory, len == Size(), page-aligned base.
+// Bytes returns the mapped memory, len == the requested size, page-aligned base.
 // The slice is invalid after Close; Bytes returns nil once closed.
 func (s *Segment) Bytes() []byte {
 	s.mu.Lock()
@@ -51,9 +51,6 @@ func (s *Segment) Bytes() []byte {
 	}
 	return s.mem[:s.size:s.size]
 }
-
-// Size returns the size requested at Create or carried by the Token at Attach.
-func (s *Segment) Size() int { return s.size }
 
 // Close unmaps the segment and closes its handle. It is idempotent.
 func (s *Segment) Close() error {
