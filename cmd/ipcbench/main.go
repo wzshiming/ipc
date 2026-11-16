@@ -44,7 +44,6 @@ type options struct {
 	size     int
 	ring     int
 	duration time.Duration
-	json     bool
 	peer     string // the parent's address; set only in the peer
 }
 
@@ -84,12 +83,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return exitError
 	}
-	if o.json {
-		err = r.writeJSON(stdout)
-	} else {
-		err = r.writeText(stdout)
-	}
-	if err != nil {
+	if err := r.writeText(stdout); err != nil {
 		fmt.Fprintln(stderr, "ipcbench:", err)
 		return exitError
 	}
@@ -142,7 +136,6 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.Var((*sizeValue)(&o.size), "size", "record size: what the producer offers per Read, or writes per message with -io rw; B/KiB/MiB/GiB suffixes allowed (default 1MiB for throughput, 64B otherwise)")
 	fs.Var((*sizeValue)(&o.ring), "ring", "ring size per direction of -net ipc (default 4MiB, or the power of two holding 4 records)")
 	fs.DurationVar(&o.duration, "duration", 5*time.Second, "how long the peer produces")
-	fs.BoolVar(&o.json, "json", false, "print the report as JSON")
 	fs.StringVar(&o.peer, "peer", "", "internal: run as the peer that dials the parent at `address` and produces")
 	if err := fs.Parse(args); err != nil {
 		return o, err
@@ -153,7 +146,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	if o.mode == "compare" {
 		var set []string
 		fs.Visit(func(f *flag.Flag) {
-			if slices.Contains([]string{"conns", "size", "net", "io", "json"}, f.Name) {
+			if slices.Contains([]string{"conns", "size", "net", "io"}, f.Name) {
 				set = append(set, "-"+f.Name)
 			}
 		})

@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -279,57 +278,51 @@ func TestCorruptChunkExitsWithCodeTwo(t *testing.T) {
 	}
 }
 
-func TestThroughputJSONParsesWithPositiveRates(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "throughput", "-conns", "2", "-size", "64KiB", "-duration", "300ms", "-json")
-	if code != 0 {
-		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
-	}
-	var r report
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
-	}
-	if r.Mode != "throughput" || r.Conns != 2 || r.Size != 64<<10 || len(r.PerConn) != 2 {
-		t.Fatalf("unexpected report header: %+v", r)
-	}
-	if !strings.Contains(stdout, `"conns"`) || !strings.Contains(stdout, `"per_conn"`) {
-		t.Fatalf("JSON lacks the conns and per_conn fields:\n%s", stdout)
-	}
-	if r.Aggregate == nil || r.Aggregate.GBps <= 0 || r.Aggregate.Gbps <= 0 || r.Aggregate.RecordsPerSec <= 0 {
-		t.Fatalf("aggregate rates not positive: %+v", r.Aggregate)
-	}
-	for _, c := range r.PerConn {
-		if c.GBps <= 0 {
-			t.Fatalf("connection %d rate not positive: %+v", c.Conn, c)
+func TestRunReportsItsConfigurationAndMeasurements(t *testing.T) {
+	t.Setenv("IPCBENCH_AS_MAIN", "1")
+	kernelThroughput := func(network string) func(r *report) bool {
+		return func(r *report) bool {
+			return r.Net == network && r.Ring == 0 && r.Aggregate != nil && r.Aggregate.GBps > 0
 		}
 	}
-}
-
-func TestFramingJSONCountsRecords(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "framing", "-size", "64B", "-duration", "300ms", "-json")
-	if code != 0 {
-		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
-	}
-	var r report
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
-	}
-	if r.Aggregate == nil || r.Aggregate.RecordsPerSec <= 0 {
-		t.Fatalf("framing records/s not positive: %+v", r.Aggregate)
-	}
-}
-
-func TestLatencyJSONReportsPercentiles(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "latency", "-duration", "300ms", "-json")
-	if code != 0 {
-		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
-	}
-	var r report
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
-	}
-	l := r.Latency
-	if l == nil || l.Samples == 0 || l.P50 <= 0 || l.P99 < l.P50 || l.P999 < l.P99 {
-		t.Fatalf("latency percentiles not ordered and positive: %+v", l)
+	roundTrips := func(r *report) bool { return r.Latency != nil && r.Latency.Samples > 0 && r.Latency.P50 > 0 }
+	for _, tc := range []struct {
+		args []string
+		want string
+		ok   func(r *report) bool
+	}{
+		{[]string{"-mode", "throughput", "-conns", "2", "-size", "64KiB"}, "throughput of 2 connections of 64 KiB records, each and all at positive rates", func(r *report) bool {
+			a := r.Aggregate
+			return r.Mode == "throughput" && r.Conns == 2 && r.Size == 64<<10 && len(r.PerConn) == 2 &&
+				a != nil && a.GBps > 0 && a.Gbps > 0 && a.RecordsPerSec > 0 &&
+				!slices.ContainsFunc(r.PerConn, func(c rate) bool { return c.GBps <= 0 })
+		}},
+		{[]string{"-mode", "framing", "-size", "64B"}, "positive records/s", func(r *report) bool {
+			return r.Aggregate != nil && r.Aggregate.RecordsPerSec > 0
+		}},
+		{[]string{"-mode", "latency"}, "positive percentiles in order", func(r *report) bool {
+			l := r.Latency
+			return l != nil && l.Samples > 0 && l.P50 > 0 && l.P99 >= l.P50 && l.P999 >= l.P99
+		}},
+		{[]string{"-mode", "throughput", "-net", "unix", "-size", "64KiB"}, "net unix, ring 0 and a positive rate", kernelThroughput("unix")},
+		{[]string{"-mode", "throughput", "-net", "tcp", "-size", "64KiB"}, "net tcp, ring 0 and a positive rate", kernelThroughput("tcp")},
+		{[]string{"-mode", "latency", "-net", "unix"}, "measured round trips", roundTrips},
+		{[]string{"-mode", "latency", "-net", "tcp"}, "measured round trips", roundTrips},
+		{[]string{"-mode", "throughput", "-io", "rw", "-size", "64KiB"}, "io rw, positive rates and 64 KiB per record", func(r *report) bool {
+			a := r.Aggregate
+			return r.IO == "rw" && a != nil && a.GBps > 0 && a.RecordsPerSec > 0 && a.Bytes == a.Records*(64<<10)
+		}},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var stderr bytes.Buffer
+			r, err := runParent(parsed(t, append(tc.args, "-duration", "300ms")...), &stderr)
+			if err != nil || r.empty() {
+				t.Fatalf("runParent = %v, want a measured run; stderr:\n%s", err, &stderr)
+			}
+			if !tc.ok(r) {
+				t.Fatalf("report %+v with aggregate %+v and latency %+v, want %s", *r, r.Aggregate, r.Latency, tc.want)
+			}
+		})
 	}
 }
 
@@ -346,7 +339,7 @@ func TestThroughputTextReportsRates(t *testing.T) {
 }
 
 func TestRemovedFlagIsUnknown(t *testing.T) {
-	for _, args := range [][]string{{"-lanes", "2"}, {"-corrupt", "5"}, {"-path", "b.sock"}, {"-spin", "1ms"}} {
+	for _, args := range [][]string{{"-lanes", "2"}, {"-corrupt", "5"}, {"-path", "b.sock"}, {"-spin", "1ms"}, {"-json"}} {
 		_, err := parseFlags(args, &bytes.Buffer{})
 		if err == nil || !strings.Contains(err.Error(), "not defined") {
 			t.Errorf("parseFlags(%s) = %v, want a flag-not-defined error", strings.Join(args, " "), err)
@@ -415,41 +408,6 @@ func TestKernelTransportsHaveNoRing(t *testing.T) {
 	}
 }
 
-func TestThroughputRunsOnKernelTransports(t *testing.T) {
-	for _, network := range []string{"unix", "tcp"} {
-		stdout, stderr, code := runBench(t, "-mode", "throughput", "-net", network, "-size", "64KiB", "-duration", "300ms", "-json")
-		if code != 0 {
-			t.Fatalf("-net %s: exit code %d; stderr:\n%s", network, code, stderr)
-		}
-		var r report
-		if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-			t.Fatalf("-net %s: output is not JSON: %v\n%s", network, err, stdout)
-		}
-		if r.Net != network || r.Ring != 0 {
-			t.Fatalf("-net %s reported net=%q ring=%d, want the transport and no ring", network, r.Net, r.Ring)
-		}
-		if r.Aggregate == nil || r.Aggregate.GBps <= 0 {
-			t.Fatalf("-net %s: aggregate rate not positive: %+v", network, r.Aggregate)
-		}
-	}
-}
-
-func TestLatencyRunsOnKernelTransports(t *testing.T) {
-	for _, network := range []string{"unix", "tcp"} {
-		stdout, stderr, code := runBench(t, "-mode", "latency", "-net", network, "-duration", "300ms", "-json")
-		if code != 0 {
-			t.Fatalf("-net %s: exit code %d; stderr:\n%s", network, code, stderr)
-		}
-		var r report
-		if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-			t.Fatalf("-net %s: output is not JSON: %v\n%s", network, err, stdout)
-		}
-		if l := r.Latency; l == nil || l.Samples == 0 || l.P50 <= 0 {
-			t.Fatalf("-net %s: no round trips measured: %+v", network, l)
-		}
-	}
-}
-
 func TestCorruptChunkOnKernelTransportsExitsWithCodeTwo(t *testing.T) {
 	t.Setenv("IPCBENCH_TEST_PEER", "corrupt 5")
 	for _, network := range []string{"unix", "tcp"} {
@@ -487,41 +445,14 @@ func TestPeerExitsQuietlyWhenParentClosesKernelTransportFirst(t *testing.T) {
 	}
 }
 
-// With -io rw every record is one message: the consumer reads exactly -size
-// bytes per record it counts.
-func TestReadWriteIOReportsPositiveRatesPerMessage(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "throughput", "-io", "rw", "-size", "64KiB", "-duration", "300ms", "-json")
-	if code != 0 {
-		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
-	}
-	var r report
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
-	}
-	if r.IO != "rw" || r.Aggregate == nil || r.Aggregate.GBps <= 0 || r.Aggregate.RecordsPerSec <= 0 {
-		t.Fatalf("report io=%q aggregate %+v, want io=rw and positive rates", r.IO, r.Aggregate)
-	}
-	if r.Aggregate.Bytes != r.Aggregate.Records*(64<<10) {
-		t.Fatalf("%d bytes in %d records, want %d-byte messages", r.Aggregate.Bytes, r.Aggregate.Records, 64<<10)
-	}
-}
-
 func TestReportNamesTransportAndIO(t *testing.T) {
 	r := newReport(options{mode: "throughput", net: "tcp", io: "rw", conns: 1, size: 64}, 4)
-	var text, js bytes.Buffer
+	var text bytes.Buffer
 	if err := r.writeText(&text); err != nil {
 		t.Fatal(err)
 	}
 	if want := "mode=throughput net=tcp io=rw conns=1 size=64 ring=0 duration=0s gomaxprocs=4\n"; !strings.HasPrefix(text.String(), want) {
 		t.Fatalf("text header is not %q:\n%s", want, text.String())
-	}
-	if err := r.writeJSON(&js); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{`"net": "tcp"`, `"io": "rw"`} {
-		if !strings.Contains(js.String(), want) {
-			t.Fatalf("JSON lacks %s:\n%s", want, js.String())
-		}
 	}
 }
 
@@ -557,7 +488,7 @@ func TestCorruptMessageWithReadWriteIOExitsWithCodeTwo(t *testing.T) {
 }
 
 func TestCompareRejectsSingleConfigurationFlags(t *testing.T) {
-	for _, args := range [][]string{{"-conns", "1"}, {"-size", "64KiB"}, {"-net", "ipc"}, {"-io", "copy"}, {"-json"}} {
+	for _, args := range [][]string{{"-conns", "1"}, {"-size", "64KiB"}, {"-net", "ipc"}, {"-io", "copy"}} {
 		_, err := parseFlags(append([]string{"-mode", "compare"}, args...), &bytes.Buffer{})
 		if err == nil || !strings.Contains(err.Error(), "compare") || !strings.Contains(err.Error(), args[0]) {
 			t.Errorf("-mode compare %s = %v, want an error naming %s and compare", strings.Join(args, " "), err, args[0])
