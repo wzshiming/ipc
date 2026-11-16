@@ -215,6 +215,14 @@ func TestListenRejectsOutOfRangeCap(t *testing.T) {
 	}
 }
 
+func TestErrUnsupportedIsStdlibErrUnsupported(t *testing.T) {
+	for _, err := range []error{control.ErrUnsupported, shm.ErrUnsupported} {
+		if !errors.Is(err, errors.ErrUnsupported) {
+			t.Errorf("errors.Is(%v, errors.ErrUnsupported) = false", err)
+		}
+	}
+}
+
 func TestAddrsAreIPCPaths(t *testing.T) {
 	l, path := listen(t, ListenConfig{})
 	if a := l.Addr(); a.Network() != "ipc" || a.String() != path {
