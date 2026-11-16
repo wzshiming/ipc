@@ -499,76 +499,47 @@ func fillUntilFull(t *testing.T, p *Producer, n int) {
 	}
 }
 
-func TestCommitWakesParkedConsumerOnce(t *testing.T) {
-	p, c := newPair(t, newRegion(t, testCap))
-	if c.Park() {
-		t.Fatal("Park on an empty ring reported ready")
+func TestPublishRingsOncePerWaitingPark(t *testing.T) {
+	cases := []struct {
+		name      string
+		producer  bool // the producer parks on a full ring, else the consumer on an empty one
+		published bool // the peer publishes before Park
+		unparked  bool // Unpark follows Park
+	}{
+		{"Commit wakes parked consumer once", false, false, false},
+		{"consumer Park with data is ready and clears flag", false, true, false},
+		{"consumer Unpark is not counted", false, false, true},
+		{"Release wakes parked producer once", true, false, false},
+		{"producer Park with space is ready and clears flag", true, true, false},
+		{"producer Unpark is not counted", true, false, true},
 	}
-	if !commit(t, p, 1) {
-		t.Fatal("Commit after the consumer parked did not ask for a doorbell")
-	}
-	if commit(t, p, 1) {
-		t.Fatal("second Commit rang again for the same park")
-	}
-}
-
-func TestConsumerParkWithDataIsReadyAndClearsFlag(t *testing.T) {
-	p, c := newPair(t, newRegion(t, testCap))
-	commit(t, p, 1)
-	if !c.Park() {
-		t.Fatal("Park with a published record did not report ready")
-	}
-	if commit(t, p, 1) {
-		t.Fatal("Commit rang for a park that reported ready")
-	}
-}
-
-func TestConsumerUnparkIsNotCounted(t *testing.T) {
-	p, c := newPair(t, newRegion(t, testCap))
-	if c.Park() {
-		t.Fatal("Park on an empty ring reported ready")
-	}
-	c.Unpark()
-	if commit(t, p, 1) {
-		t.Fatal("Commit rang for a consumer that had unparked")
-	}
-}
-
-func TestReleaseWakesParkedProducerOnce(t *testing.T) {
-	p, c := newPair(t, newRegion(t, testCap))
-	fillUntilFull(t, p, 1000)
-	if p.Park(1000) {
-		t.Fatal("Park on a full ring reported ready")
-	}
-	if !release(t, c) {
-		t.Fatal("Release after the producer parked did not ask for a doorbell")
-	}
-	if release(t, c) {
-		t.Fatal("second Release rang again for the same park")
-	}
-}
-
-func TestProducerParkWithSpaceIsReadyAndClearsFlag(t *testing.T) {
-	p, c := newPair(t, newRegion(t, testCap))
-	fillUntilFull(t, p, 1000)
-	release(t, c)
-	if !p.Park(1000) {
-		t.Fatal("Park with room for the record did not report ready")
-	}
-	if release(t, c) {
-		t.Fatal("Release rang for a park that reported ready")
-	}
-}
-
-func TestProducerUnparkIsNotCounted(t *testing.T) {
-	p, c := newPair(t, newRegion(t, testCap))
-	fillUntilFull(t, p, 1000)
-	if p.Park(1000) {
-		t.Fatal("Park on a full ring reported ready")
-	}
-	p.Unpark()
-	if release(t, c) {
-		t.Fatal("Release rang for a producer that had unparked")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, c := newPair(t, newRegion(t, testCap))
+			park, unpark := c.Park, c.Unpark
+			publish := func() bool { return commit(t, p, 1) }
+			if tc.producer {
+				fillUntilFull(t, p, 1000)
+				park, unpark = func() bool { return p.Park(1000) }, p.Unpark
+				publish = func() bool { return release(t, c) }
+			}
+			if tc.published {
+				publish()
+			}
+			if ready := park(); ready != tc.published {
+				t.Fatalf("Park reported ready=%v, want %v", ready, tc.published)
+			}
+			if tc.unparked {
+				unpark()
+			}
+			wake := !tc.published && !tc.unparked
+			if rang := publish(); rang != wake {
+				t.Fatalf("publish after Park asked for a doorbell=%v, want %v", rang, wake)
+			}
+			if wake && publish() {
+				t.Fatal("second publish rang again for the same park")
+			}
+		})
 	}
 }
 
