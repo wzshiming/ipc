@@ -9,35 +9,20 @@ import (
 // It trusts nothing the producer wrote: every length is checked against
 // MaxRecord, the published bytes and the end of the data area.
 type Consumer struct {
-	data           []byte
-	sharedHead     *uint64 // written by the producer
-	sharedTail     *uint64 // written by us
-	consumerParked *uint32
-	producerParked *uint32
-	mask           uint64
-	capacity       uint64
-	maxRecord      uint64
-	tail           uint64 // local copy of the shared tail
-	cachedHead     uint64
-	pending        uint64 // bytes the current record advances tail by; 0 if none
+	view
+	maxRecord  uint64
+	tail       uint64 // local copy of the shared tail
+	cachedHead uint64
+	pending    uint64 // bytes the current record advances tail by; 0 if none
 }
 
-// NewConsumer attaches a consumer to a formatted region.
-func NewConsumer(region []byte) (*Consumer, error) {
-	capacity, err := Verify(region)
+// NewConsumer attaches a consumer to a region formatted for capacity.
+func NewConsumer(region []byte, capacity int) (*Consumer, error) {
+	v, err := attach(region, capacity)
 	if err != nil {
 		return nil, err
 	}
-	c := &Consumer{
-		data:           region[HeaderSize : HeaderSize+capacity : HeaderSize+capacity],
-		sharedHead:     u64(region, offHead),
-		sharedTail:     u64(region, offTail),
-		consumerParked: u32(region, offConsumerParked),
-		producerParked: u32(region, offProducerParked),
-		mask:           uint64(capacity - 1),
-		capacity:       uint64(capacity),
-		maxRecord:      uint64(MaxRecord(capacity)),
-	}
+	c := &Consumer{view: v, maxRecord: uint64(MaxRecord(capacity))}
 	c.tail = atomic.LoadUint64(c.sharedTail)
 	c.cachedHead = c.tail
 	if c.tail%recHeader != 0 {

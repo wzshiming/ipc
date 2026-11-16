@@ -34,10 +34,11 @@ var (
 	ErrTooLarge = errors.New("ring: record too large")
 	ErrCorrupt  = errors.New("ring: corrupt record")
 
-	ErrBadMagic    = errors.New("ring: bad magic")
-	ErrBadCapacity = errors.New("ring: capacity must be a power of two in [64 KiB, 1 GiB]")
-	ErrShortRegion = errors.New("ring: region too small")
-	ErrUnaligned   = errors.New("ring: region not 8-byte aligned")
+	ErrBadMagic         = errors.New("ring: bad magic")
+	ErrBadCapacity      = errors.New("ring: capacity must be a power of two in [64 KiB, 1 GiB]")
+	ErrCapacityMismatch = errors.New("ring: capacity differs from the expected one")
+	ErrShortRegion      = errors.New("ring: region too small")
+	ErrUnaligned        = errors.New("ring: region not 8-byte aligned")
 )
 
 // Size returns the region size needed for a ring with the given data capacity.
@@ -91,4 +92,35 @@ func Verify(region []byte) (capacity int, err error) {
 		return 0, ErrShortRegion
 	}
 	return c, nil
+}
+
+// view is what both ends of a ring map from its region.
+type view struct {
+	data           []byte
+	sharedHead     *uint64 // written by the producer
+	sharedTail     *uint64 // written by the consumer
+	consumerParked *uint32
+	producerParked *uint32
+	mask           uint64
+	capacity       uint64
+}
+
+// attach verifies that region is formatted for capacity and returns its view.
+func attach(region []byte, capacity int) (view, error) {
+	c, err := Verify(region)
+	if err != nil {
+		return view{}, err
+	}
+	if c != capacity {
+		return view{}, ErrCapacityMismatch
+	}
+	return view{
+		data:           region[HeaderSize : HeaderSize+capacity : HeaderSize+capacity],
+		sharedHead:     u64(region, offHead),
+		sharedTail:     u64(region, offTail),
+		consumerParked: u32(region, offConsumerParked),
+		producerParked: u32(region, offProducerParked),
+		mask:           uint64(capacity - 1),
+		capacity:       uint64(capacity),
+	}, nil
 }

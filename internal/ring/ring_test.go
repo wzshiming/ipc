@@ -25,11 +25,12 @@ func newRegion(t testing.TB, capacity int) []byte {
 
 func newPair(t testing.TB, region []byte) (*Producer, *Consumer) {
 	t.Helper()
-	p, err := NewProducer(region)
+	capacity := len(region) - HeaderSize
+	p, err := NewProducer(region, capacity)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
-	c, err := NewConsumer(region)
+	c, err := NewConsumer(region, capacity)
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
@@ -844,5 +845,29 @@ func TestVerifyRejectsTamperedHeader(t *testing.T) {
 	}
 	if _, err := Verify(make([]byte, HeaderSize-1)); err == nil {
 		t.Error("Verify accepted a region shorter than the header")
+	}
+}
+
+func TestNewProducerAndConsumerRejectRegionFormattedForOtherCapacity(t *testing.T) {
+	below := make([]byte, Size(2*testCap))
+	if err := Format(below, testCap); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		region   []byte
+		capacity int
+	}{
+		{"header below the expected capacity", below, 2 * testCap},
+		{"header above the expected capacity", newRegion(t, 2*testCap), testCap},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewProducer(tc.region, tc.capacity); !errors.Is(err, ErrCapacityMismatch) {
+				t.Errorf("NewProducer = %v; want ErrCapacityMismatch", err)
+			}
+			if _, err := NewConsumer(tc.region, tc.capacity); !errors.Is(err, ErrCapacityMismatch) {
+				t.Errorf("NewConsumer = %v; want ErrCapacityMismatch", err)
+			}
+		})
 	}
 }

@@ -92,16 +92,11 @@ func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Durat
 		k := int(dir)
 		return mem[k*rs : (k+1)*rs : (k+1)*rs]
 	}
-	for dir := range uint8(2) {
-		if capacity, err := ring.Verify(region(dir)); err != nil || capacity != ringSize {
-			return nil, corruptErr(dir, err)
-		}
-	}
 	var err error
-	if c.prod, err = ring.NewProducer(region(c.sendDir)); err != nil {
+	if c.prod, err = ring.NewProducer(region(c.sendDir), ringSize); err != nil {
 		return nil, corruptErr(c.sendDir, err)
 	}
-	if c.cons, err = ring.NewConsumer(region(recvDir)); err != nil {
+	if c.cons, err = ring.NewConsumer(region(recvDir), ringSize); err != nil {
 		return nil, corruptErr(recvDir, err)
 	}
 	c.tx.sig, c.tx.bell = make(chan struct{}, 1), doorbell{c.sendDir}
@@ -112,9 +107,6 @@ func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Durat
 }
 
 func corruptErr(dir uint8, err error) error {
-	if err == nil {
-		err = errors.New("capacity differs from the negotiated ring size")
-	}
 	return fmt.Errorf("%w: ring %d: %w", ErrCorrupt, dir, err)
 }
 
