@@ -1,4 +1,6 @@
-package ipc
+//go:build windows
+
+package control
 
 import (
 	"syscall"

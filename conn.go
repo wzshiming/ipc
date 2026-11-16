@@ -128,7 +128,7 @@ func (c *Conn) readLoop() {
 			return
 		}
 		if len(fds) > 0 {
-			discardFDs(fds)
+			control.CloseFDs(fds)
 			c.shutdown(errProtocol)
 			return
 		}
@@ -221,7 +221,7 @@ func (c *Conn) recvErr() error {
 
 // peerErr maps the link errors a vanished peer causes to ErrPeerClosed.
 func peerErr(err error) error {
-	if isPeerGone(err) {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || control.PeerGone(err) {
 		return ErrPeerClosed
 	}
 	return err

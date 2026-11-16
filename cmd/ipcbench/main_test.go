@@ -431,7 +431,7 @@ func TestPeerExitsQuietlyWhenParentClosesKernelTransportFirst(t *testing.T) {
 	setBound(t, &peerGrace, 30*time.Second)
 	networks := []string{"unix", "tcp"}
 	if runtime.GOOS == "darwin" {
-		// darwin may fail the peer's unix Write with ENOTCONN, which peerGone does not list.
+		// darwin may fail the peer's unix Write with ENOTCONN, which control.PeerGone does not list.
 		networks = []string{"tcp"}
 	}
 	for _, network := range networks {

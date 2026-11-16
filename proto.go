@@ -4,8 +4,6 @@ import (
 	"errors"
 	"math/bits"
 	"time"
-
-	"github.com/wzshiming/ipc/internal/shm"
 )
 
 // Control protocol. The dialer sends Hello; the listener answers Welcome
@@ -105,12 +103,4 @@ func decodeDoorbell(p []byte) (dir uint8, err error) {
 		return 0, errProtocol
 	}
 	return p[0], nil
-}
-
-// discardFDs closes descriptors received where none belong: DecodeToken owns
-// its fds and closes them when the payload is invalid.
-func discardFDs(fds []int) {
-	if len(fds) > 0 {
-		shm.DecodeToken(nil, fds)
-	}
 }

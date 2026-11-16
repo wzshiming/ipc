@@ -794,7 +794,7 @@ func rawHello(t *testing.T, path string, payload []byte) (typ uint8, answer []by
 	if err != nil {
 		t.Fatal(err)
 	}
-	discardFDs(fds)
+	control.CloseFDs(fds)
 	if _, _, _, err := link.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("Recv after Reject = %v; want io.EOF (listener closes the link)", err)
 	}
@@ -822,7 +822,7 @@ func sentHello(t *testing.T, d Dialer) []byte {
 		if err != nil {
 			return
 		}
-		discardFDs(fds)
+		control.CloseFDs(fds)
 		ch <- p
 		link.Send(frameReject, nil, nil)
 	}()
@@ -945,7 +945,7 @@ func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 		if _, _, fds, err := link.Recv(); err != nil {
 			return
 		} else {
-			discardFDs(fds)
+			control.CloseFDs(fds)
 		}
 		tok, err := seg.Export()
 		if err != nil {

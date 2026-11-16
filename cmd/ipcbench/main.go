@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/ipc"
+	"github.com/wzshiming/ipc/internal/control"
 )
 
 const (
@@ -384,7 +385,7 @@ func runPeer(o options) error {
 	} else {
 		err = produceAll(conns, o)
 	}
-	if errors.Is(err, ipc.ErrPeerClosed) || peerGone(err) {
+	if errors.Is(err, ipc.ErrPeerClosed) || control.PeerGone(err) {
 		return nil // the parent quit first, e.g. on an integrity failure, and reports why
 	}
 	return err
