@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"runtime"
+	"runtime/debug"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -592,6 +593,19 @@ func ring(bell chan struct{}) {
 	}
 }
 
+func raceEnabled() bool {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "-race" {
+			return s.Value == "true"
+		}
+	}
+	return false
+}
+
 // TestParkProtocolNoLostWakeups runs a producer and a consumer that park on a
 // full/empty ring and wait on channel doorbells until 1e6 waits (2e5 under
 // -race) have happened. A lost wakeup deadlocks and trips the progress
@@ -599,7 +613,7 @@ func ring(bell chan struct{}) {
 // then the producer on the full one.
 func TestParkProtocolNoLostWakeups(t *testing.T) {
 	wantWaits := int64(1_000_000)
-	if raceEnabled {
+	if raceEnabled() {
 		wantWaits = 200_000
 	}
 	const stallLimit = 20 * time.Second
