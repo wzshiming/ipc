@@ -283,10 +283,10 @@ func measureLatency(c net.Conn, size int, d time.Duration) (*latency, error) {
 	const warmup = 1000
 	msg, reply := newTemplate(size), make([]byte, size)
 	samples := make([]time.Duration, 0, 1<<20)
-	start := nowNanos()
+	start := now()
 	for seq := uint64(1); ; seq++ {
-		t0 := nowNanos()
-		if seq > warmup && elapsed(start, t0) >= d {
+		t0 := now()
+		if seq > warmup && t0-start >= d {
 			break
 		}
 		binary.LittleEndian.PutUint64(msg, seq)
@@ -300,7 +300,7 @@ func measureLatency(c net.Conn, size int, d time.Duration) (*latency, error) {
 			return nil, &integrityError{0, fmt.Sprintf("echo of record %d differs from the record sent", seq)}
 		}
 		if seq > warmup {
-			samples = append(samples, elapsed(t0, nowNanos()))
+			samples = append(samples, now()-t0)
 		}
 	}
 	return newLatency(samples), nil

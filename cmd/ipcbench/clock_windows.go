@@ -3,6 +3,7 @@
 package main
 
 import (
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -21,10 +22,10 @@ var (
 	}()
 )
 
-// nowNanos returns QueryPerformanceCounter ticks as nanoseconds.
-func nowNanos() int64 {
+// now returns QueryPerformanceCounter ticks as a duration.
+func now() time.Duration {
 	var t int64
 	qpc.Call(uintptr(unsafe.Pointer(&t)))
 	// Split so ticks*1e9 cannot overflow on long uptimes.
-	return t/qpcFreq*1e9 + t%qpcFreq*1e9/qpcFreq
+	return time.Duration(t/qpcFreq*1e9 + t%qpcFreq*1e9/qpcFreq)
 }
