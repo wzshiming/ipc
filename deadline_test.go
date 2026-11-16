@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -330,63 +329,19 @@ func churnDeadline(set func(time.Time) error) (stop func()) {
 	})
 }
 
-// deadlinePingPong runs b.N 64 B round trips like pinnedPingPong. With
-// eachCall every Read and Write first sets its deadline a minute ahead;
-// without, both ends set a deadline an hour ahead once.
-func deadlinePingPong(b *testing.B, eachCall bool) {
+func BenchmarkPinnedPingPong64BDeadlineEachCall(b *testing.B) {
 	lc, dc := pair(b, ListenConfig{}, Dialer{})
-	if !eachCall {
-		far := time.Now().Add(time.Hour)
-		lc.SetDeadline(far)
-		dc.SetDeadline(far)
-	}
-	read := func(c *Conn, p []byte) (int, error) {
-		if eachCall {
-			c.SetReadDeadline(time.Now().Add(time.Minute))
-		}
-		return c.Read(p)
-	}
-	write := func(c *Conn, p []byte) (int, error) {
-		if eachCall {
-			c.SetWriteDeadline(time.Now().Add(time.Minute))
-		}
-		return c.Write(p)
-	}
-	done := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-		buf := make([]byte, 64)
-		for range b.N {
-			n, err := read(dc, buf)
-			if err == nil {
-				_, err = write(dc, buf[:n])
-			}
-			if err != nil {
-				done <- err
-				return
-			}
-		}
-		done <- nil
-	}()
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	msg, buf := make([]byte, 64), make([]byte, 64)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for range b.N {
-		if _, err := write(lc, msg); err != nil {
-			b.Fatal(err)
-		}
-		if _, err := read(lc, buf); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := <-done; err != nil {
-		b.Fatal(err)
-	}
+	pinnedPingPong(b, lc, dc, b.N, true, false)
 }
 
-func BenchmarkPinnedPingPong64BDeadlineEachCall(b *testing.B) { deadlinePingPong(b, true) }
-
-func BenchmarkPinnedPingPong64BFarDeadline(b *testing.B) { deadlinePingPong(b, false) }
+func BenchmarkPinnedPingPong64BFarDeadline(b *testing.B) {
+	lc, dc := pair(b, ListenConfig{}, Dialer{})
+	far := time.Now().Add(time.Hour)
+	lc.SetDeadline(far)
+	dc.SetDeadline(far)
+	b.ReportAllocs()
+	b.ResetTimer()
+	pinnedPingPong(b, lc, dc, b.N, false, false)
+}
