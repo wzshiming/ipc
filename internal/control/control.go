@@ -97,9 +97,6 @@ type Link struct {
 
 	wmu  sync.Mutex
 	wbuf []byte
-
-	closeOnce sync.Once
-	closeErr  error
 }
 
 func newLink(c *net.UnixConn) *Link {
@@ -163,11 +160,8 @@ func (k *Link) Recv() (typ uint8, payload []byte, fds []int, err error) {
 	return h[0], payload, fds, nil
 }
 
-// Close closes the link and wakes a blocked Recv; later calls return nil.
-func (k *Link) Close() error {
-	k.closeOnce.Do(func() { k.closeErr = k.c.Close() })
-	return k.closeErr
-}
+// Close closes the link and wakes a blocked Recv.
+func (k *Link) Close() error { return k.c.Close() }
 
 // SetDeadline sets the read and write deadlines.
 func (k *Link) SetDeadline(t time.Time) error { return k.c.SetDeadline(t) }
