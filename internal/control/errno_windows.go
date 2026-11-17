@@ -5,28 +5,10 @@ package control
 import (
 	"errors"
 	"fmt"
-	"io"
-	"net"
+	"syscall"
 
 	"golang.org/x/sys/windows"
 )
-
-// Windows AF_UNIX has no control messages, so the Msg variants are unusable.
-const fdPassing = false
-
-const oobSize = 0
-
-func writeFirst(c *net.UnixConn, b []byte, _ []int) error {
-	_, err := c.Write(b)
-	return err
-}
-
-func readFirst(c *net.UnixConn, b, _ []byte) ([]int, error) {
-	_, err := io.ReadFull(c, b)
-	return nil, err
-}
-
-func closeFDs([]int) {}
 
 func isConnRefused(err error) bool { return errors.Is(err, windows.WSAECONNREFUSED) }
 
@@ -38,4 +20,13 @@ func unsupportedErr(err error) error {
 		return fmt.Errorf("%w: %w", ErrUnsupported, err)
 	}
 	return err
+}
+
+// PeerGone reports whether a socket call failed because the peer closed or
+// reset the connection; Winsock reports WSA* codes, not syscall's invented Errnos.
+func PeerGone(err error) bool {
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, windows.WSAECONNRESET) || errors.Is(err, windows.WSAECONNABORTED) ||
+		errors.Is(err, windows.WSAENETRESET) || errors.Is(err, windows.WSAESHUTDOWN)
 }

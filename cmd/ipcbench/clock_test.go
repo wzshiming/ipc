@@ -6,13 +6,13 @@ import (
 )
 
 func TestClockIsMonotonic(t *testing.T) {
-	prev := nowNanos()
+	prev := now()
 	for i := range 10000 {
-		now := nowNanos()
-		if now < prev {
-			t.Fatalf("read %d went backwards: %d after %d", i, now, prev)
+		next := now()
+		if next < prev {
+			t.Fatalf("read %d went backwards: %d after %d", i, next, prev)
 		}
-		prev = now
+		prev = next
 	}
 }
 
@@ -22,16 +22,16 @@ func TestClockResolutionIsAtMostTenMicroseconds(t *testing.T) {
 	const limit = 10 * time.Microsecond
 	smallest := time.Duration(-1)
 	steps := 0
-	prev := nowNanos()
+	prev := now()
 	for i := 0; i < 5_000_000 && steps < 1000; i++ {
-		now := nowNanos()
-		if d := elapsed(prev, now); d > 0 {
+		next := now()
+		if d := next - prev; d > 0 {
 			steps++
 			if smallest < 0 || d < smallest {
 				smallest = d
 			}
 		}
-		prev = now
+		prev = next
 	}
 	if smallest < 0 {
 		t.Fatal("clock never advanced")

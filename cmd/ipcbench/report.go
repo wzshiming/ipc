@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"text/tabwriter"
@@ -10,41 +9,40 @@ import (
 
 // report is the tool's output. GB and Gbit are decimal (1e9).
 type report struct {
-	Mode       string  `json:"mode"`
-	Net        string  `json:"net"`
-	IO         string  `json:"io"`
-	Conns      int     `json:"conns"`
-	Size       int     `json:"size"`
-	Ring       int     `json:"ring"`
-	DurationS  float64 `json:"duration_s"`
-	SpinNS     int64   `json:"spin_ns"`
-	GOMAXPROCS int     `json:"gomaxprocs"`
+	Mode       string
+	Net        string
+	IO         string
+	Conns      int
+	Size       int
+	Ring       int
+	DurationS  float64
+	GOMAXPROCS int
 
-	Aggregate *rate    `json:"aggregate,omitempty"`
-	PerConn   []rate   `json:"per_conn,omitempty"`
-	Latency   *latency `json:"latency,omitempty"`
+	Aggregate *rate
+	PerConn   []rate
+	Latency   *latency
 }
 
 // rate is what the consumer read over a measured window.
 type rate struct {
-	Conn          int     `json:"conn"`
-	Records       uint64  `json:"records"`
-	Bytes         uint64  `json:"bytes"`
-	Seconds       float64 `json:"seconds"`
-	GBps          float64 `json:"gb_per_s"`
-	Gbps          float64 `json:"gbit_per_s"`
-	RecordsPerSec float64 `json:"records_per_s"`
+	Conn          int
+	Records       uint64
+	Bytes         uint64
+	Seconds       float64
+	GBps          float64
+	Gbps          float64
+	RecordsPerSec float64
 }
 
 // latency is a round-trip distribution in microseconds.
 type latency struct {
-	Samples int     `json:"samples"`
-	P50     float64 `json:"p50_us"`
-	P99     float64 `json:"p99_us"`
-	P999    float64 `json:"p999_us"`
-	Min     float64 `json:"min_us"`
-	Mean    float64 `json:"mean_us"`
-	Max     float64 `json:"max_us"`
+	Samples int
+	P50     float64
+	P99     float64
+	P999    float64
+	Min     float64
+	Mean    float64
+	Max     float64
 }
 
 func newReport(o options, gomaxprocs int) *report {
@@ -56,7 +54,6 @@ func newReport(o options, gomaxprocs int) *report {
 		Size:       o.size,
 		Ring:       o.ring,
 		DurationS:  o.duration.Seconds(),
-		SpinNS:     int64(o.spin),
 		GOMAXPROCS: gomaxprocs,
 	}
 }
@@ -102,15 +99,9 @@ func (r *report) empty() bool {
 	return r.Aggregate == nil || r.Aggregate.Records == 0 || r.Aggregate.GBps <= 0
 }
 
-func (r *report) writeJSON(w io.Writer) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(r)
-}
-
 func (r *report) writeText(w io.Writer) error {
-	fmt.Fprintf(w, "mode=%s net=%s io=%s conns=%d size=%d ring=%d duration=%gs spin=%v gomaxprocs=%d\n",
-		r.Mode, r.Net, r.IO, r.Conns, r.Size, r.Ring, r.DurationS, time.Duration(r.SpinNS), r.GOMAXPROCS)
+	fmt.Fprintf(w, "mode=%s net=%s io=%s conns=%d size=%d ring=%d duration=%gs gomaxprocs=%d\n",
+		r.Mode, r.Net, r.IO, r.Conns, r.Size, r.Ring, r.DurationS, r.GOMAXPROCS)
 	if l := r.Latency; l != nil {
 		_, err := fmt.Fprintf(w, "round trip: samples=%d p50=%.2fus p99=%.2fus p999=%.2fus min=%.2fus mean=%.2fus max=%.2fus\n",
 			l.Samples, l.P50, l.P99, l.P999, l.Min, l.Mean, l.Max)

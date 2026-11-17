@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,7 +39,7 @@ func readFirst(c *net.UnixConn, b, oob []byte) ([]int, error) {
 		err = io.EOF
 	}
 	if err != nil {
-		closeFDs(fds)
+		CloseFDs(fds)
 		return nil, err
 	}
 	return fds, nil
@@ -58,7 +57,7 @@ func parseRights(oob []byte) ([]int, error) {
 		}
 		got, err := unix.ParseUnixRights(&msgs[i])
 		if err != nil {
-			closeFDs(fds)
+			CloseFDs(fds)
 			return nil, err
 		}
 		fds = append(fds, got...)
@@ -66,12 +65,9 @@ func parseRights(oob []byte) ([]int, error) {
 	return fds, nil
 }
 
-func closeFDs(fds []int) {
+// CloseFDs closes descriptors Recv returned that the caller does not keep.
+func CloseFDs(fds []int) {
 	for _, fd := range fds {
 		unix.Close(fd)
 	}
 }
-
-func isConnRefused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
-
-func unsupportedErr(err error) error { return err }

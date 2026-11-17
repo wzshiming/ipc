@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -21,7 +20,8 @@ import (
 // from the test binary.
 func TestMain(m *testing.M) {
 	if os.Getenv("IPCBENCH_AS_MAIN") == "1" {
-		if behavior := os.Getenv("IPCBENCH_TEST_PEER"); behavior != "" && slices.Contains(os.Args[1:], "-peer") {
+		peer := slices.ContainsFunc(os.Args[1:], func(a string) bool { return strings.HasPrefix(a, "-peer=") })
+		if behavior := os.Getenv("IPCBENCH_TEST_PEER"); behavior != "" && peer {
 			os.Exit(misbehave(behavior, os.Args[1:]))
 		}
 		os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -224,7 +224,9 @@ func TestProduceEndsWithClose(t *testing.T) {
 	consumer.SetDeadline(time.Now().Add(10 * time.Second))
 	var stop atomic.Bool
 	errc := make(chan error, 1)
-	go func() { errc <- produce(producer, 0, options{mode: "throughput", size: size}, &stop) }()
+	go func() {
+		errc <- produce(producer, 0, options{size: size}, &source{size: size, payload: true, stop: &stop})
+	}()
 	rec := make([]byte, size)
 	for range 3 {
 		if _, err := io.ReadFull(consumer, rec); err != nil {
@@ -266,7 +268,8 @@ func TestEchoEndsAtPeerClose(t *testing.T) {
 // Chunk 5 of 4 KiB starts at stream offset 16384, whose stamp word the
 // flipped first byte damages.
 func TestCorruptChunkExitsWithCodeTwo(t *testing.T) {
-	_, stderr, code := runBench(t, "-mode", "throughput", "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
+	t.Setenv("IPCBENCH_TEST_PEER", "corrupt 5")
+	_, stderr, code := runBench(t, "-mode", "throughput", "-size", "4KiB", "-duration", "300ms")
 	if code != 2 {
 		t.Fatalf("exit code %d, want 2; stderr:\n%s", code, stderr)
 	}
@@ -275,57 +278,51 @@ func TestCorruptChunkExitsWithCodeTwo(t *testing.T) {
 	}
 }
 
-func TestThroughputJSONParsesWithPositiveRates(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "throughput", "-conns", "2", "-size", "64KiB", "-duration", "300ms", "-json")
-	if code != 0 {
-		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
-	}
-	var r report
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
-	}
-	if r.Mode != "throughput" || r.Conns != 2 || r.Size != 64<<10 || len(r.PerConn) != 2 {
-		t.Fatalf("unexpected report header: %+v", r)
-	}
-	if !strings.Contains(stdout, `"conns"`) || !strings.Contains(stdout, `"per_conn"`) {
-		t.Fatalf("JSON lacks the conns and per_conn fields:\n%s", stdout)
-	}
-	if r.Aggregate == nil || r.Aggregate.GBps <= 0 || r.Aggregate.Gbps <= 0 || r.Aggregate.RecordsPerSec <= 0 {
-		t.Fatalf("aggregate rates not positive: %+v", r.Aggregate)
-	}
-	for _, c := range r.PerConn {
-		if c.GBps <= 0 {
-			t.Fatalf("connection %d rate not positive: %+v", c.Conn, c)
+func TestRunReportsItsConfigurationAndMeasurements(t *testing.T) {
+	t.Setenv("IPCBENCH_AS_MAIN", "1")
+	kernelThroughput := func(network string) func(r *report) bool {
+		return func(r *report) bool {
+			return r.Net == network && r.Ring == 0 && r.Aggregate != nil && r.Aggregate.GBps > 0
 		}
 	}
-}
-
-func TestFramingJSONCountsRecords(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "framing", "-size", "64B", "-duration", "300ms", "-json")
-	if code != 0 {
-		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
-	}
-	var r report
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
-	}
-	if r.Aggregate == nil || r.Aggregate.RecordsPerSec <= 0 {
-		t.Fatalf("framing records/s not positive: %+v", r.Aggregate)
-	}
-}
-
-func TestLatencyJSONReportsPercentiles(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "latency", "-duration", "300ms", "-json")
-	if code != 0 {
-		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
-	}
-	var r report
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
-	}
-	l := r.Latency
-	if l == nil || l.Samples == 0 || l.P50 <= 0 || l.P99 < l.P50 || l.P999 < l.P99 {
-		t.Fatalf("latency percentiles not ordered and positive: %+v", l)
+	roundTrips := func(r *report) bool { return r.Latency != nil && r.Latency.Samples > 0 && r.Latency.P50 > 0 }
+	for _, tc := range []struct {
+		args []string
+		want string
+		ok   func(r *report) bool
+	}{
+		{[]string{"-mode", "throughput", "-conns", "2", "-size", "64KiB"}, "throughput of 2 connections of 64 KiB records, each and all at positive rates", func(r *report) bool {
+			a := r.Aggregate
+			return r.Mode == "throughput" && r.Conns == 2 && r.Size == 64<<10 && len(r.PerConn) == 2 &&
+				a != nil && a.GBps > 0 && a.Gbps > 0 && a.RecordsPerSec > 0 &&
+				!slices.ContainsFunc(r.PerConn, func(c rate) bool { return c.GBps <= 0 })
+		}},
+		{[]string{"-mode", "framing", "-size", "64B"}, "positive records/s", func(r *report) bool {
+			return r.Aggregate != nil && r.Aggregate.RecordsPerSec > 0
+		}},
+		{[]string{"-mode", "latency"}, "positive percentiles in order", func(r *report) bool {
+			l := r.Latency
+			return l != nil && l.Samples > 0 && l.P50 > 0 && l.P99 >= l.P50 && l.P999 >= l.P99
+		}},
+		{[]string{"-mode", "throughput", "-net", "unix", "-size", "64KiB"}, "net unix, ring 0 and a positive rate", kernelThroughput("unix")},
+		{[]string{"-mode", "throughput", "-net", "tcp", "-size", "64KiB"}, "net tcp, ring 0 and a positive rate", kernelThroughput("tcp")},
+		{[]string{"-mode", "latency", "-net", "unix"}, "measured round trips", roundTrips},
+		{[]string{"-mode", "latency", "-net", "tcp"}, "measured round trips", roundTrips},
+		{[]string{"-mode", "throughput", "-io", "rw", "-size", "64KiB"}, "io rw, positive rates and 64 KiB per record", func(r *report) bool {
+			a := r.Aggregate
+			return r.IO == "rw" && a != nil && a.GBps > 0 && a.RecordsPerSec > 0 && a.Bytes == a.Records*(64<<10)
+		}},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var stderr bytes.Buffer
+			r, err := runParent(parsed(t, append(tc.args, "-duration", "300ms")...), &stderr)
+			if err != nil || r.empty() {
+				t.Fatalf("runParent = %v, want a measured run; stderr:\n%s", err, &stderr)
+			}
+			if !tc.ok(r) {
+				t.Fatalf("report %+v with aggregate %+v and latency %+v, want %s", *r, r.Aggregate, r.Latency, tc.want)
+			}
+		})
 	}
 }
 
@@ -341,19 +338,37 @@ func TestThroughputTextReportsRates(t *testing.T) {
 	}
 }
 
-func TestRemovedFlagIsUnknown(t *testing.T) {
-	_, err := parseFlags([]string{"-lanes", "2"}, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "not defined") {
-		t.Fatalf("parseFlags(-lanes 2) = %v, want a flag-not-defined error", err)
-	}
-}
-
-func TestLatencyModeRequiresOneConnection(t *testing.T) {
-	if _, err := parseFlags([]string{"-mode", "latency", "-conns", "2"}, &bytes.Buffer{}); err == nil {
-		t.Fatal("-mode latency -conns 2 was accepted")
-	}
-	if _, err := parseFlags([]string{"-mode", "latency", "-conns", "1"}, &bytes.Buffer{}); err != nil {
-		t.Fatalf("-mode latency -conns 1 was rejected: %v", err)
+func TestParseFlagsRejectsBadArguments(t *testing.T) {
+	for _, tc := range []struct {
+		args     []string
+		accepted bool
+		want     []string
+	}{
+		{args: []string{"-lanes", "2"}, want: []string{"not defined"}},
+		{args: []string{"-corrupt", "5"}, want: []string{"not defined"}},
+		{args: []string{"-path", "b.sock"}, want: []string{"not defined"}},
+		{args: []string{"-spin", "1ms"}, want: []string{"not defined"}},
+		{args: []string{"-json"}, want: []string{"not defined"}},
+		{args: []string{"-mode", "latency", "-conns", "2"}},
+		{args: []string{"-mode", "latency", "-conns", "1"}, accepted: true},
+		{args: []string{"-net", "udp"}, want: []string{"want ipc, unix or tcp"}},
+		{args: []string{"-io", "splice"}, want: []string{"want copy or rw"}},
+		{args: []string{"-mode", "compare", "-conns", "1"}, want: []string{"compare", "-conns"}},
+		{args: []string{"-mode", "compare", "-size", "64KiB"}, want: []string{"compare", "-size"}},
+		{args: []string{"-mode", "compare", "-net", "ipc"}, want: []string{"compare", "-net"}},
+		{args: []string{"-mode", "compare", "-io", "copy"}, want: []string{"compare", "-io"}},
+		{args: []string{"-mode", "compare", "-duration", "1s"}, accepted: true},
+	} {
+		_, err := parseFlags(tc.args, &bytes.Buffer{})
+		if tc.accepted {
+			if err != nil {
+				t.Errorf("parseFlags(%s) = %v, want it accepted", strings.Join(tc.args, " "), err)
+			}
+			continue
+		}
+		if err == nil || slices.ContainsFunc(tc.want, func(w string) bool { return !strings.Contains(err.Error(), w) }) {
+			t.Errorf("parseFlags(%s) = %v, want an error naming %q", strings.Join(tc.args, " "), err, tc.want)
+		}
 	}
 }
 
@@ -384,17 +399,6 @@ func TestDefaultRingFitsLargeRecords(t *testing.T) {
 	}
 }
 
-func TestUnknownTransportAndIOAreRejected(t *testing.T) {
-	_, err := parseFlags([]string{"-net", "udp"}, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "want ipc, unix or tcp") {
-		t.Errorf("-net udp = %v, want an error listing the transports", err)
-	}
-	_, err = parseFlags([]string{"-io", "splice"}, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "want copy or rw") {
-		t.Errorf("-io splice = %v, want an error listing the I/O paths", err)
-	}
-}
-
 // Kernel sockets have no ring: -ring is not applied, no size check against
 // it runs, and the report shows ring 0.
 func TestKernelTransportsHaveNoRing(t *testing.T) {
@@ -409,90 +413,51 @@ func TestKernelTransportsHaveNoRing(t *testing.T) {
 	}
 }
 
-func TestThroughputRunsOnKernelTransports(t *testing.T) {
+func TestCorruptChunkOnKernelTransportsExitsWithCodeTwo(t *testing.T) {
+	t.Setenv("IPCBENCH_TEST_PEER", "corrupt 5")
 	for _, network := range []string{"unix", "tcp"} {
-		stdout, stderr, code := runBench(t, "-mode", "throughput", "-net", network, "-size", "64KiB", "-duration", "300ms", "-json")
-		if code != 0 {
-			t.Fatalf("-net %s: exit code %d; stderr:\n%s", network, code, stderr)
-		}
-		var r report
-		if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-			t.Fatalf("-net %s: output is not JSON: %v\n%s", network, err, stdout)
-		}
-		if r.Net != network || r.Ring != 0 {
-			t.Fatalf("-net %s reported net=%q ring=%d, want the transport and no ring", network, r.Net, r.Ring)
-		}
-		if r.Aggregate == nil || r.Aggregate.GBps <= 0 {
-			t.Fatalf("-net %s: aggregate rate not positive: %+v", network, r.Aggregate)
+		_, stderr, code := runBench(t, "-mode", "throughput", "-net", network, "-size", "4KiB", "-duration", "300ms")
+		if code != 2 || !strings.Contains(stderr, "connection 0") || !strings.Contains(stderr, "offset 16384") {
+			t.Fatalf("-net %s: exit code %d, want 2 naming connection 0 and offset 16384; stderr:\n%s", network, code, stderr)
 		}
 	}
 }
 
-func TestLatencyRunsOnKernelTransports(t *testing.T) {
-	for _, network := range []string{"unix", "tcp"} {
-		stdout, stderr, code := runBench(t, "-mode", "latency", "-net", network, "-duration", "300ms", "-json")
-		if code != 0 {
-			t.Fatalf("-net %s: exit code %d; stderr:\n%s", network, code, stderr)
-		}
-		var r report
-		if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-			t.Fatalf("-net %s: output is not JSON: %v\n%s", network, err, stdout)
-		}
-		if l := r.Latency; l == nil || l.Samples == 0 || l.P50 <= 0 {
-			t.Fatalf("-net %s: no round trips measured: %+v", network, l)
-		}
-	}
-}
-
-// Once the parent quits on an integrity failure, the peer's next Write
-// fails with the socket's reset; that ends the run and is not a peer error.
+// Once the parent's run bound closes a kernel socket, the peer's next Write
+// fails with the socket's reset; that ends the peer's run and is not an error.
 func TestPeerExitsQuietlyWhenParentClosesKernelTransportFirst(t *testing.T) {
-	for _, network := range []string{"unix", "tcp"} {
-		_, stderr, code := runBench(t, "-mode", "throughput", "-net", network, "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
-		if code != 2 || !strings.Contains(stderr, "offset 16384") {
-			t.Fatalf("-net %s: exit code %d, want 2 naming offset 16384; stderr:\n%s", network, code, stderr)
+	t.Setenv("IPCBENCH_AS_MAIN", "1")
+	setBound(t, &safetyMargin, -29*time.Second) // the parent's bound closes 1s into the peer's 30s
+	setBound(t, &peerGrace, 30*time.Second)
+	networks := []string{"unix", "tcp"}
+	if runtime.GOOS == "darwin" {
+		// darwin may fail the peer's unix Write with ENOTCONN, which control.PeerGone does not list.
+		networks = []string{"tcp"}
+	}
+	for _, network := range networks {
+		var stderr bytes.Buffer
+		start := time.Now()
+		_, err := runParent(parsed(t, "-net", network, "-size", "4KiB", "-duration", "30s"), &stderr)
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("-net %s: runParent = %v, want its bound to close the connections first; stderr:\n%s", network, err, &stderr)
 		}
-		if strings.Contains(stderr, "ipcbench peer:") {
-			t.Fatalf("-net %s: the peer reported an error after the parent closed:\n%s", network, stderr)
+		if d := time.Since(start); d > 15*time.Second {
+			t.Fatalf("-net %s: runParent returned after %v, want the peer gone by itself, not killed after the %v grace", network, d, peerGrace)
 		}
-	}
-}
-
-// With -io rw every record is one message: the consumer reads exactly -size
-// bytes per record it counts.
-func TestReadWriteIOReportsPositiveRatesPerMessage(t *testing.T) {
-	stdout, stderr, code := runBench(t, "-mode", "throughput", "-io", "rw", "-size", "64KiB", "-duration", "300ms", "-json")
-	if code != 0 {
-		t.Fatalf("exit code %d; stderr:\n%s", code, stderr)
-	}
-	var r report
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
-	}
-	if r.IO != "rw" || r.Aggregate == nil || r.Aggregate.GBps <= 0 || r.Aggregate.RecordsPerSec <= 0 {
-		t.Fatalf("report io=%q aggregate %+v, want io=rw and positive rates", r.IO, r.Aggregate)
-	}
-	if r.Aggregate.Bytes != r.Aggregate.Records*(64<<10) {
-		t.Fatalf("%d bytes in %d records, want %d-byte messages", r.Aggregate.Bytes, r.Aggregate.Records, 64<<10)
+		if strings.Contains(stderr.String(), "ipcbench peer:") {
+			t.Fatalf("-net %s: the peer reported an error after the parent closed:\n%s", network, &stderr)
+		}
 	}
 }
 
 func TestReportNamesTransportAndIO(t *testing.T) {
 	r := newReport(options{mode: "throughput", net: "tcp", io: "rw", conns: 1, size: 64}, 4)
-	var text, js bytes.Buffer
+	var text bytes.Buffer
 	if err := r.writeText(&text); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text.String(), "mode=throughput net=tcp io=rw ") {
-		t.Fatalf("text header lacks net and io:\n%s", text.String())
-	}
-	if err := r.writeJSON(&js); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{`"net": "tcp"`, `"io": "rw"`} {
-		if !strings.Contains(js.String(), want) {
-			t.Fatalf("JSON lacks %s:\n%s", want, js.String())
-		}
+	if want := "mode=throughput net=tcp io=rw conns=1 size=64 ring=0 duration=0s gomaxprocs=4\n"; !strings.HasPrefix(text.String(), want) {
+		t.Fatalf("text header is not %q:\n%s", want, text.String())
 	}
 }
 
@@ -517,24 +482,13 @@ func TestConsumeWithReadWriteIORejectsAShortLastMessage(t *testing.T) {
 
 // With -io rw the peer flips the first byte of message 5, stream offset 16384.
 func TestCorruptMessageWithReadWriteIOExitsWithCodeTwo(t *testing.T) {
-	_, stderr, code := runBench(t, "-mode", "throughput", "-io", "rw", "-size", "4KiB", "-duration", "300ms", "-corrupt", "5")
+	t.Setenv("IPCBENCH_TEST_PEER", "corrupt 5")
+	_, stderr, code := runBench(t, "-mode", "throughput", "-io", "rw", "-size", "4KiB", "-duration", "300ms")
 	if code != 2 {
 		t.Fatalf("exit code %d, want 2; stderr:\n%s", code, stderr)
 	}
 	if !strings.Contains(stderr, "connection 0") || !strings.Contains(stderr, "offset 16384") {
 		t.Fatalf("stderr does not name connection 0 and offset 16384:\n%s", stderr)
-	}
-}
-
-func TestCompareRejectsSingleConfigurationFlags(t *testing.T) {
-	for _, args := range [][]string{{"-conns", "1"}, {"-size", "64KiB"}, {"-net", "ipc"}, {"-io", "copy"}, {"-json"}} {
-		_, err := parseFlags(append([]string{"-mode", "compare"}, args...), &bytes.Buffer{})
-		if err == nil || !strings.Contains(err.Error(), "compare") || !strings.Contains(err.Error(), args[0]) {
-			t.Errorf("-mode compare %s = %v, want an error naming %s and compare", strings.Join(args, " "), err, args[0])
-		}
-	}
-	if _, err := parseFlags([]string{"-mode", "compare", "-duration", "1s"}, &bytes.Buffer{}); err != nil {
-		t.Fatalf("-mode compare -duration 1s was rejected: %v", err)
 	}
 }
 

@@ -101,8 +101,8 @@ func TestAttachSharesWritesBothWays(t *testing.T) {
 	}
 	defer b.Close()
 
-	if b.Size() != size || len(b.Bytes()) != size {
-		t.Fatalf("attached Size()=%d len=%d, want %d", b.Size(), len(b.Bytes()), size)
+	if got := len(b.Bytes()); got != size {
+		t.Fatalf("attached len(Bytes()) = %d, want %d", got, size)
 	}
 	copy(a.Bytes()[100:], "a->b")
 	if got := string(b.Bytes()[100:104]); got != "a->b" {
@@ -228,8 +228,13 @@ func TestCreateBytesLengthIsRequestedSize(t *testing.T) {
 	if got := len(seg.Bytes()); got != size {
 		t.Fatalf("len(Bytes()) = %d, want %d", got, size)
 	}
-	if got := seg.Size(); got != size {
-		t.Fatalf("Size() = %d, want %d", got, size)
+	tok, err := seg.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Close()
+	if tok.Size != size {
+		t.Fatalf("Export().Size = %d, want %d", tok.Size, size)
 	}
 }
 

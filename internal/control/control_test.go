@@ -214,7 +214,7 @@ func TestDialMissingPathFailsFast(t *testing.T) {
 
 func TestRecvReadDeadlineIsTimeout(t *testing.T) {
 	_, b := pair(t)
-	if err := b.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+	if err := b.SetDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := b.Recv(); !os.IsTimeout(err) {

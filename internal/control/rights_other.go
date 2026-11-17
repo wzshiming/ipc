@@ -1,15 +1,13 @@
-//go:build !darwin && !linux && !windows
+//go:build !darwin && !linux
 
 package control
 
 import (
-	"errors"
 	"io"
 	"net"
-	"syscall"
 )
 
-// Descriptor passing is only wired up for darwin and linux.
+// Only darwin and linux pass descriptors; Windows AF_UNIX has no control messages.
 const fdPassing = false
 
 const oobSize = 0
@@ -24,8 +22,5 @@ func readFirst(c *net.UnixConn, b, _ []byte) ([]int, error) {
 	return nil, err
 }
 
-func closeFDs([]int) {}
-
-func isConnRefused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
-
-func unsupportedErr(err error) error { return err }
+// CloseFDs does nothing: without descriptor passing Recv returns none.
+func CloseFDs([]int) {}

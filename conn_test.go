@@ -215,6 +215,14 @@ func TestListenRejectsOutOfRangeCap(t *testing.T) {
 	}
 }
 
+func TestErrUnsupportedIsStdlibErrUnsupported(t *testing.T) {
+	for _, err := range []error{control.ErrUnsupported, shm.ErrUnsupported} {
+		if !errors.Is(err, errors.ErrUnsupported) {
+			t.Errorf("errors.Is(%v, errors.ErrUnsupported) = false", err)
+		}
+	}
+}
+
 func TestAddrsAreIPCPaths(t *testing.T) {
 	l, path := listen(t, ListenConfig{})
 	if a := l.Addr(); a.Network() != "ipc" || a.String() != path {
@@ -331,41 +339,58 @@ func getSeq(p []byte) (seq uint64) {
 	return seq
 }
 
-func TestPeerCloseWakesBlockedNextWithEOF(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{}, Dialer{Spin: -1})
-	ch := make(chan error, 1)
-	go func() {
-		_, err := dc.Next()
-		ch <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	lc.Close()
-	if err := waitErr(t, ch, time.Second); err != io.EOF {
-		t.Fatalf("Next = %v; want io.EOF", err)
+func TestCloseWakesBlockedCall(t *testing.T) {
+	calls := map[string]func(c *Conn) error{
+		"Next":    func(c *Conn) error { _, err := c.Next(); return err },
+		"Reserve": func(c *Conn) error { _, err := c.Reserve(4000); return err },
+		"Read":    func(c *Conn) error { _, err := c.Read(make([]byte, 8)); return err },
+		"Write":   func(c *Conn) error { _, err := c.Write(make([]byte, 4000)); return err },
 	}
-	<-dc.Done()
-	if !errors.Is(dc.Err(), ErrPeerClosed) || !errors.Is(lc.Err(), net.ErrClosed) {
-		t.Fatalf("Err = %v (dialer), %v (listener); want ErrPeerClosed, net.ErrClosed", dc.Err(), lc.Err())
-	}
-}
-
-func TestPeerCloseWakesBlockedReserveWithErrPeerClosed(t *testing.T) {
-	lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
-	for {
-		if _, err := dc.TryReserve(4000); err != nil {
-			break
+	for _, tc := range []struct {
+		call string // blocks on dc, whose send ring is full and receive ring empty
+		peer bool   // lc ends the connection, else dc closes
+		want error
+	}{
+		{"Next", true, io.EOF},
+		{"Reserve", true, ErrPeerClosed},
+		{"Read", true, io.EOF},
+		{"Next", false, net.ErrClosed},
+		{"Reserve", false, net.ErrClosed},
+		{"Read", false, net.ErrClosed},
+		{"Write", false, net.ErrClosed},
+	} {
+		end := "local"
+		if tc.peer {
+			end = "peer"
 		}
-		dc.Commit()
-	}
-	ch := make(chan error, 1)
-	go func() {
-		_, err := dc.Reserve(4000)
-		ch <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	lc.Close()
-	if err := waitErr(t, ch, time.Second); !errors.Is(err, ErrPeerClosed) {
-		t.Fatalf("Reserve = %v; want ErrPeerClosed", err)
+		t.Run(tc.call+" on "+end+" Close", func(t *testing.T) {
+			lc, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
+			fill(t, dc)
+			ch := make(chan error, 1)
+			go func() { ch <- calls[tc.call](dc) }()
+			time.Sleep(20 * time.Millisecond)
+			if tc.peer {
+				lc.Close()
+			} else {
+				dc.Close()
+			}
+			if err := waitErr(t, ch, time.Second); err != tc.want {
+				t.Fatalf("%s = %v; want %v", tc.call, err, tc.want)
+			}
+			if tc.peer {
+				<-dc.Done()
+				if !errors.Is(dc.Err(), ErrPeerClosed) || !errors.Is(lc.Err(), net.ErrClosed) {
+					t.Fatalf("Err = %v (dialer), %v (listener); want ErrPeerClosed, net.ErrClosed", dc.Err(), lc.Err())
+				}
+				return
+			}
+			if _, err := dc.TryNext(); err != net.ErrClosed {
+				t.Fatalf("TryNext after Close = %v; want net.ErrClosed", err)
+			}
+			if err := dc.Err(); err != net.ErrClosed {
+				t.Fatalf("Err after Close = %v; want net.ErrClosed", err)
+			}
+		})
 	}
 }
 
@@ -609,11 +634,11 @@ func TestLocalCloseAfterPeerCloseUnmapsAndStopsDraining(t *testing.T) {
 	commitSeq(t, lc, 10, 100)
 	lc.Close()
 	<-dc.readerDone // the peer-close shutdown has finished
-	if dc.unmapped.Load() {
-		t.Fatal("segment unmapped by peer close; draining needs it until local Close")
+	if dc.live.Load() == 0 {
+		t.Fatal("segment released by peer close; draining needs it until local Close")
 	}
 	dc.Close()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after local Close")
 	}
 	if _, err := dc.TryNext(); err != net.ErrClosed {
@@ -624,67 +649,6 @@ func TestLocalCloseAfterPeerCloseUnmapsAndStopsDraining(t *testing.T) {
 	}
 	if err := dc.Err(); err != net.ErrClosed {
 		t.Fatalf("Err after local Close = %v; want net.ErrClosed", err)
-	}
-}
-
-func TestLocalCloseWakesBlockedNextWithNetErrClosed(t *testing.T) {
-	_, dc := pair(t, ListenConfig{}, Dialer{Spin: -1})
-	ch := make(chan error, 1)
-	go func() {
-		_, err := dc.Next()
-		ch <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	dc.Close()
-	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
-		t.Fatalf("Next = %v; want net.ErrClosed", err)
-	}
-	if _, err := dc.TryNext(); err != net.ErrClosed {
-		t.Fatalf("TryNext after Close = %v; want net.ErrClosed", err)
-	}
-	if err := dc.Err(); err != net.ErrClosed {
-		t.Fatalf("Err after Close = %v; want net.ErrClosed", err)
-	}
-}
-
-func TestLocalCloseWakesBlockedReserveWithNetErrClosed(t *testing.T) {
-	_, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
-	for {
-		if _, err := dc.TryReserve(4000); err != nil {
-			break
-		}
-		dc.Commit()
-	}
-	ch := make(chan error, 1)
-	go func() {
-		_, err := dc.Reserve(4000)
-		ch <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	dc.Close()
-	if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
-		t.Fatalf("Reserve = %v; want net.ErrClosed", err)
-	}
-}
-
-func TestLocalCloseWakesBlockedReadAndWriteWithNetErrClosed(t *testing.T) {
-	_, dc := pair(t, ListenConfig{RingSize: 64 << 10}, Dialer{RingSize: 64 << 10, Spin: -1})
-	fill(t, dc)
-	ch := make(chan error, 2)
-	go func() {
-		_, err := dc.Write(make([]byte, 4000))
-		ch <- err
-	}()
-	go func() {
-		_, err := dc.Read(make([]byte, 8))
-		ch <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	dc.Close()
-	for range 2 {
-		if err := waitErr(t, ch, time.Second); err != net.ErrClosed {
-			t.Fatalf("blocked Read or Write = %v; want net.ErrClosed", err)
-		}
 	}
 }
 
@@ -709,14 +673,14 @@ func TestCloseDefersUnmapUntilInflightNextReleased(t *testing.T) {
 		t.Fatal(err)
 	}
 	dc.Close()
-	if dc.unmapped.Load() {
-		t.Fatal("segment unmapped while a Next slice is outstanding")
+	if dc.live.Load() == 0 {
+		t.Fatal("segment released while a Next slice is outstanding")
 	}
 	if string(rec) != "hello" {
 		t.Fatalf("in-flight slice reads %q after Close", rec)
 	}
 	dc.Release()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after the last slice was released")
 	}
 }
@@ -728,12 +692,12 @@ func TestCloseDefersUnmapUntilInflightReserveAborted(t *testing.T) {
 		t.Fatal(err)
 	}
 	dc.Close()
-	if dc.unmapped.Load() {
-		t.Fatal("segment unmapped while a Reserve slice is outstanding")
+	if dc.live.Load() == 0 {
+		t.Fatal("segment released while a Reserve slice is outstanding")
 	}
 	clear(p)
 	dc.Abort()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after the reservation was aborted")
 	}
 }
@@ -741,7 +705,7 @@ func TestCloseDefersUnmapUntilInflightReserveAborted(t *testing.T) {
 func TestCloseUnmapsAtOnceWithoutInflightSlices(t *testing.T) {
 	lc, _ := pair(t, ListenConfig{}, Dialer{})
 	lc.Close()
-	if !lc.unmapped.Load() {
+	if lc.live.Load() != 0 {
 		t.Fatal("segment still mapped after Close with nothing outstanding")
 	}
 }
@@ -755,8 +719,24 @@ func TestCloseReleasesRecordReadHoldsPartlyConsumed(t *testing.T) {
 		t.Fatal(err)
 	}
 	dc.Close()
-	if !dc.unmapped.Load() {
+	if dc.live.Load() != 0 {
 		t.Fatal("segment still mapped after Close while Read held a partly consumed record")
+	}
+}
+
+func TestHalfClosedTwiceStaysClosedAndReleasesSegmentOnce(t *testing.T) {
+	_, dc := pair(t, ListenConfig{}, Dialer{})
+	dc.rx.close(dc)
+	dc.rx.close(dc)
+	if dc.rx.acquire(dc) {
+		t.Fatal("acquire succeeded on a half closed twice")
+	}
+	if n := dc.live.Load(); n != 1 {
+		t.Fatalf("live = %d after closing one half twice; want 1", n)
+	}
+	dc.Close()
+	if n := dc.live.Load(); n != 0 {
+		t.Fatalf("live = %d after Close; want 0", n)
 	}
 }
 
@@ -778,7 +758,7 @@ func rawHello(t *testing.T, path string, payload []byte) (typ uint8, answer []by
 	if err != nil {
 		t.Fatal(err)
 	}
-	discardFDs(fds)
+	control.CloseFDs(fds)
 	if _, _, _, err := link.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("Recv after Reject = %v; want io.EOF (listener closes the link)", err)
 	}
@@ -806,7 +786,7 @@ func sentHello(t *testing.T, d Dialer) []byte {
 		if err != nil {
 			return
 		}
-		discardFDs(fds)
+		control.CloseFDs(fds)
 		ch <- p
 		link.Send(frameReject, nil, nil)
 	}()
@@ -929,7 +909,7 @@ func TestDialReturnsErrCorruptForTamperedRingHeaders(t *testing.T) {
 		if _, _, fds, err := link.Recv(); err != nil {
 			return
 		} else {
-			discardFDs(fds)
+			control.CloseFDs(fds)
 		}
 		tok, err := seg.Export()
 		if err != nil {

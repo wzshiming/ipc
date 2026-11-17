@@ -49,14 +49,12 @@ type Conn struct {
 	sendDir   uint8
 
 	closeOnce  sync.Once
-	rxOnce     sync.Once
 	life       context.Context // done when the connection ends, with why as its cause
 	end        context.CancelCauseFunc
 	closed     atomic.Bool // Close was called on this end
 	bye        atomic.Bool // the peer said goodbye
 	readerDone chan struct{}
 	live       atomic.Int32 // halves that may still touch the segment
-	unmapped   atomic.Bool  // test hook: the segment has been released
 
 	wmu sync.Mutex // serializes Write and ReadFrom
 	tx  half
@@ -94,16 +92,11 @@ func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Durat
 		k := int(dir)
 		return mem[k*rs : (k+1)*rs : (k+1)*rs]
 	}
-	for dir := range uint8(2) {
-		if capacity, err := ring.Verify(region(dir)); err != nil || capacity != ringSize {
-			return nil, corruptErr(dir, err)
-		}
-	}
 	var err error
-	if c.prod, err = ring.NewProducer(region(c.sendDir)); err != nil {
+	if c.prod, err = ring.NewProducer(region(c.sendDir), ringSize); err != nil {
 		return nil, corruptErr(c.sendDir, err)
 	}
-	if c.cons, err = ring.NewConsumer(region(recvDir)); err != nil {
+	if c.cons, err = ring.NewConsumer(region(recvDir), ringSize); err != nil {
 		return nil, corruptErr(recvDir, err)
 	}
 	c.tx.sig, c.tx.bell = make(chan struct{}, 1), doorbell{c.sendDir}
@@ -114,9 +107,6 @@ func newConn(link *control.Link, seg *shm.Segment, ringSize int, spin time.Durat
 }
 
 func corruptErr(dir uint8, err error) error {
-	if err == nil {
-		err = errors.New("capacity differs from the negotiated ring size")
-	}
 	return fmt.Errorf("%w: ring %d: %w", ErrCorrupt, dir, err)
 }
 
@@ -130,7 +120,7 @@ func (c *Conn) readLoop() {
 			return
 		}
 		if len(fds) > 0 {
-			discardFDs(fds)
+			control.CloseFDs(fds)
 			c.shutdown(errProtocol)
 			return
 		}
@@ -165,7 +155,7 @@ func (c *Conn) readLoop() {
 // released when no slice is outstanding.
 func (c *Conn) shutdown(err error) {
 	c.peerGone(err)
-	c.rxOnce.Do(func() { c.rx.close(c) })
+	c.rx.close(c)
 }
 
 // peerGone closes the connection like shutdown but leaves the receive half
@@ -187,7 +177,6 @@ func (c *Conn) peerGone(err error) {
 func (c *Conn) halfDone() {
 	if c.live.Add(-1) == 0 {
 		c.seg.Close()
-		c.unmapped.Store(true)
 	}
 }
 
@@ -224,7 +213,7 @@ func (c *Conn) recvErr() error {
 
 // peerErr maps the link errors a vanished peer causes to ErrPeerClosed.
 func peerErr(err error) error {
-	if isPeerGone(err) {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || control.PeerGone(err) {
 		return ErrPeerClosed
 	}
 	return err
